@@ -1,0 +1,197 @@
+services:
+
+  # ──────────────────────────────────────────────────────────────
+  # Interface
+  # ──────────────────────────────────────────────────────────────
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:main
+    container_name: open-webui
+    restart: unless-stopped
+    ports:
+      - "3000:8080"          # seule interface exposée côté hôte
+    environment:
+      - WEBUI_AUTH=true
+      - WEBUI_SECRET_KEY=${WEBUI_SECRET_KEY}   # fixe : sans ça, chaque recréation du conteneur invalide les sessions
+      - ENABLE_OPENAI_API=true
+      - OPENAI_API_BASE_URL=http://langgraph-agent:8000/v1
+    volumes:
+      - open-webui-data:/app/backend/data
+    depends_on:
+      - langgraph-agent
+    networks:
+      - agent-net
+
+  # ──────────────────────────────────────────────────────────────
+  # Orchestration globale
+  # ──────────────────────────────────────────────────────────────
+  langgraph-agent:
+    build: ./services/langgraph-agent
+    container_name: langgraph-agent
+    restart: unless-stopped
+    environment:
+      - LLM_BASE_URL=http://vllm:8000/v1
+      - SKILL_MANAGER_URL=http://skill-manager:8001
+      - CONTEXT_MANAGER_URL=http://context-manager:8002
+      - MCP_CLIENT_URL=http://mcp-client:8003
+    depends_on:
+      - skill-manager
+      - context-manager
+      - mcp-client
+      - vllm
+    networks:
+      - agent-net
+    # pas de port publié : uniquement accessible via le réseau interne
+
+  # ──────────────────────────────────────────────────────────────
+  # Skill Manager (skills/ python, fastapi, docker, clean-code)
+  # ──────────────────────────────────────────────────────────────
+  skill-manager:
+    build: ./services/skill-manager
+    container_name: skill-manager
+    restart: unless-stopped
+    volumes:
+      - ./skills:/app/skills:ro
+    networks:
+      - agent-net
+
+  # ──────────────────────────────────────────────────────────────
+  # Context Manager : RAG (LlamaIndex) / mémoire (Mem0) /
+  # compression (LLMLingua) / reranking
+  # ──────────────────────────────────────────────────────────────
+  context-manager:
+    build: ./services/context-manager
+    container_name: context-manager
+    restart: unless-stopped
+    environment:
+      - QDRANT_URL=http://qdrant:6333
+      - LLM_BASE_URL=http://vllm:8000/v1
+    depends_on:
+      qdrant:
+        condition: service_healthy
+    networks:
+      - agent-net
+
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: qdrant
+    restart: unless-stopped
+    volumes:
+      - qdrant-data:/qdrant/storage
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/localhost/6333' || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    networks:
+      - agent-net
+    # décommenter pour debug via l'UI Qdrant (http://localhost:6335/dashboard)
+    # ports:
+    #   - "6335:6333"
+
+  # ──────────────────────────────────────────────────────────────
+  # MCP Client : point d'entrée unique vers les serveurs MCP
+  # ──────────────────────────────────────────────────────────────
+  mcp-client:
+    build: ./services/mcp-client
+    container_name: mcp-client
+    restart: unless-stopped
+    environment:
+      # mcp-client spawne ces conteneurs à la demande via le socket Docker
+      # (transport stdio, conforme à l'usage officiel des images mcp/*)
+      - MCP_FILESYSTEM_IMAGE=mcp/filesystem:latest
+      - MCP_GIT_IMAGE=mcp/git:latest
+      - MCP_BROWSER_IMAGE=mcp/playwright:latest
+      - MCP_TERMINAL_IMAGE=mcp-terminal:local   # construite localement, voir plus bas
+      - WORKSPACE_HOST_PATH=${WORKSPACE_HOST_PATH}    # chemin HOTE requis par docker run -v
+      # GhostDesk (serveur "desktop") : contrairement aux autres, c'est un
+      # serveur HTTP persistant (bureau virtuel), pas un conteneur spawné à
+      # la demande — mcp-client s'y connecte en Streamable HTTP.
+      - MCP_GHOSTDESK_URL=http://ghostdesk:3000/mcp
+      - GHOSTDESK_AUTH_TOKEN=${GHOSTDESK_AUTH_TOKEN}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock   # ⚠️ équivaut à un accès root sur l'hôte,
+                                                       # voir avertissement de sécurité dans le README
+      - ./workspace:/workspace
+    depends_on:
+      - ghostdesk
+    networks:
+      - agent-net
+
+  # --- Image du serveur MCP "Terminal" ---------------------------
+  # ⚠️ Il n'existe pas d'image MCP "Terminal" officielle (ni chez
+  # Anthropic/modelcontextprotocol, ni chez Docker) : l'exécution shell
+  # arbitraire est volontairement absente des serveurs de référence.
+  # Cette image est construite localement puis spawnée à la demande par
+  # mcp-client, avec le même hardening qu'un conteneur classique.
+  mcp-terminal-build:
+    build: ./services/mcp-terminal
+    image: mcp-terminal:local
+    container_name: mcp-terminal-build
+    profiles: ["build-only"]   # ce service ne se lance jamais, il sert juste à builder l'image
+    command: ["true"]
+
+  # --- GhostDesk : bureau virtuel complet piloté par l'agent ------
+  # ⚠️ Surface d'attaque bien plus large que mcp-terminal : SYS_ADMIN +
+  # exécution shell + contrôle GUI complet. Reste un serveur MCP HTTP
+  # persistant avec état (pas un conteneur éphémère comme les autres) ;
+  # voir avertissement détaillé et limites assumées dans le README.
+  ghostdesk:
+    image: ghcr.io/yv17labs/ghostdesk:latest
+    container_name: ghostdesk
+    restart: unless-stopped
+    shm_size: 2gb
+    cap_add:
+      - SYS_ADMIN   # requis par Electron/apps complexes dans le bureau virtuel
+    environment:
+      - GHOSTDESK_AUTH_TOKEN=${GHOSTDESK_AUTH_TOKEN}
+      - GHOSTDESK_VNC_PASSWORD=${GHOSTDESK_VNC_PASSWORD}
+    volumes:
+      - ghostdesk-home:/home/agent   # persiste le bureau/apps entre redémarrages
+    ports:
+      - "6080:6080"   # noVNC — exposé par défaut pour observer l'agent piloter le bureau
+    networks:
+      - agent-net
+    # Port MCP (3000) volontairement non publié sur l'hôte : seul mcp-client
+    # doit l'atteindre, via le réseau interne agent-net.
+
+  # ──────────────────────────────────────────────────────────────
+  # Inférence
+  # ──────────────────────────────────────────────────────────────
+  vllm:
+    image: vllm/vllm-openai:latest
+    container_name: vllm
+    restart: unless-stopped
+    command:
+      - "--model"
+      - "/models/Qwen2.5-Coder-32B-Instruct"   # adapter au modèle réellement présent dans ./models
+      - "--served-model-name"
+      - "agent-llm"
+      - "--host"
+      - "0.0.0.0"
+      - "--port"
+      - "8000"
+    volumes:
+      - ./models:/models
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    ipc: host              # requis par vLLM pour le shared memory PyTorch
+    networks:
+      - agent-net
+    # décommenter pour exposer l'API OpenAI-compatible directement sur l'hôte
+    # ports:
+    #   - "8000:8000"
+
+networks:
+  agent-net:
+    driver: bridge
+
+volumes:
+  open-webui-data:
+  qdrant-data:
+  ghostdesk-home:
