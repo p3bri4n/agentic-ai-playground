@@ -10,7 +10,9 @@ cp .env.example .env
 # éditer .env : WORKSPACE_HOST_PATH doit être le chemin ABSOLU de ./workspace sur l'hôte
 # (requis car mcp-client monte ce chemin dans des conteneurs qu'il spawn lui-même)
 
-docker pull mcp/filesystem:latest mcp/git:latest mcp/playwright:latest
+docker pull mcp/filesystem:latest
+docker pull mcp/git:latest
+docker pull mcp/playwright:latest
 docker compose --profile build-only build mcp-terminal-build   # construit l'image locale mcp-terminal:local
 
 docker compose up -d
