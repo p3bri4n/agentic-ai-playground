@@ -29,7 +29,7 @@ services:
     container_name: langgraph-agent
     restart: unless-stopped
     environment:
-      - LLM_BASE_URL=http://vllm:8000/v1
+      - LLM_BASE_URL=${LLM_BASE_URL:-http://vllm:8000/v1}
       - SKILL_MANAGER_URL=http://skill-manager:8001
       - CONTEXT_MANAGER_URL=http://context-manager:8002
       - MCP_CLIENT_URL=http://mcp-client:8003
@@ -64,7 +64,7 @@ services:
     restart: unless-stopped
     environment:
       - QDRANT_URL=http://qdrant:6333
-      - LLM_BASE_URL=http://vllm:8000/v1
+      - LLM_BASE_URL=${LLM_BASE_URL:-http://vllm:8000/v1}
     depends_on:
       qdrant:
         condition: service_healthy
@@ -172,7 +172,7 @@ services:
       - "--port"
       - "8000"
     volumes:
-      - ./models:/models
+      - ${MODELS_HOST_PATH:-./models}:/models
     deploy:
       resources:
         reservations:
@@ -187,6 +187,41 @@ services:
     # ports:
     #   - "8000:8000"
 
+  # --- Backend alternatif : Ollama (GGUF, quants I-quants/K-quants inclus) --
+  # Non utilisé par défaut (voir LLM_BASE_URL, qui pointe sur vllm par
+  # défaut) : pour l'activer, définir dans .env
+  #   LLM_BASE_URL=http://ollama:11434/v1
+  # puis démarrer ce service explicitement (il n'est pas dans les depends_on
+  # de langgraph-agent/context-manager, qui restent câblés sur vllm) :
+  #   docker compose up -d ollama
+  # Après le pull, aliaser le modèle en "agent-llm" pour matcher le nom en
+  # dur dans le code (services/langgraph-agent/app/graph.py) :
+  #   docker exec -it ollama ollama pull qwen3.6:35b
+  #   docker exec -it ollama ollama cp qwen3.6:35b agent-llm
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama
+    restart: unless-stopped
+    volumes:
+      - ollama-data:/root/.ollama
+      # Réutilise un dossier de modèles Ollama existant sur l'hôte (blobs/ +
+      # manifests/ à la racine, structure attendue par Ollama sous .../models)
+      # au lieu de re-télécharger. Optionnel : si absent, Ollama stocke ses
+      # modèles dans le volume nommé ollama-models (déclaré plus bas).
+      - ${OLLAMA_MODELS_HOST_PATH:-ollama-models}:/root/.ollama/models
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    networks:
+      - agent-net
+    # décommenter pour piloter Ollama (pull, etc.) depuis l'hôte sans docker exec
+    # ports:
+    #   - "11434:11434"
+
 networks:
   agent-net:
     driver: bridge
@@ -195,3 +230,5 @@ volumes:
   open-webui-data:
   qdrant-data:
   ghostdesk-home:
+  ollama-data:
+  ollama-models:

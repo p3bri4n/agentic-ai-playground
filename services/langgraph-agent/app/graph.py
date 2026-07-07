@@ -18,16 +18,49 @@ l'exécution — au prix de perdre les approbations en attente si le service
 redémarre (acceptable pour un usage local, voir README).
 """
 
+import contextvars
 import os
 import json
 from typing import Annotated, Optional, TypedDict
 
 import httpx
+import langchain_openai.chat_models.base as _openai_base
 from langchain_openai import ChatOpenAI
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.errors import NodeInterrupt
 from langgraph.graph import StateGraph, END
 from langgraph.graph.message import add_messages
+
+# Ollama (modèles Qwen3+) renvoie le raisonnement dans un champ "reasoning" des
+# deltas SSE, en plus de "content" — un champ hors du format OpenAI standard,
+# que langchain-openai ignore silencieusement (_convert_delta_to_message_chunk
+# ne lit que "content"/"tool_calls"/"function_call"). On l'y réinjecte en le
+# repliant dans "content", entouré de <think>...</think> (convention reconnue
+# par Open WebUI pour afficher une bulle de pensée repliable), ce qui le fait
+# apparaître dans le flux de streaming existant sans toucher à app/main.py.
+_think_state: contextvars.ContextVar[Optional[dict]] = contextvars.ContextVar(
+    "_think_state", default=None
+)
+_original_convert_delta = _openai_base._convert_delta_to_message_chunk
+
+
+def _convert_delta_with_reasoning(_dict, default_class):
+    chunk = _original_convert_delta(_dict, default_class)
+    state = _think_state.get()
+    if state is None:
+        return chunk
+    reasoning = _dict.get("reasoning")
+    if reasoning:
+        prefix = "<think>" if not state["opened"] else ""
+        state["opened"] = True
+        chunk.content = prefix + reasoning
+    elif chunk.content and state["opened"] and not state["closed"]:
+        state["closed"] = True
+        chunk.content = "</think>\n\n" + chunk.content
+    return chunk
+
+
+_openai_base._convert_delta_to_message_chunk = _convert_delta_with_reasoning
 
 LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "http://vllm:8000/v1")
 CONTEXT_MANAGER_URL = os.environ.get("CONTEXT_MANAGER_URL", "http://context-manager:8002")
@@ -99,9 +132,17 @@ async def select_skill(state: AgentState) -> dict:
 
 
 async def call_llm(state: AgentState) -> dict:
-    merged = None
-    async for chunk in llm.astream(state["messages"]):
-        merged = chunk if merged is None else merged + chunk
+    token = _think_state.set({"opened": False, "closed": False})
+    try:
+        merged = None
+        async for chunk in llm.astream(state["messages"]):
+            merged = chunk if merged is None else merged + chunk
+    finally:
+        think = _think_state.get()
+        _think_state.reset(token)
+
+    if think["opened"] and not think["closed"]:
+        merged.content += "</think>"
     return {"messages": [merged]}
 
 

@@ -54,3 +54,18 @@ def text_response(tokens):
         + [({"content": tok}, None) for tok in tokens]
         + [({}, "stop")]
     )
+
+
+def reasoning_response(reasoning_tokens, content_tokens):
+    """
+    Simule une réponse Ollama (Qwen3+) qui streame un raisonnement dans le
+    champ "reasoning" des deltas, en plus de "content" — format hors standard
+    OpenAI que langchain-openai ignore nativement (voir app/graph.py, patch de
+    _convert_delta_to_message_chunk).
+    """
+    return sse_body(
+        [({"role": "assistant", "content": ""}, None)]
+        + [({"reasoning": tok}, None) for tok in reasoning_tokens]
+        + [({"content": tok}, None) for tok in content_tokens]
+        + [({}, "stop")]
+    )

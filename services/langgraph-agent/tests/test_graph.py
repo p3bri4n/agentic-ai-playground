@@ -12,7 +12,7 @@ import httpx
 import pytest
 import respx
 
-from tests.fixtures.llm_sse import text_response, tool_call_response
+from tests.fixtures.llm_sse import reasoning_response, text_response, tool_call_response
 
 
 @pytest.fixture
@@ -162,6 +162,49 @@ async def test_tool_call_loop_resolves_and_does_not_duplicate_messages(mock_side
     tool_message = result["messages"][2]
     payload = json.loads(tool_message.content)
     assert payload["content"][0]["text"] == "42"
+
+
+@pytest.mark.asyncio
+async def test_reasoning_field_is_folded_into_think_tags(mock_side_services):
+    """
+    Ollama (Qwen3+) streame le raisonnement dans un champ "reasoning" séparé
+    de "content", hors format OpenAI standard : langchain-openai l'ignore
+    silencieusement par défaut (_convert_delta_to_message_chunk ne lit que
+    "content"/"tool_calls"/"function_call"). app/graph.py le replie dans
+    "content", entouré de <think>...</think>, pour qu'Open WebUI l'affiche en
+    bulle repliable. Ce test échoue si ce repli casse ou disparaît.
+    """
+    import app.graph as g
+
+    mock_side_services.post("http://fake-vllm/v1/chat/completions").mock(
+        return_value=_sse_response(
+            reasoning_response(["12*7", "=84"], ["Ça fait", " 84."])
+        )
+    )
+    g.agent_graph = g.build_graph()
+
+    state = {"messages": [{"role": "user", "content": "Combien font 12*7 ?"}], "tool_iterations": 0, "approved": None}
+    result = await g.agent_graph.ainvoke(state, CONFIG)
+
+    assert result["messages"][-1].content == "<think>12*7=84</think>\n\nÇa fait 84."
+
+
+@pytest.mark.asyncio
+async def test_reasoning_without_trailing_content_still_closes_think_tag(mock_side_services):
+    """Cas limite : le raisonnement va jusqu'au bout sans contenu final après (jamais
+    observé en pratique avec Qwen3, mais call_llm doit rester robuste : la balise
+    <think> ne doit jamais rester ouverte dans l'historique persisté)."""
+    import app.graph as g
+
+    mock_side_services.post("http://fake-vllm/v1/chat/completions").mock(
+        return_value=_sse_response(reasoning_response(["Hmm."], []))
+    )
+    g.agent_graph = g.build_graph()
+
+    state = {"messages": [{"role": "user", "content": "..."}], "tool_iterations": 0, "approved": None}
+    result = await g.agent_graph.ainvoke(state, CONFIG)
+
+    assert result["messages"][-1].content == "<think>Hmm.</think>"
 
 
 @pytest.mark.asyncio

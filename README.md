@@ -98,7 +98,7 @@ Résumé des suites, à date de la dernière vérification :
 | `context-manager` | 4 | ingestion/retrieval Qdrant, mémoire par utilisateur, collection vide |
 | `mcp-client` | 6 | registre d'outils, appel réel via stdio, erreur 404 sur outil inconnu, appel réel via Streamable HTTP (serveur "desktop"/GhostDesk) avec vérification du bearer token |
 | `mcp-terminal` | 6 | liste blanche de commandes, lecture de fichier (y compris nom avec espace), blocage du path traversal |
-| `langgraph-agent` | 14 | boucle d'appel d'outil, non-duplication des messages, endpoint streaming et non-streaming, pause/reprise d'approbation humaine (approuvé, refusé, streaming inclus), non-duplication de l'historique sur plusieurs tours de conversation |
+| `langgraph-agent` | 16 | boucle d'appel d'outil, non-duplication des messages, endpoint streaming et non-streaming, pause/reprise d'approbation humaine (approuvé, refusé, streaming inclus), non-duplication de l'historique sur plusieurs tours de conversation, repli du raisonnement Ollama/Qwen3 (champ `reasoning`) en balises `<think>` |
 
 ## Bugs trouvés et corrigés pendant le développement
 
@@ -115,6 +115,7 @@ Cette démarche a permis de trouver et corriger les bugs suivants :
 | `langgraph-agent` | `requirements.txt` ne pinnait pas `openai` : `langchain-openai==0.2.2` autorise `openai<2.0.0,>=1.40.0`, mais les versions récentes d'`openai` (1.109+, 2.x) cassent le wrapper HTTP interne de `langchain-openai` (`AttributeError: 'AsyncHttpxClientWrapper' object has no attribute 'build_request'`) — un bug connu et récurrent entre les deux librairies (cf. [langchain-ai/langchain#19116](https://github.com/langchain-ai/langchain/issues/19116)) | `openai==1.51.2` épinglé explicitement, combinaison testée et validée |
 | `mcp-client` | `requirements.txt` non installable tel quel : `pydantic==2.9.2` entrait en conflit avec `mcp==1.2.0`, qui exige `pydantic>=2.10.1` — `pip install` (donc le build Docker) aurait échoué | `pydantic==2.10.3` |
 | `langgraph-agent` | l'ajout du checkpointer pour la supervision humaine a introduit une duplication de l'historique : Open WebUI renvoie l'historique complet à chaque requête, mais celui-ci était désormais aussi persisté par thread — chaque tour réinjectait donc tout l'historique déjà stocké (2 tours simples produisaient 6 messages internes au lieu de 4) | `owui_message_count` dans l'état du graphe : seuls les messages Open WebUI non encore vus sont soumis à chaque tour |
+| `langgraph-agent` | avec Ollama (modèles Qwen3+) comme backend, le raisonnement du modèle est renvoyé dans un champ `reasoning` séparé de `content` sur les deltas SSE — hors format OpenAI standard, donc silencieusement ignoré par `langchain-openai` (`_convert_delta_to_message_chunk` ne lit que `content`/`tool_calls`/`function_call`) : la pensée du modèle n'atteignait jamais Open WebUI | patch de `_convert_delta_to_message_chunk` (`app/graph.py`) qui replie `reasoning` dans `content`, entouré de `<think>...</think>` (convention reconnue par Open WebUI pour la bulle de pensée repliable) — appliqué en direct dans le flux de streaming, pas seulement en fin de réponse |
 
 Une fausse alerte a aussi été rencontrée puis écartée : un test utilisait un
 monkeypatch global de `httpx.AsyncClient` pour simuler les appels HTTP vers
