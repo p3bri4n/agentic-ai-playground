@@ -80,6 +80,32 @@ def test_list_tools_builds_registry():
     assert resp.json()["tools"] == {"echo": "echo"}
 
 
+def test_tools_schema_exposes_description_and_input_schema():
+    """
+    langgraph-agent consomme ce schéma pour lier les outils au LLM via
+    bind_tools (voir services/langgraph-agent/app/graph.py). Sans
+    description/inputSchema, le LLM ne peut pas savoir qu'un outil existe ni
+    quels arguments il attend.
+    """
+    resp = _client().get("/tools/schema")
+    assert resp.status_code == 200
+    tools = resp.json()["tools"]
+    assert tools == [
+        {
+            "type": "function",
+            "function": {
+                "name": "echo",
+                "description": "Renvoie le message reçu, préfixé de 'echo: '.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"message": {"type": "string"}},
+                    "required": ["message"],
+                },
+            },
+        }
+    ]
+
+
 def test_call_known_tool_returns_result():
     resp = _client().post("/call", json={"tool": "echo", "arguments": {"message": "bonjour"}})
     assert resp.status_code == 200

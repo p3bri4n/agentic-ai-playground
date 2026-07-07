@@ -32,6 +32,9 @@ async def test_two_turn_conversation_message_count():
         mock.post("http://fake-skill-manager/match").mock(
             return_value=httpx.Response(200, json={"skill": None})
         )
+        mock.get("http://fake-mcp-client/tools/schema").mock(
+            return_value=httpx.Response(200, json={"tools": []})
+        )
         route = mock.post("http://fake-vllm/v1/chat/completions")
         route.side_effect = [
             _sse_response(text_response(["Bonjour", " !"])),
@@ -82,6 +85,9 @@ async def test_tool_approval_then_new_turn_message_count():
         )
         mock.post("http://fake-mcp-client/call").mock(
             return_value=httpx.Response(200, json={"content": [{"type": "text", "text": "42"}]})
+        )
+        mock.get("http://fake-mcp-client/tools/schema").mock(
+            return_value=httpx.Response(200, json={"tools": []})
         )
         route = mock.post("http://fake-vllm/v1/chat/completions")
         route.side_effect = [

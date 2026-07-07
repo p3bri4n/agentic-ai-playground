@@ -84,8 +84,11 @@ SERVERS = {
 
 app = FastAPI(title="MCP Client")
 
-# registre {nom_outil: nom_serveur}, construit paresseusement au 1er appel
-_tool_registry: dict[str, str] = {}
+# registre {nom_outil: {"server", "description", "inputSchema"}}, construit
+# paresseusement au 1er appel (description/inputSchema nécessaires pour que
+# langgraph-agent puisse lier ces outils au LLM via bind_tools — sans quoi le
+# modèle ignore purement et simplement que ces outils existent).
+_tool_registry: dict[str, dict] = {}
 
 
 async def _run_on_server(server_name: str, action):
@@ -109,7 +112,11 @@ async def _refresh_registry():
         try:
             tools = await _run_on_server(server_name, lambda s: s.list_tools())
             for tool in tools.tools:
-                _tool_registry[tool.name] = server_name
+                _tool_registry[tool.name] = {
+                    "server": server_name,
+                    "description": tool.description or "",
+                    "inputSchema": tool.inputSchema or {"type": "object", "properties": {}},
+                }
         except Exception:
             # un serveur indisponible ne doit pas bloquer le démarrage des autres
             continue
@@ -127,19 +134,42 @@ async def health():
 
 @app.get("/tools")
 async def list_all_tools():
+    """{nom_outil: nom_serveur} — vue simple utilisée pour l'inspection/debug."""
     await _refresh_registry()
-    return {"tools": _tool_registry}
+    return {"tools": {name: info["server"] for name, info in _tool_registry.items()}}
+
+
+@app.get("/tools/schema")
+async def list_tools_schema():
+    """
+    Schéma au format OpenAI function-calling (utilisé par langgraph-agent pour
+    lier les outils au LLM via bind_tools — voir app/graph.py).
+    """
+    await _refresh_registry()
+    return {
+        "tools": [
+            {
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": info["description"],
+                    "parameters": info["inputSchema"],
+                },
+            }
+            for name, info in _tool_registry.items()
+        ]
+    }
 
 
 @app.post("/call")
 async def call_tool(request: CallRequest):
     if request.tool not in _tool_registry:
         await _refresh_registry()
-    server_name = _tool_registry.get(request.tool)
-    if not server_name:
+    tool_info = _tool_registry.get(request.tool)
+    if not tool_info:
         raise HTTPException(status_code=404, detail=f"Outil inconnu : {request.tool}")
 
     result = await _run_on_server(
-        server_name, lambda s: s.call_tool(request.tool, request.arguments)
+        tool_info["server"], lambda s: s.call_tool(request.tool, request.arguments)
     )
     return {"content": [block.model_dump() for block in result.content]}

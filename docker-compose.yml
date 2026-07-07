@@ -202,6 +202,13 @@ services:
     image: ollama/ollama:latest
     container_name: ollama
     restart: unless-stopped
+    environment:
+      # Par défaut, Ollama choisit une taille de contexte selon la VRAM
+      # disponible (4096 tokens observé ici) — trop court dès qu'une image
+      # (tokens visuels) s'ajoute à l'historique : "request (4713 tokens)
+      # exceeds the available context size (4096 tokens)" en conditions
+      # réelles avec GhostDesk/screen_shot. Relevé explicitement.
+      - OLLAMA_CONTEXT_LENGTH=16384
     volumes:
       - ollama-data:/root/.ollama
       # Réutilise un dossier de modèles Ollama existant sur l'hôte (blobs/ +

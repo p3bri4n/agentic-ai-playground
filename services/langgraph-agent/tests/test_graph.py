@@ -6,6 +6,7 @@ elle-même — contrairement à un monkeypatch naïf, cela n'interfère pas avec
 client interne du SDK openai (voir le README pour le détail de ce piège).
 """
 
+import base64
 import json
 
 import httpx
@@ -27,6 +28,9 @@ def mock_side_services():
         )
         mock.post("http://fake-mcp-client/call").mock(
             return_value=httpx.Response(200, json={"content": [{"type": "text", "text": "42"}]})
+        )
+        mock.get("http://fake-mcp-client/tools/schema").mock(
+            return_value=httpx.Response(200, json={"tools": []})
         )
         yield mock
 
@@ -162,6 +166,102 @@ async def test_tool_call_loop_resolves_and_does_not_duplicate_messages(mock_side
     tool_message = result["messages"][2]
     payload = json.loads(tool_message.content)
     assert payload["content"][0]["text"] == "42"
+
+
+@pytest.mark.asyncio
+async def test_tool_schema_from_mcp_client_is_bound_to_llm(mock_side_services):
+    """
+    Non-régression : ChatOpenAI était instancié sans jamais appeler
+    bind_tools(), donc le LLM ignorait purement et simplement l'existence des
+    outils MCP (terminal/filesystem/git/browser/desktop-GhostDesk) — has_
+    tool_calls()/require_approval() restaient du code mort en usage réel,
+    quel que soit le modèle servi. Ce test échoue si le schéma récupéré
+    depuis mcp-client (GET /tools/schema) n'est plus transmis au LLM dans la
+    requête sortante.
+    """
+    import app.graph as g
+
+    tool_schema = [
+        {
+            "type": "function",
+            "function": {
+                "name": "run_command",
+                "description": "Exécute une commande shell.",
+                "parameters": {"type": "object", "properties": {"command": {"type": "string"}}},
+            },
+        }
+    ]
+    mock_side_services.get("http://fake-mcp-client/tools/schema").mock(
+        return_value=httpx.Response(200, json={"tools": tool_schema})
+    )
+    llm_route = mock_side_services.post("http://fake-vllm/v1/chat/completions").mock(
+        return_value=_sse_response(text_response(["OK"]))
+    )
+    g.agent_graph = g.build_graph()
+
+    state = {"messages": [{"role": "user", "content": "Salut"}], "tool_iterations": 0, "approved": None}
+    await g.agent_graph.ainvoke(state, CONFIG)
+
+    sent_body = json.loads(llm_route.calls.last.request.content)
+    assert sent_body["tools"] == tool_schema
+
+
+@pytest.mark.asyncio
+async def test_tool_image_result_becomes_multimodal_user_message(mock_side_services):
+    """
+    Non-régression : le résultat brut d'un outil (ex. screen_shot de GhostDesk,
+    format MCP {"type": "image", "data": <base64>, "mimeType": ...}) était
+    json.dumps() intégralement dans un ToolMessage, un rôle qui ne supporte
+    que du texte au format OpenAI-compatible — le modèle recevait donc un
+    blob base64 illisible, pas une image, indépendamment de ses capacités
+    vision. call_tools doit désormais extraire les blocs image et les
+    réinjecter en message "user" multimodal (image_url), seul rôle qui les
+    supporte. Le WebP (format par défaut de screen_shot) doit en plus être
+    reconverti en PNG : le décodeur d'image d'Ollama (mtmd/llama.cpp) échoue
+    explicitement dessus ("Failed to load image or audio file", vérifié en
+    conditions réelles), PNG fonctionne.
+    """
+    import io
+
+    from PIL import Image
+
+    import app.graph as g
+
+    webp_buf = io.BytesIO()
+    Image.new("RGB", (2, 2), color="red").save(webp_buf, format="WEBP", lossless=True)
+    webp_b64 = base64.b64encode(webp_buf.getvalue()).decode()
+
+    mock_side_services.post("http://fake-vllm/v1/chat/completions").mock(
+        return_value=_sse_response(tool_call_response("screen_shot", "call_1", "{}"))
+    )
+    mock_side_services.post("http://fake-mcp-client/call").mock(
+        return_value=httpx.Response(
+            200,
+            json={"content": [{"type": "image", "data": webp_b64, "mimeType": "image/webp"}]},
+        )
+    )
+    g.agent_graph = g.build_graph()
+
+    state = {"messages": [{"role": "user", "content": "Capture le bureau"}], "tool_iterations": 0, "approved": None}
+    await g.agent_graph.ainvoke(state, CONFIG)
+    await g.agent_graph.aupdate_state(CONFIG, {"approved": True})
+    result = await g.agent_graph.ainvoke(None, CONFIG)
+
+    tool_message = next(m for m in result["messages"] if getattr(m, "type", None) == "tool")
+    assert webp_b64 not in tool_message.content  # le base64 ne doit plus polluer le ToolMessage
+
+    image_message = next(m for m in result["messages"] if getattr(m, "type", None) == "human" and isinstance(m.content, list))
+    url = image_message.content[0]["image_url"]["url"]
+    assert image_message.content[0]["type"] == "image_url"
+    assert url.startswith("data:image/png;base64,")
+
+    # round-trip : le payload doit être un PNG 2x2 rouge valide, pas juste un
+    # préfixe correct
+    png_bytes = base64.b64decode(url.split(",", 1)[1])
+    decoded = Image.open(io.BytesIO(png_bytes))
+    assert decoded.format == "PNG"
+    assert decoded.size == (2, 2)
+    assert decoded.convert("RGB").getpixel((0, 0)) == (255, 0, 0)
 
 
 @pytest.mark.asyncio

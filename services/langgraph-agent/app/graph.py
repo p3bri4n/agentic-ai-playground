@@ -18,7 +18,9 @@ l'exécution — au prix de perdre les approbations en attente si le service
 redémarre (acceptable pour un usage local, voir README).
 """
 
+import base64
 import contextvars
+import io
 import os
 import json
 from typing import Annotated, Optional, TypedDict
@@ -26,6 +28,7 @@ from typing import Annotated, Optional, TypedDict
 import httpx
 import langchain_openai.chat_models.base as _openai_base
 from langchain_openai import ChatOpenAI
+from PIL import Image
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.errors import NodeInterrupt
 from langgraph.graph import StateGraph, END
@@ -89,6 +92,28 @@ llm = ChatOpenAI(
     temperature=0.2,
 )
 
+# Schéma des outils MCP (terminal/filesystem/git/browser/desktop-GhostDesk),
+# récupéré depuis mcp-client et mis en cache pour la durée du process. Sans
+# ce bind_tools, le LLM n'a aucune connaissance de l'existence de ces outils
+# et ne peut donc jamais produire de tool_calls, quel que soit le modèle
+# servi — has_tool_calls()/require_approval() restent alors du code mort.
+_tools_schema_cache: Optional[list] = None
+
+
+async def _get_bound_llm() -> ChatOpenAI:
+    global _tools_schema_cache
+    if _tools_schema_cache is None:
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                resp = await client.get(f"{MCP_CLIENT_URL}/tools/schema")
+                resp.raise_for_status()
+                _tools_schema_cache = resp.json().get("tools", [])
+        except (httpx.HTTPError, ValueError):
+            # mcp-client injoignable ou réponse invalide : dégrade sans outils
+            # plutôt que de faire échouer toute la conversation.
+            _tools_schema_cache = []
+    return llm.bind_tools(_tools_schema_cache) if _tools_schema_cache else llm
+
 
 async def retrieve_context(state: AgentState) -> dict:
     last_user_msg = next(
@@ -132,10 +157,11 @@ async def select_skill(state: AgentState) -> dict:
 
 
 async def call_llm(state: AgentState) -> dict:
+    bound_llm = await _get_bound_llm()
     token = _think_state.set({"opened": False, "closed": False})
     try:
         merged = None
-        async for chunk in llm.astream(state["messages"]):
+        async for chunk in bound_llm.astream(state["messages"]):
             merged = chunk if merged is None else merged + chunk
     finally:
         think = _think_state.get()
@@ -165,6 +191,43 @@ def route_after_approval(state: AgentState) -> str:
     return "call_tools" if state["approved"] else "reject_tools"
 
 
+def _to_png_data_uri(data_b64: str, mime_type: str) -> str:
+    """
+    Réencode systématiquement en PNG avant de transmettre au LLM. Le décodeur
+    d'image d'Ollama (mtmd, côté llama.cpp) échoue explicitement sur le WebP
+    ("Failed to load image or audio file") — or c'est le format par défaut de
+    l'outil screen_shot de GhostDesk. Convertir ici plutôt que de compter sur
+    le modèle pour systématiquement demander format="png" à chaque appel.
+    """
+    if mime_type == "image/png":
+        return f"data:image/png;base64,{data_b64}"
+    raw = base64.b64decode(data_b64)
+    img = Image.open(io.BytesIO(raw)).convert("RGB")
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return f"data:image/png;base64,{base64.b64encode(buf.getvalue()).decode()}"
+
+
+def _split_image_blocks(result: dict) -> tuple[dict, list[dict]]:
+    """
+    Sépare les blocs image (format MCP : {"type": "image", "data": <base64>,
+    "mimeType": ...}) du reste du résultat d'outil. Un ToolMessage (role
+    "tool") ne peut contenir que du texte au format OpenAI-compatible — y
+    mettre le base64 brut (via json.dumps sur tout le résultat, comme avant)
+    produit un blob texte illisible pour le modèle, image ou pas, multimodal
+    ou pas. Les images sont réinjectées séparément en message "user"
+    multimodal (voir call_tools), le seul rôle qui supporte un bloc image_url.
+    """
+    content = result.get("content")
+    if not isinstance(content, list):
+        return result, []
+    images = [b for b in content if isinstance(b, dict) and b.get("type") == "image"]
+    if not images:
+        return result, []
+    rest = [b for b in content if b not in images]
+    return {**result, "content": rest or "(voir image ci-dessous)"}, images
+
+
 async def call_tools(state: AgentState) -> dict:
     last = state["messages"][-1]
     new_messages = []
@@ -180,6 +243,9 @@ async def call_tools(state: AgentState) -> dict:
                 result = resp.json()
             except httpx.HTTPError as exc:
                 result = {"error": str(exc)}
+                images = []
+            else:
+                result, images = _split_image_blocks(result)
 
             new_messages.append(
                 {
@@ -188,6 +254,20 @@ async def call_tools(state: AgentState) -> dict:
                     "content": json.dumps(result, ensure_ascii=False),
                 }
             )
+            for image in images:
+                new_messages.append(
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": _to_png_data_uri(image["data"], image.get("mimeType", "image/png"))
+                                },
+                            }
+                        ],
+                    }
+                )
 
     return {
         "messages": new_messages,

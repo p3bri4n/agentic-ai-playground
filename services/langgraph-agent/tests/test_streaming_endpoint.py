@@ -26,6 +26,9 @@ def mock_side_services():
         mock.post("http://fake-mcp-client/call").mock(
             return_value=httpx.Response(200, json={"content": [{"type": "text", "text": "42"}]})
         )
+        mock.get("http://fake-mcp-client/tools/schema").mock(
+            return_value=httpx.Response(200, json={"tools": []})
+        )
         yield mock
 
 
