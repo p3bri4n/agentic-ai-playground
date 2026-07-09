@@ -1,5 +1,7 @@
 # agentic-ai-playground
 
+![Logo](logo-agentic-ai-playground.jpg)
+
 Stack Docker Compose pour un agent IA local : Open WebUI → LangGraph Agent →
 (Skill Manager / Context Manager / MCP Client) → vLLM.
 
