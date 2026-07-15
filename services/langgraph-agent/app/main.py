@@ -205,6 +205,16 @@ async def _stream_response(config: dict, run_input: Optional[dict], model: str):
     # resté ouvert côté client, invisible en dehors de la bulle repliée.
     full_streamed = "".join(streamed_text)
     closing_prefix = "</think>\n\n" if full_streamed.count("<think>") > full_streamed.count("</think>") else ""
+    # closing_prefix ferme la balise côté client, mais AgentState.think_closed
+    # (app/graph.py) reste False puisque call_llm n'a pas pu la fermer
+    # lui-même (tool_calls présent). Sans cette mise à jour, une reprise après
+    # approbation repartirait avec think_opened=True/think_closed=False :
+    # un nouveau round de raisonnement ne recevrait alors aucune balise
+    # ouvrante (déjà "opened" selon l'état persisté) mais recevrait quand
+    # même une balise fermante en fin de tour — un </think> orphelin visible
+    # côté client, sans <think> correspondant dans ce qu'il a reçu.
+    if closing_prefix:
+        await agent_graph.aupdate_state(config, {"think_opened": False, "think_closed": False})
 
     snapshot = await agent_graph.aget_state(config)
     if snapshot.next:

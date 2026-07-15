@@ -531,3 +531,49 @@ async def test_streaming_endpoint_resumes_after_approval_reply(mock_side_service
 
     assert mcp_route.call_count == 1
     assert final_text == "Resultat: 42."
+
+
+@pytest.mark.asyncio
+async def test_streaming_endpoint_reopens_think_tag_after_approval_resume(mock_side_services):
+    """
+    Non-régression : le premier tour raisonne puis demande un outil non
+    auto-approuvé -> pause. Le </think> orphelin qui clôt alors le message
+    d'approbation (closing_prefix, app/main.py) n'était jamais répercuté dans
+    AgentState.think_opened/think_closed persisté par le checkpointer. Une
+    fois l'utilisateur approuve et qu'un DEUXIÈME round de raisonnement
+    démarre (avant la réponse finale), l'état persisté croyait le <think>
+    encore ouvert : aucune balise ouvrante n'était réémise pour ce nouveau
+    raisonnement, alors qu'une balise fermante l'était bien en fin de tour —
+    un </think> visible côté client sans <think> correspondant dans ce tour.
+    """
+    import app.graph as g
+    import app.main as main_mod
+
+    route = mock_side_services.post("http://fake-vllm/v1/chat/completions")
+    route.side_effect = [
+        _sse_response(
+            reasoning_tool_call_response(["Je cherche."], "run_command", "call_1", '{"command": "pwd"}')
+        ),
+        _sse_response(reasoning_response(["Je formule la réponse."], ["Resultat", ": 42."])),
+    ]
+    mcp_route = mock_side_services.post("http://fake-mcp-client/call").mock(
+        return_value=httpx.Response(200, json={"content": [{"type": "text", "text": "42"}]})
+    )
+    g.agent_graph = g.build_graph()
+    main_mod.agent_graph = g.agent_graph
+
+    transport = httpx.ASGITransport(app=main_mod.app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        approval_text = await _stream_contents(client, [{"role": "user", "content": "Question ?"}])
+        final_text = await _stream_contents(
+            client,
+            [
+                {"role": "user", "content": "Question ?"},
+                {"role": "assistant", "content": approval_text},
+                {"role": "user", "content": "approuver"},
+            ],
+        )
+
+    assert mcp_route.call_count == 1
+    assert final_text.count("<think>") == final_text.count("</think>") == 1
+    assert final_text.startswith("<think>")
