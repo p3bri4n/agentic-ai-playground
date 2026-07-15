@@ -47,12 +47,58 @@ def tool_call_response(tool_name, tool_call_id, arguments_json):
     )
 
 
+def multi_tool_call_response(tool_calls):
+    """
+    Simule un tour où le modèle demande PLUSIEURS outils d'un coup.
+    tool_calls : liste de (tool_name, tool_call_id, arguments_json).
+    """
+    header = {
+        "role": "assistant",
+        "content": None,
+        "tool_calls": [
+            {"index": i, "id": tc_id, "type": "function", "function": {"name": name, "arguments": ""}}
+            for i, (name, tc_id, _args) in enumerate(tool_calls)
+        ],
+    }
+    arg_deltas = [
+        ({"tool_calls": [{"index": i, "function": {"arguments": args}}]}, None)
+        for i, (_name, _tc_id, args) in enumerate(tool_calls)
+    ]
+    return sse_body([(header, None)] + arg_deltas + [({}, "tool_calls")])
+
+
 def text_response(tokens):
     """Simule une réponse LLM en texte, streamée token par token."""
     return sse_body(
         [({"role": "assistant", "content": ""}, None)]
         + [({"content": tok}, None) for tok in tokens]
         + [({}, "stop")]
+    )
+
+
+def reasoning_tool_call_response(reasoning_tokens, tool_name, tool_call_id, arguments_json):
+    """
+    Simule un tour où le modèle raisonne (champ "reasoning") puis décide
+    d'appeler un outil, sans jamais produire de "content" réel — cas normal
+    pour un tool_call (le contenu visible reste vide, cf. tool_call_response).
+    Reproduit le cas qui laissait la balise <think> ouverte dans le flux SSE
+    streamé au client (voir app/main.py:_stream_response).
+    """
+    return sse_body(
+        [({"role": "assistant", "content": ""}, None)]
+        + [({"reasoning": tok}, None) for tok in reasoning_tokens]
+        + [
+            (
+                {
+                    "tool_calls": [
+                        {"index": 0, "id": tool_call_id, "type": "function", "function": {"name": tool_name, "arguments": ""}}
+                    ],
+                },
+                None,
+            ),
+            ({"tool_calls": [{"index": 0, "function": {"arguments": arguments_json}}]}, None),
+            ({}, "tool_calls"),
+        ]
     )
 
 

@@ -100,7 +100,7 @@ Résumé des suites, à date de la dernière vérification :
 | `context-manager` | 4 | ingestion/retrieval Qdrant, mémoire par utilisateur, collection vide |
 | `mcp-client` | 8 | registre d'outils, schéma function-calling (description/inputSchema) exposé pour le LLM, appel réel via stdio, erreur 404 sur outil inconnu, appel réel via Streamable HTTP (serveur "desktop"/GhostDesk) avec vérification du bearer token |
 | `mcp-terminal` | 6 | liste blanche de commandes, lecture de fichier (y compris nom avec espace), blocage du path traversal |
-| `langgraph-agent` | 18 | boucle d'appel d'outil, non-duplication des messages, endpoint streaming et non-streaming, pause/reprise d'approbation humaine (approuvé, refusé, streaming inclus), non-duplication de l'historique sur plusieurs tours de conversation, repli du raisonnement Ollama/Qwen3 (champ `reasoning`) en balises `<think>`, liaison du schéma d'outils mcp-client au LLM (bind_tools), repli des résultats d'outil image en message multimodal PNG |
+| `langgraph-agent` | 24 | boucle d'appel d'outil, non-duplication des messages, endpoint streaming et non-streaming, pause/reprise d'approbation humaine (approuvé, refusé, streaming inclus), non-duplication de l'historique sur plusieurs tours de conversation, repli du raisonnement Ollama/Qwen3 (champ `reasoning`) en balises `<think>`, liaison du schéma d'outils mcp-client au LLM (bind_tools), repli des résultats d'outil image en message multimodal PNG, auto-approbation des outils souris/capture d'écran GhostDesk (`AUTO_APPROVED_TOOLS`) y compris tours mixtes, endpoints `/pending` et `/approve` pour une approbation par bouton d'UI, fermeture de la balise `<think>` restée ouverte en streaming avant le texte d'approbation |
 
 ## Bugs trouvés et corrigés pendant le développement
 
@@ -192,14 +192,51 @@ réellement perdue au sens propre.
 ## Supervision humaine des appels d'outils
 
 Tout appel d'outil demandé par le LLM (`terminal`, `filesystem`, `git`,
-`browser`, `desktop`/GhostDesk — sans distinction, décision volontaire pour
-rester simple) suspend désormais le graphe LangGraph au lieu de s'exécuter
-automatiquement (nœud `require_approval`, `services/langgraph-agent/app/graph.py`).
-L'agent répond alors dans la conversation avec un message
-`⚠️ Approbation requise pour : ...` ; répondre "approuver" au tour suivant
-relance l'exécution réelle, toute autre réponse la refuse (un `ToolMessage`
-d'erreur "Rejeté par l'utilisateur" est renvoyé au LLM, qui peut réagir
-normalement).
+`browser`, `desktop`/GhostDesk) suspend le graphe LangGraph au lieu de
+s'exécuter automatiquement (nœud `require_approval`,
+`services/langgraph-agent/app/graph.py`). L'agent répond alors dans la
+conversation avec un message `⚠️ Approbation requise pour : ...` ; répondre
+"approuver" au tour suivant relance l'exécution réelle, toute autre réponse
+la refuse (un `ToolMessage` d'erreur "Rejeté par l'utilisateur" est renvoyé
+au LLM, qui peut réagir normalement).
+
+**Exception : auto-approbation des outils souris/capture d'écran GhostDesk**
+(`AUTO_APPROVED_TOOLS`, variable d'env, défaut `screen_shot,mouse_move,
+mouse_click,mouse_double_click,mouse_drag,mouse_scroll`). Un modèle qui vise
+mal à l'écran (limite de vision/grounding, voir plus bas) doit pouvoir
+itérer capture → clic → capture sans qu'un humain valide chaque clic un par
+un. Ces outils n'ont pas d'effet destructeur ni de saisie (pas de clavier,
+pas de lancement d'appli, pas de presse-papiers). Routage dans
+`has_tool_calls` : un tour dont **tous** les tool_calls sont dans cette
+liste saute `require_approval` ; un tour mixte (même un seul outil hors
+liste) reste entièrement soumis à approbation, par sécurité — pas
+d'approbation partielle par outil.
+
+**Approbation par bouton d'UI, sans passer par un message texte** : deux
+endpoints complètent le flux texte "approuver"/"refuser" —
+
+- `POST /pending` (lecture seule, ne modifie aucun état) : indique si le
+  thread dérivé de `messages` est en pause d'approbation, et renvoie le
+  texte de la demande. Ne dépend que du premier message humain (dérivation
+  du `thread_id`), jamais du contenu du dernier message assistant — celui-ci
+  peut être vide ou tronqué côté client selon la façon dont Open WebUI
+  interprète les balises `<think>`.
+- `POST /approve` (`{"messages": [...], "approved": bool}`) : reprend le
+  thread en pause directement depuis une décision hors bande (Open WebUI
+  Action function), en éditant en place le message "⚠️ Approbation requise"
+  existant plutôt qu'en ajoutant un nouveau message — d'où un bookkeeping de
+  `owui_message_count` sans le `+1` appliqué au flux texte normal. Renvoie
+  409 s'il n'y a aucune approbation en attente pour ce thread.
+
+**Correctif streaming** : quand le modèle raisonne (balises `<think>`) avant
+de décider d'un appel d'outil, le tour se termine avec un `content` réel
+vide (le tool_call passe par un canal séparé), donc aucun chunk de contenu
+ne referme jamais la balise côté client. Sans correctif, le texte
+d'approbation qui suit se retrouvait concaténé à l'intérieur du `<think>`
+resté ouvert — invisible en dehors de la bulle de pensée repliée d'Open
+WebUI. `_stream_response` (`app/main.py`) referme désormais la balise avant
+d'émettre ce texte, en se basant sur ce qui a réellement été streamé au
+client (pas sur l'état déjà réparé en interne par `call_llm`).
 
 Comme Open WebUI ne fournit pas d'identifiant de conversation stable à
 `/v1/chat/completions` (il renvoie juste l'historique complet à chaque

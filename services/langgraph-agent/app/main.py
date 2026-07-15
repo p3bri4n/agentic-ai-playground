@@ -20,7 +20,7 @@ import time
 import uuid
 from typing import List, Optional
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
@@ -38,6 +38,31 @@ class ChatCompletionRequest(BaseModel):
     model: str = "agent-llm"
     messages: List[ChatMessage]
     stream: Optional[bool] = False
+
+
+class PendingCheckRequest(BaseModel):
+    """Ne nécessite que de dériver le même thread_id que le reste (voir
+    _derive_thread_id, basé uniquement sur le premier message humain) — donc
+    insensible au fait que le contenu du dernier message assistant, tel que
+    renvoyé par le client, puisse être vide ou tronqué (observé avec Open
+    WebUI sur les messages contenant des balises <think>, indépendamment de
+    ce service : sa valeur affichée et sa valeur stockée en interne peuvent
+    diverger). Permet à un client (bouton d'UI) de savoir s'il y a une
+    approbation en attente sans dépendre de ce contenu."""
+
+    messages: List[ChatMessage]
+
+
+class ApprovalDecisionRequest(BaseModel):
+    """Décision transmise hors bande, depuis un bouton d'UI (Open WebUI Action
+    function) plutôt que par un message texte "approuver"/"refuser" — voir
+    /approve. `messages` doit être l'historique complet tel que vu par Open
+    WebUI au moment du clic (même contrat que ChatCompletionRequest.messages),
+    nécessaire pour dériver le même thread_id et tenir owui_message_count à
+    jour de la même façon que le flux texte existant."""
+
+    messages: List[ChatMessage]
+    approved: bool
 
 
 def _derive_thread_id(messages: List[ChatMessage]) -> str:
@@ -122,6 +147,7 @@ def _sse_chunk(completion_id: str, model: str, delta: dict, finish_reason: Optio
 async def _stream_response(config: dict, run_input: Optional[dict], model: str):
     completion_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
     sent_role = False
+    streamed_text = []
 
     # Ne transmet au client QUE les tokens de contenu (on_chat_model_stream).
     # Les itérations qui décident d'un appel d'outil ont un contenu vide côté
@@ -135,6 +161,7 @@ async def _stream_response(config: dict, run_input: Optional[dict], model: str):
         chunk = event["data"]["chunk"]
         if not chunk.content:
             continue
+        streamed_text.append(chunk.content)
         if not sent_role:
             yield _sse_chunk(completion_id, model, {"role": "assistant", "content": chunk.content})
             sent_role = True
@@ -143,11 +170,75 @@ async def _stream_response(config: dict, run_input: Optional[dict], model: str):
 
     snapshot = await agent_graph.aget_state(config)
     if snapshot.next:
+        # Si le modèle a raisonné avant de décider d'appeler un outil, les
+        # tokens <think>...</think> streamés ci-dessus (voir app/graph.py)
+        # n'ont jamais reçu leur balise fermante : côté LLM, un tour qui
+        # aboutit à un tool_call a un content final vide, donc aucun chunk de
+        # contenu "réel" n'arrive jamais pour déclencher la fermeture (voir
+        # _convert_delta_with_reasoning). call_llm referme bien la balise sur
+        # le message PERSISTÉ après coup, mais ça ne corrige pas les chunks
+        # déjà envoyés au client dans la boucle ci-dessus — c'est donc sur ce
+        # qui a été réellement streamé (`streamed_text`) qu'il faut vérifier,
+        # pas sur l'état déjà réparé. Sans ce correctif, le texte d'approbation
+        # qui suit se retrouve avalé dans le <think> resté ouvert côté client,
+        # invisible en dehors de la bulle de pensée repliée.
+        full_streamed = "".join(streamed_text)
+        needs_closing_tag = full_streamed.count("<think>") > full_streamed.count("</think>")
         pending = _format_approval_request(snapshot.values["messages"][-1].tool_calls)
+        if needs_closing_tag:
+            pending = "</think>\n\n" + pending
         yield _sse_chunk(completion_id, model, {"role": "assistant", "content": pending})
 
     yield _sse_chunk(completion_id, model, {}, finish_reason="stop")
     yield "data: [DONE]\n\n"
+
+
+async def _current_answer(config: dict) -> str:
+    snapshot = await agent_graph.aget_state(config)
+    if snapshot.next:
+        return _format_approval_request(snapshot.values["messages"][-1].tool_calls)
+    return snapshot.values["messages"][-1].content
+
+
+@app.post("/pending")
+async def pending(request: PendingCheckRequest):
+    """Lecture seule : n'invoque jamais le graphe, ne modifie aucun état."""
+    config = {"configurable": {"thread_id": _derive_thread_id(request.messages)}}
+    snapshot = await agent_graph.aget_state(config)
+    if not snapshot.next:
+        return {"pending": False}
+    return {"pending": True, "text": _format_approval_request(snapshot.values["messages"][-1].tool_calls)}
+
+
+@app.post("/approve")
+async def approve(request: ApprovalDecisionRequest):
+    """
+    Reprend un thread en pause d'approbation directement depuis une décision
+    hors bande (bouton d'UI), sans passer par le message texte "approuver"/
+    "refuser" qu'attend normalement _resolve_run.
+
+    Bookkeeping owui_message_count (voir _resolve_run) : contrairement au
+    flux texte, où le message "approuver" de l'utilisateur ET la réponse
+    finale s'ajoutent tous deux à l'historique Open WebUI (d'où le +1 sur le
+    compte déjà présent), ce bouton ne fait qu'éditer EN PLACE le message
+    "⚠️ Approbation requise" existant avec la réponse finale (voir la
+    fonction Action Open WebUI fournie) — aucun nouveau message n'est ajouté.
+    Le compte reste donc celui déjà vu, sans +1, sous peine de désynchroniser
+    le découpage `request.messages[already_seen:]` du tour normal suivant et
+    de perdre le premier message que l'utilisateur enverra après.
+    """
+    config = {"configurable": {"thread_id": _derive_thread_id(request.messages)}}
+    snapshot = await agent_graph.aget_state(config)
+    if not snapshot.next:
+        raise HTTPException(status_code=409, detail="Aucune approbation en attente pour ce thread.")
+
+    owui_message_count = len(request.messages)
+    await agent_graph.aupdate_state(
+        config, {"approved": request.approved, "owui_message_count": owui_message_count}
+    )
+    await agent_graph.ainvoke(None, config)
+
+    return {"content": await _current_answer(config)}
 
 
 @app.post("/v1/chat/completions")
@@ -161,12 +252,6 @@ async def chat_completions(request: ChatCompletionRequest):
 
     await agent_graph.ainvoke(run_input, config)
 
-    snapshot = await agent_graph.aget_state(config)
-    if snapshot.next:
-        answer = _format_approval_request(snapshot.values["messages"][-1].tool_calls)
-    else:
-        answer = snapshot.values["messages"][-1].content
-
     return {
         "id": f"chatcmpl-{uuid.uuid4().hex[:12]}",
         "object": "chat.completion",
@@ -175,7 +260,7 @@ async def chat_completions(request: ChatCompletionRequest):
         "choices": [
             {
                 "index": 0,
-                "message": {"role": "assistant", "content": answer},
+                "message": {"role": "assistant", "content": await _current_answer(config)},
                 "finish_reason": "stop",
             }
         ],

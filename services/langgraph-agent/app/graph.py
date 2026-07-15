@@ -5,17 +5,24 @@ Flux :
   1. retrieve_context   -> interroge Context Manager (RAG / mémoire)
   2. select_skill        -> interroge Skill Manager pour injecter un prompt de skill pertinent
   3. call_llm             -> appelle vLLM (API OpenAI-compatible) avec function calling
-  4. require_approval (option) -> si le LLM demande un outil, met le graphe en pause
-     (NodeInterrupt) tant qu'un humain n'a pas approuvé/refusé via l'état "approved"
-  5. call_tools | reject_tools -> exécute l'outil via MCP Client, ou synthétise un
+  4. has_tool_calls       -> route vers require_approval, ou directement vers
+     call_tools si TOUS les tool_calls du tour sont dans AUTO_APPROVED_TOOLS
+     (voir plus bas)
+  5. require_approval (option) -> si le LLM demande un outil non auto-approuvé,
+     met le graphe en pause (NodeInterrupt) tant qu'un humain n'a pas
+     approuvé/refusé via l'état "approved"
+  6. call_tools | reject_tools -> exécute l'outil via MCP Client, ou synthétise un
      refus si l'humain a refusé, puis reboucle sur call_llm
-  6. END                  -> réponse finale
+  7. END                  -> réponse finale
 
-Supervision humaine : tout appel d'outil est soumis à approbation (voir
-require_approval/reject_tools ci-dessous). Le graphe est donc compilé avec un
-checkpointer (MemorySaver, en mémoire) pour pouvoir suspendre puis reprendre
-l'exécution — au prix de perdre les approbations en attente si le service
-redémarre (acceptable pour un usage local, voir README).
+Supervision humaine : par défaut, tout appel d'outil est soumis à
+approbation (voir require_approval/reject_tools ci-dessous), à l'exception
+des outils listés dans AUTO_APPROVED_TOOLS (souris/capture d'écran
+GhostDesk par défaut — voir la constante plus bas pour le raisonnement). Le
+graphe est donc compilé avec un checkpointer (MemorySaver, en mémoire) pour
+pouvoir suspendre puis reprendre l'exécution — au prix de perdre les
+approbations en attente si le service redémarre (acceptable pour un usage
+local, voir README).
 """
 
 import base64
@@ -71,6 +78,26 @@ SKILL_MANAGER_URL = os.environ.get("SKILL_MANAGER_URL", "http://skill-manager:80
 MCP_CLIENT_URL = os.environ.get("MCP_CLIENT_URL", "http://mcp-client:8003")
 
 MAX_TOOL_ITERATIONS = 5
+
+# Outils dispensés d'approbation humaine : uniquement du pilotage souris/
+# capture d'écran GhostDesk, sans effet destructeur ni saisie (pas de clavier,
+# pas de lancement d'appli, pas de presse-papiers). Un modèle qui vise mal
+# (limite connue de vision/grounding, voir README) doit pouvoir itérer
+# capture → clic → capture sans qu'un humain valide chaque clic un par un ;
+# tout le reste (terminal, filesystem, git, browser, app_launch, saisie
+# clavier, presse-papiers) reste soumis à approbation stricte. Un tour dont
+# TOUS les tool_calls sont dans cette liste saute require_approval ; un tour
+# mixte (même un seul outil hors liste) reste entièrement soumis à
+# approbation, par sécurité.
+AUTO_APPROVED_TOOLS = set(
+    filter(
+        None,
+        os.environ.get(
+            "AUTO_APPROVED_TOOLS",
+            "screen_shot,mouse_move,mouse_click,mouse_double_click,mouse_drag,mouse_scroll",
+        ).split(","),
+    )
+)
 
 
 class AgentState(TypedDict):
@@ -175,9 +202,11 @@ async def call_llm(state: AgentState) -> dict:
 def has_tool_calls(state: AgentState) -> str:
     last = state["messages"][-1]
     tool_calls = getattr(last, "tool_calls", None)
-    if tool_calls and state["tool_iterations"] < MAX_TOOL_ITERATIONS:
-        return "call_tools"
-    return "end"
+    if not tool_calls or state["tool_iterations"] >= MAX_TOOL_ITERATIONS:
+        return "end"
+    if all(tc["name"] in AUTO_APPROVED_TOOLS for tc in tool_calls):
+        return "auto_call_tools"
+    return "call_tools"
 
 
 async def require_approval(state: AgentState) -> dict:
@@ -306,7 +335,11 @@ def build_graph(checkpointer=None):
     graph.set_entry_point("retrieve_context")
     graph.add_edge("retrieve_context", "select_skill")
     graph.add_edge("select_skill", "call_llm")
-    graph.add_conditional_edges("call_llm", has_tool_calls, {"call_tools": "require_approval", "end": END})
+    graph.add_conditional_edges(
+        "call_llm",
+        has_tool_calls,
+        {"call_tools": "require_approval", "auto_call_tools": "call_tools", "end": END},
+    )
     graph.add_conditional_edges(
         "require_approval", route_after_approval, {"call_tools": "call_tools", "reject_tools": "reject_tools"}
     )

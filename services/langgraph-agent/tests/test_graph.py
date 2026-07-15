@@ -13,7 +13,12 @@ import httpx
 import pytest
 import respx
 
-from tests.fixtures.llm_sse import reasoning_response, text_response, tool_call_response
+from tests.fixtures.llm_sse import (
+    multi_tool_call_response,
+    reasoning_response,
+    text_response,
+    tool_call_response,
+)
 
 
 @pytest.fixture
@@ -74,6 +79,67 @@ async def test_tool_call_pauses_for_approval_without_calling_mcp_client(mock_sid
     g.agent_graph = g.build_graph()
 
     state = {"messages": [{"role": "user", "content": "Question ?"}], "tool_iterations": 0, "approved": None}
+    await g.agent_graph.ainvoke(state, CONFIG)
+
+    snapshot = await g.agent_graph.aget_state(CONFIG)
+    assert snapshot.next == ("require_approval",)
+    assert mcp_route.call_count == 0
+
+
+@pytest.mark.asyncio
+async def test_auto_approved_tool_skips_require_approval(mock_side_services):
+    """
+    Les outils souris/capture d'écran GhostDesk (AUTO_APPROVED_TOOLS) doivent
+    s'exécuter sans passer par require_approval : sinon un modèle qui vise
+    mal (limite de vision/grounding, voir README) oblige un humain à valider
+    chaque clic un par un.
+    """
+    import app.graph as g
+
+    route = mock_side_services.post("http://fake-vllm/v1/chat/completions")
+    route.side_effect = [
+        _sse_response(tool_call_response("mouse_click", "call_1", '{"x": 100, "y": 200}')),
+        _sse_response(text_response(["Cliqué", "."])),
+    ]
+    mcp_route = mock_side_services.post("http://fake-mcp-client/call").mock(
+        return_value=httpx.Response(200, json={"content": [{"type": "text", "text": "ok"}]})
+    )
+    g.agent_graph = g.build_graph()
+
+    state = {"messages": [{"role": "user", "content": "Clique là"}], "tool_iterations": 0, "approved": None}
+    result = await g.agent_graph.ainvoke(state, CONFIG)
+
+    snapshot = await g.agent_graph.aget_state(CONFIG)
+    assert snapshot.next == ()  # pas de pause : le tour est allé jusqu'au bout
+    assert mcp_route.call_count == 1
+    assert result["messages"][-1].content == "Cliqué."
+
+
+@pytest.mark.asyncio
+async def test_mixed_auto_and_manual_tools_still_requires_approval(mock_side_services):
+    """
+    Un tour qui mélange un outil auto-approuvé (mouse_click) et un outil
+    sensible (run_command) doit rester intégralement soumis à approbation —
+    pas d'approbation partielle par outil.
+    """
+    import app.graph as g
+
+    mock_side_services.post("http://fake-vllm/v1/chat/completions").mock(
+        return_value=_sse_response(
+            multi_tool_call_response(
+                [
+                    ("mouse_click", "call_1", '{"x": 100, "y": 200}'),
+                    ("run_command", "call_2", '{"command": "pwd"}'),
+                ]
+            )
+        )
+    )
+    mcp_route = mock_side_services.post("http://fake-mcp-client/call").mock(
+        return_value=httpx.Response(200, json={"content": [{"type": "text", "text": "ok"}]})
+    )
+    g.agent_graph = g.build_graph()
+
+    state = {"messages": [{"role": "user", "content": "Clique puis exécute pwd"}], "tool_iterations": 0, "approved": None}
     await g.agent_graph.ainvoke(state, CONFIG)
 
     snapshot = await g.agent_graph.aget_state(CONFIG)
