@@ -110,6 +110,16 @@ class AgentState(TypedDict):
     # est déjà persisté ici via le checkpointer), et donc d'éviter de le
     # dupliquer dans "messages" à chaque tour.
     owui_message_count: int
+    # État de la balise <think> (voir _think_state plus haut), reporté d'un
+    # appel de call_llm à l'autre au sein d'un même tour utilisateur — requis
+    # depuis AUTO_APPROVED_TOOLS, qui permet à call_llm de s'exécuter plusieurs
+    # fois de suite sans pause d'approbation entre deux. Sans ce report, chaque
+    # itération rouvrait sa propre balise <think>, et Open WebUI n'affiche en
+    # bulle repliable que celle en tout début de message : les suivantes
+    # apparaissaient en texte brut visible. Remis à False à chaque nouveau tour
+    # (voir _resolve_run, app/main.py), comme tool_iterations.
+    think_opened: bool
+    think_closed: bool
 
 
 llm = ChatOpenAI(
@@ -185,7 +195,13 @@ async def select_skill(state: AgentState) -> dict:
 
 async def call_llm(state: AgentState) -> dict:
     bound_llm = await _get_bound_llm()
-    token = _think_state.set({"opened": False, "closed": False})
+    # Repris tel quel depuis l'appel précédent au sein de ce tour (voir
+    # AgentState.think_opened/think_closed) plutôt que remis à False, pour ne
+    # produire qu'une seule balise <think> continue même si call_llm boucle
+    # plusieurs fois via AUTO_APPROVED_TOOLS.
+    token = _think_state.set(
+        {"opened": state.get("think_opened", False), "closed": state.get("think_closed", False)}
+    )
     try:
         merged = None
         async for chunk in bound_llm.astream(state["messages"]):
@@ -194,9 +210,16 @@ async def call_llm(state: AgentState) -> dict:
         think = _think_state.get()
         _think_state.reset(token)
 
-    if think["opened"] and not think["closed"]:
+    # Ne force la fermeture ici que si ce tour n'ira pas relancer call_llm
+    # (pas de tool_calls) : sinon on couperait prématurément un <think>
+    # censé continuer sur la prochaine itération de la boucle d'outils
+    # auto-approuvés. Le cas "tool_calls + pause d'approbation humaine" est
+    # géré séparément côté flux streamé (voir needs_closing_tag, app/main.py).
+    if think["opened"] and not think["closed"] and not getattr(merged, "tool_calls", None):
         merged.content += "</think>"
-    return {"messages": [merged]}
+        think["closed"] = True
+
+    return {"messages": [merged], "think_opened": think["opened"], "think_closed": think["closed"]}
 
 
 def has_tool_calls(state: AgentState) -> str:

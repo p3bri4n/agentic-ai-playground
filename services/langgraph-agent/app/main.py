@@ -115,6 +115,8 @@ async def _resolve_run(request: ChatCompletionRequest):
         "tool_iterations": 0,
         "approved": None,
         "owui_message_count": owui_message_count,
+        "think_opened": False,
+        "think_closed": False,
     }
     return config, run_input
 

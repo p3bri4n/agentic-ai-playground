@@ -9,7 +9,12 @@ import httpx
 import pytest
 import respx
 
-from tests.fixtures.llm_sse import reasoning_tool_call_response, text_response, tool_call_response
+from tests.fixtures.llm_sse import (
+    reasoning_response,
+    reasoning_tool_call_response,
+    text_response,
+    tool_call_response,
+)
 
 
 def _sse_response(body):
@@ -132,6 +137,58 @@ async def test_streaming_endpoint_closes_dangling_think_tag_before_approval_text
     # la balise doit être fermée AVANT le texte d'approbation, pas juste
     # présente quelque part dans le flux
     assert full_text.index("</think>") < full_text.index("Approbation requise")
+
+
+@pytest.mark.asyncio
+async def test_streaming_endpoint_merges_think_across_auto_approved_tool_loop(mock_side_services):
+    """
+    Non-régression : avec AUTO_APPROVED_TOOLS, call_llm peut s'exécuter
+    plusieurs fois d'affilée sans pause d'approbation (boucle capture/clic
+    GhostDesk). Chaque itération raisonne (champ "reasoning") avant de
+    décider quoi faire ensuite. Sans le report de l'état <think> d'un appel
+    de call_llm à l'autre (AgentState.think_opened/think_closed), chaque
+    itération rouvrait sa propre balise <think> en plein milieu du flux —
+    Open WebUI n'affiche en bulle repliable que celle en tout début de
+    message, les suivantes apparaissant en texte brut visible au milieu de
+    la réponse.
+    """
+    import app.graph as g
+    import app.main as main_mod
+
+    route = mock_side_services.post("http://fake-vllm/v1/chat/completions")
+    route.side_effect = [
+        _sse_response(
+            reasoning_tool_call_response(["Je vais ", "cliquer."], "mouse_click", "call_1", '{"x": 1, "y": 2}')
+        ),
+        _sse_response(reasoning_response(["Et ", "voilà."], ["Cliqué", "."])),
+    ]
+    mock_side_services.post("http://fake-mcp-client/call").mock(
+        return_value=httpx.Response(200, json={"content": [{"type": "text", "text": "ok"}]})
+    )
+    g.agent_graph = g.build_graph()
+    main_mod.agent_graph = g.agent_graph
+
+    transport = httpx.ASGITransport(app=main_mod.app)
+    chunks = []
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        async with client.stream(
+            "POST",
+            "/v1/chat/completions",
+            json={"model": "agent-llm", "messages": [{"role": "user", "content": "Clique là"}], "stream": True},
+        ) as resp:
+            async for line in resp.aiter_lines():
+                if line.startswith("data: ") and "[DONE]" not in line:
+                    payload = json.loads(line[6:])
+                    content = payload["choices"][0]["delta"].get("content")
+                    if content:
+                        chunks.append(content)
+
+    full_text = "".join(chunks)
+    # Une seule balise ouvrante/fermante malgré deux itérations de call_llm :
+    # tout le raisonnement des deux tours doit tenir dans le même bloc.
+    assert full_text.count("<think>") == 1
+    assert full_text.count("</think>") == 1
+    assert full_text.index("<think>") < full_text.index("</think>") < full_text.index("Cliqué.")
 
 
 @pytest.mark.asyncio
