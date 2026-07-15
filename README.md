@@ -302,7 +302,8 @@ documentée plus haut pour le streaming n'a donc pas été touchée.
   MCP (3000) ne l'est pas. `mcp-terminal` reste l'outil par défaut pour les
   commandes simples ; `ghostdesk` n'est sollicité que pour du pilotage GUI
   qui le justifie réellement — les deux coexistent sciemment plutôt que de
-  remplacer l'un par l'autre.
+  remplacer l'un par l'autre. Accès : http://localhost:6080 une fois le
+  service démarré, mot de passe = `GHOSTDESK_VNC_PASSWORD` (voir `.env`).
 - **Les outils de capture d'écran/clic guidé de `ghostdesk` ne sont pas
   exploitables par l'agent actuel** : le modèle servi (Qwen2.5-Coder) n'est
   pas multimodal, donc l'interprétation de captures d'écran nécessiterait un

@@ -162,13 +162,21 @@ services:
   # ──────────────────────────────────────────────────────────────
   # Inférence
   # ──────────────────────────────────────────────────────────────
+  # ⚠️ vLLM attend un modèle au format HuggingFace natif (dossier avec
+  # config.json/tokenizer/*.safetensors) sous ./models, PAS un .gguf : un
+  # .gguf isolé (format Ollama/llama.cpp) est réinterprété comme un repo_id
+  # HuggingFace mal formé et fait planter vLLM en boucle de redémarrage dès
+  # le démarrage (huggingface_hub.errors.HFValidationError). Support GGUF
+  # dans vLLM encore expérimental (--quantization gguf), non utilisé ici.
+  # Pour du GGUF/quants I-quants, utiliser le backend ollama plus bas à la
+  # place (voir LLM_BASE_URL).
   vllm:
     image: vllm/vllm-openai:latest
     container_name: vllm
     restart: unless-stopped
     command:
       - "--model"
-      - "/models/Qwen2.5-Coder-32B-Instruct"   # adapter au modèle réellement présent dans ./models
+      - "/models/Qwen2.5-Coder-32B-Instruct"   # adapter au modèle HF réellement présent dans ./models
       - "--served-model-name"
       - "agent-llm"
       - "--host"
