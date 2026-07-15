@@ -98,7 +98,7 @@ Résumé des suites, à date de la dernière vérification :
 |---|---|---|
 | `skill-manager` | 5 | chargement des skills, matching mot-clé, endpoints HTTP |
 | `context-manager` | 4 | ingestion/retrieval Qdrant, mémoire par utilisateur, collection vide |
-| `mcp-client` | 8 | registre d'outils, schéma function-calling (description/inputSchema) exposé pour le LLM, appel réel via stdio, erreur 404 sur outil inconnu, appel réel via Streamable HTTP (serveur "desktop"/GhostDesk) avec vérification du bearer token |
+| `mcp-client` | 8 | registre d'outils, schéma function-calling (description/inputSchema) exposé pour le LLM, appel réel via stdio, erreur 404 sur outil inconnu, appel réel via Streamable HTTP (serveur "desktop"/GhostDesk) avec vérification du bearer token et de l'en-tête `GhostDesk-Model-Space` |
 | `mcp-terminal` | 6 | liste blanche de commandes, lecture de fichier (y compris nom avec espace), blocage du path traversal |
 | `langgraph-agent` | 24 | boucle d'appel d'outil, non-duplication des messages, endpoint streaming et non-streaming, pause/reprise d'approbation humaine (approuvé, refusé, streaming inclus), non-duplication de l'historique sur plusieurs tours de conversation, repli du raisonnement Ollama/Qwen3 (champ `reasoning`) en balises `<think>`, liaison du schéma d'outils mcp-client au LLM (bind_tools), repli des résultats d'outil image en message multimodal PNG, auto-approbation des outils souris/capture d'écran GhostDesk (`AUTO_APPROVED_TOOLS`) y compris tours mixtes, endpoints `/pending` et `/approve` pour une approbation par bouton d'UI, fermeture de la balise `<think>` restée ouverte en streaming avant le texte d'approbation |
 
@@ -122,6 +122,7 @@ Cette démarche a permis de trouver et corriger les bugs suivants :
 | `langgraph-agent` | le résultat brut d'un outil (ex. `screen_shot` de GhostDesk, bloc image MCP `{"type": "image", "data": <base64>, "mimeType": ...}`) était `json.dumps()` intégralement dans un `ToolMessage` — un rôle qui ne supporte que du texte au format OpenAI-compatible : le modèle recevait un blob base64 illisible, jamais une vraie image, indépendamment de ses capacités vision | `_split_image_blocks` extrait les blocs image et les réinjecte en message `user` multimodal (`image_url`), seul rôle qui les supporte |
 | `langgraph-agent` | même après le correctif ci-dessus, l'image restait invisible pour le modèle : le décodeur d'image d'Ollama (`mtmd`/llama.cpp) rejette explicitement le WebP (`"Failed to load image or audio file"`), format par défaut de `screen_shot` | `_to_png_data_uri` (Pillow) reconvertit systématiquement en PNG avant transmission, plutôt que de compter sur le modèle pour penser à demander `format="png"` à chaque appel |
 | `ollama` (service) | avec une image dans le contexte, le nombre de tokens (texte + tokens visuels) dépassait le contexte par défaut choisi automatiquement par Ollama selon la VRAM disponible (4096 tokens observés) — `"request (4713 tokens) exceeds the available context size (4096 tokens)"` | `OLLAMA_CONTEXT_LENGTH=16384` fixé explicitement dans `docker-compose.yml` |
+| `mcp-client` | les clics souris GhostDesk (`mouse_click`, etc.) atterrissaient systématiquement à côté de leur cible avec les modèles Qwen : ceux-ci raisonnent nativement en repère de coordonnées normalisé 0-1000, alors que GhostDesk interprète par défaut les coordonnées reçues comme des pixels écran natifs (documenté par GhostDesk) | en-tête `GhostDesk-Model-Space` (`GHOSTDESK_MODEL_SPACE`, défaut `1000`) ajouté à chaque appel HTTP vers GhostDesk dans `_run_on_server` |
 
 Une fausse alerte a aussi été rencontrée puis écartée : un test utilisait un
 monkeypatch global de `httpx.AsyncClient` pour simuler les appels HTTP vers
@@ -313,3 +314,14 @@ documentée plus haut pour le streaming n'a donc pas été touchée.
   connecte via `streamablehttp_client` (SDK `mcp` ≥ 1.8, d'où le bump de
   `mcp==1.2.0` vers `mcp==1.9.4` dans `services/mcp-client/requirements.txt`),
   authentifié par bearer token (`GHOSTDESK_AUTH_TOKEN`, voir `.env.example`).
+- **Précision des clics avec les modèles Qwen** : ces modèles raisonnent
+  nativement en repère de coordonnées normalisé 0-1000, alors que GhostDesk
+  attend par défaut des pixels écran natifs (documenté par GhostDesk) — sans
+  correction, les clics atterrissent à côté de leur cible. `mcp-client`
+  envoie donc l'en-tête `GhostDesk-Model-Space` (valeur `GHOSTDESK_MODEL_SPACE`,
+  défaut `1000`) sur chaque appel HTTP vers GhostDesk (`_run_on_server`,
+  `services/mcp-client/app/main.py`). À vider (`GHOSTDESK_MODEL_SPACE=`) si
+  le modèle servi passe à un modèle frontière (Claude, GPT-4o), qui travaille
+  nativement en pixels écran. Ce fix ne résout pas le grounding en soi (viser
+  le bon élément reste imprécis avec un modèle de vision généraliste) — voir
+  la limite ci-dessus sur l'absence d'OCR/détection d'éléments UI.

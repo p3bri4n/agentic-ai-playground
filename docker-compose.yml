@@ -109,6 +109,10 @@ services:
       # la demande — mcp-client s'y connecte en Streamable HTTP.
       - MCP_GHOSTDESK_URL=http://ghostdesk:3000/mcp
       - GHOSTDESK_AUTH_TOKEN=${GHOSTDESK_AUTH_TOKEN}
+      # Requis par les modèles Qwen pour que leurs clics tombent sur la bonne
+      # cible (voir .env.example) ; ${VAR:-1000} plutôt que ${VAR} pour
+      # garder ce défaut même si la variable est absente du .env.
+      - GHOSTDESK_MODEL_SPACE=${GHOSTDESK_MODEL_SPACE:-1000}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock   # ⚠️ équivaut à un accès root sur l'hôte,
                                                        # voir avertissement de sécurité dans le README

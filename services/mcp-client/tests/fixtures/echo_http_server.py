@@ -7,6 +7,13 @@ Usage : python3 echo_http_server.py <port> <token_attendu>
 
 Exige un header `Authorization: Bearer <token_attendu>` sur chaque requête,
 pour vérifier que mcp-client transmet bien le bearer token configuré.
+
+Usage : python3 echo_http_server.py <port> <token_attendu> [model_space_attendu]
+Si un 3e argument est fourni, exige aussi un header
+`GhostDesk-Model-Space: <model_space_attendu>` (voir GHOSTDESK_MODEL_SPACE
+dans app/main.py — nécessaire aux modèles Qwen pour que leurs coordonnées de
+clic, raisonnées en repère normalisé 0-1000, soient interprétées correctement
+par GhostDesk plutôt qu'en pixels écran natifs).
 """
 
 import sys
@@ -27,9 +34,10 @@ def echo(message: str) -> str:
 
 
 class RequireBearerToken:
-    def __init__(self, app: ASGIApp, expected_token: str):
+    def __init__(self, app: ASGIApp, expected_token: str, expected_model_space: str | None = None):
         self.app = app
         self.expected_token = expected_token
+        self.expected_model_space = expected_model_space
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] != "http":
@@ -41,15 +49,24 @@ class RequireBearerToken:
             response = PlainTextResponse("token invalide", status_code=401)
             await response(scope, receive, send)
             return
+        if self.expected_model_space is not None:
+            model_space = headers.get(b"ghostdesk-model-space", b"").decode()
+            if model_space != self.expected_model_space:
+                response = PlainTextResponse("model-space invalide", status_code=401)
+                await response(scope, receive, send)
+                return
         await self.app(scope, receive, send)
 
 
-def build_app(expected_token: str) -> Starlette:
+def build_app(expected_token: str, expected_model_space: str | None = None) -> Starlette:
     inner = mcp.streamable_http_app()
-    return RequireBearerToken(inner, expected_token)
+    return RequireBearerToken(inner, expected_token, expected_model_space)
 
 
 if __name__ == "__main__":
     port = int(sys.argv[1])
     expected_token = sys.argv[2]
-    uvicorn.run(build_app(expected_token), host="127.0.0.1", port=port, log_level="warning")
+    expected_model_space = sys.argv[3] if len(sys.argv) > 3 else None
+    uvicorn.run(
+        build_app(expected_token, expected_model_space), host="127.0.0.1", port=port, log_level="warning"
+    )

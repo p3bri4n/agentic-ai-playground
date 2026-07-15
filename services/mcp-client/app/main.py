@@ -79,6 +79,14 @@ SERVERS = {
         "transport": "http",
         "url": os.environ.get("MCP_GHOSTDESK_URL", "http://ghostdesk:3000/mcp"),
         "token": os.environ.get("GHOSTDESK_AUTH_TOKEN", ""),
+        # Sans cet en-tête, GhostDesk attend des coordonnées en pixels écran
+        # natifs (1280x1024 ici) ; les modèles Qwen raisonnent eux nativement
+        # en repère normalisé 0-1000 et leurs clics atterrissent alors
+        # complètement à côté de la cible (documenté par GhostDesk). Les
+        # modèles frontière (Claude, GPT-4o) fonctionnent nativement en
+        # pixels écran et n'en ont pas besoin — d'où la variable d'env
+        # plutôt qu'une valeur figée, à vider si le modèle servi change.
+        "model_space": os.environ.get("GHOSTDESK_MODEL_SPACE", "1000"),
     },
 }
 
@@ -99,6 +107,8 @@ async def _run_on_server(server_name: str, action):
             read, write = await stack.enter_async_context(stdio_client(server["params"]))
         else:
             headers = {"Authorization": f"Bearer {server['token']}"}
+            if server.get("model_space"):
+                headers["GhostDesk-Model-Space"] = server["model_space"]
             read, write, _ = await stack.enter_async_context(
                 streamablehttp_client(server["url"], headers=headers)
             )
