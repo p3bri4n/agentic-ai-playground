@@ -207,9 +207,37 @@ services:
   # de langgraph-agent/context-manager, qui restent câblés sur vllm) :
   #   docker compose up -d ollama
   # Après le pull, aliaser le modèle en "agent-llm" pour matcher le nom en
-  # dur dans le code (services/langgraph-agent/app/graph.py) :
+  # dur dans le code (services/langgraph-agent/app/graph.py), avec les
+  # paramètres de sampling validés (voir ci-dessous) :
   #   docker exec -it ollama ollama pull qwen3.6:35b
-  #   docker exec -it ollama ollama cp qwen3.6:35b agent-llm
+  #   scripts/rebuild-agent-llm.sh qwen3.6:35b
+  #
+  # ⚠️ Avec un modèle fortement quantisé (ex. IQ2_M), des pénalités
+  # anti-répétition trop agressives (repeat_penalty/repeat_last_n/
+  # presence_penalty élevés) sont contre-productives : elles interdisent au
+  # modèle de réutiliser des mots sur une longue fenêtre, ce qui le force à
+  # piocher un vocabulaire toujours plus rare et le fait dériver vers de
+  # l'incohérence — sans jamais produire de tool_calls, jusqu'à saturer tout
+  # le contexte (voir README, tableau des bugs, où cette cause a été
+  # confirmée par comparaison d'horodatages puis rejeu de la tâche cassée).
+  # Ce réglage vit dans le store Ollama du conteneur (volume ollama-data),
+  # pas dans ce repo, et un `ollama pull`/`cp` refait à la main l'écrase :
+  # scripts/rebuild-agent-llm.sh fige la recette (repeat_penalty 1.05,
+  # repeat_last_n 256, presence_penalty 0) pour la réappliquer à l'identique
+  # quel que soit le modèle source, y compris après un changement de modèle
+  # puis un retour au modèle actuel.
+  #
+  # ⚠️ Testé aussi avec qwen3.6:35b-a3b (non quantisé, 21,45 Go) sur une GPU
+  # 16 Go : tient pour du texte pur, mais OOM (~248 Mio manquants) dès qu'une
+  # image (screen_shot GhostDesk) entre dans le contexte — le buffer de
+  # l'encodeur vision (mtmd) n'est alloué qu'à ce moment-là, après que poids
+  # + KV cache + compute buffer texte ont déjà quasi saturé la VRAM. Ni
+  # réduire `num_gpu` manuellement (contre-productif : casse le partage
+  # GPU/CPU automatique d'Ollama, qui gère déjà ~13 Go réels en VRAM sur les
+  # 21,45 Go du modèle), ni réduire `OLLAMA_CONTEXT_LENGTH` à 8192, ni
+  # flash-attention + cache K/V q8_0 n'ont suffi à combler ce déficit. À
+  # retester quand plus de VRAM sera disponible plutôt que de continuer à
+  # ajuster ces réglages sur 16 Go.
   ollama:
     image: ollama/ollama:latest
     container_name: ollama

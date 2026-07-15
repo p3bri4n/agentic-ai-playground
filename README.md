@@ -100,7 +100,7 @@ Résumé des suites, à date de la dernière vérification :
 | `context-manager` | 4 | ingestion/retrieval Qdrant, mémoire par utilisateur, collection vide |
 | `mcp-client` | 8 | registre d'outils, schéma function-calling (description/inputSchema) exposé pour le LLM, appel réel via stdio, erreur 404 sur outil inconnu, appel réel via Streamable HTTP (serveur "desktop"/GhostDesk) avec vérification du bearer token et de l'en-tête `GhostDesk-Model-Space` |
 | `mcp-terminal` | 6 | liste blanche de commandes, lecture de fichier (y compris nom avec espace), blocage du path traversal |
-| `langgraph-agent` | 25 | boucle d'appel d'outil, non-duplication des messages, endpoint streaming et non-streaming, pause/reprise d'approbation humaine (approuvé, refusé, streaming inclus), non-duplication de l'historique sur plusieurs tours de conversation, repli du raisonnement Ollama/Qwen3 (champ `reasoning`) en balises `<think>`, liaison du schéma d'outils mcp-client au LLM (bind_tools), repli des résultats d'outil image en message multimodal PNG, auto-approbation des outils souris/capture d'écran GhostDesk (`AUTO_APPROVED_TOOLS`) y compris tours mixtes, endpoints `/pending` et `/approve` pour une approbation par bouton d'UI, fermeture de la balise `<think>` restée ouverte en streaming avant le texte d'approbation, fusion d'un seul bloc `<think>` continu sur plusieurs itérations de la boucle d'outils auto-approuvés |
+| `langgraph-agent` | 28 | boucle d'appel d'outil, non-duplication des messages, endpoint streaming et non-streaming, pause/reprise d'approbation humaine (approuvé, refusé, streaming inclus), non-duplication de l'historique sur plusieurs tours de conversation, repli du raisonnement Ollama/Qwen3 (champ `reasoning`) en balises `<think>`, liaison du schéma d'outils mcp-client au LLM (bind_tools), repli des résultats d'outil image en message multimodal PNG, auto-approbation des outils souris/capture d'écran GhostDesk (`AUTO_APPROVED_TOOLS`) y compris tours mixtes, endpoints `/pending` et `/approve` pour une approbation par bouton d'UI, fermeture de la balise `<think>` restée ouverte en streaming avant le texte d'approbation, fusion d'un seul bloc `<think>` continu sur plusieurs itérations de la boucle d'outils auto-approuvés, notice explicite quand MAX_TOOL_ITERATIONS coupe un run avec un tool_call encore en attente, garde-fou `AUTO_APPROVAL_STREAK_LIMIT` forçant un passage humain après N tours auto-approuvés consécutifs (avec réarmement du compteur après approbation) |
 
 ## Bugs trouvés et corrigés pendant le développement
 
@@ -124,6 +124,8 @@ Cette démarche a permis de trouver et corriger les bugs suivants :
 | `ollama` (service) | avec une image dans le contexte, le nombre de tokens (texte + tokens visuels) dépassait le contexte par défaut choisi automatiquement par Ollama selon la VRAM disponible (4096 tokens observés) — `"request (4713 tokens) exceeds the available context size (4096 tokens)"` | `OLLAMA_CONTEXT_LENGTH=16384` fixé explicitement dans `docker-compose.yml` |
 | `mcp-client` | les clics souris GhostDesk (`mouse_click`, etc.) atterrissaient systématiquement à côté de leur cible avec les modèles Qwen : ceux-ci raisonnent nativement en repère de coordonnées normalisé 0-1000, alors que GhostDesk interprète par défaut les coordonnées reçues comme des pixels écran natifs (documenté par GhostDesk) | en-tête `GhostDesk-Model-Space` (`GHOSTDESK_MODEL_SPACE`, défaut `1000`) ajouté à chaque appel HTTP vers GhostDesk dans `_run_on_server` |
 | `langgraph-agent` | avec `AUTO_APPROVED_TOOLS`, `call_llm` peut s'exécuter plusieurs fois d'affilée sans pause d'approbation (boucle capture/clic GhostDesk) ; chaque appel remettait l'état de la balise `<think>` à zéro, donc chaque itération de raisonnement rouvrait sa propre balise en plein milieu du flux — Open WebUI n'affiche en bulle repliable que celle en tout début de message, les suivantes apparaissaient en texte brut visible (ex. observé en usage réel : `<think>...<think>...</think>Cliqué.`) | état `think_opened`/`think_closed` déplacé de la variable de contexte locale à `AgentState` (comme `tool_iterations`), reporté d'un appel de `call_llm` à l'autre au sein d'un même tour et remis à `False` uniquement au tout début d'un nouveau tour (`_resolve_run`, `app/main.py`) — un seul bloc `<think>` continu sur toute la boucle |
+| `langgraph-agent` | `tool_iterations` ne se réinitialise jamais entre deux tours "approuver" (seulement sur un tout nouveau message utilisateur) : le budget de `MAX_TOOL_ITERATIONS` (5 à l'origine) est donc partagé sur toute une chaîne d'approbations, épuisé en 2-3 aller-retours à peine, avant même la boucle GhostDesk auto-approuvée qui en consomme 2 par geste (capture+clic) — `has_tool_calls` force alors la fin du graphe MÊME SI le dernier message du modèle contient un tool_calls en attente, silencieusement jeté sans aucun message d'explication (observé en usage réel : l'agent semblait "s'arrêter" en plein milieu d'une tâche, ex. en train de taper une URL) | `MAX_TOOL_ITERATIONS` relevé (configurable via env, défaut `20`) ; `app/main.py` détecte désormais ce cas (dernier message avec `tool_calls` mais graphe non mis en pause) et renvoie une notice explicite au lieu du texte de raisonnement brut ; `recursion_limit` de LangGraph (25 par défaut, indépendant de `MAX_TOOL_ITERATIONS` et bien plus vite atteint par une longue boucle auto-approuvée) relevé en conséquence pour éviter un `GraphRecursionError` brut avant même d'atteindre cette notice |
+| `ollama` (modèle `agent-llm`, quant IQ2_M) | un tour de raisonnement pouvait dégénérer en dérive sémantique (pas une répétition mot à mot, mais une cascade de synonymes de plus en plus rares/incohérents, ex. observé en usage réel sur la tâche "va sur google.fr" : dérive vers une énumération de gentilés régionaux français puis d'ères géologiques) sans jamais produire de `tool_calls`, jusqu'à saturer tout le contexte (`OLLAMA_CONTEXT_LENGTH`). Nos garde-fous (`MAX_TOOL_ITERATIONS`/`AUTO_APPROVAL_STREAK_LIMIT`) ne s'appliquent pas ici : ils comptent des itérations d'*outils*, pas la longueur d'une génération. Cause réelle, confirmée en comparant l'horodatage du manifest Ollama (recréation à 10:56) à celui de la conversation cassée (11:12) puis en rejouant la même tâche après correction : le Modelfile de `agent-llm` avait été durci un peu plus tôt dans la même session (`repeat_penalty` `1.0`→`1.15`, `repeat_last_n` `64`→`1024`, `presence_penalty` déjà à `1.5`) pour parer une boucle de répétition redoutée, mais cette combinaison était en réalité bien trop agressive pour un modèle aussi quantisé — en interdisant la réutilisation de mots sur une fenêtre de 1024 tokens, elle forçait le modèle à piocher un vocabulaire toujours plus rare pour continuer, provoquant elle-même la dérive observée. Une première explication écrite ici ("`repeat_last_n` trop court") s'est donc révélée fausse : le réglage durci était déjà actif *pendant* la dérive, pas absent | Modelfile assoupli : `repeat_penalty` `1.15`→`1.05`, `repeat_last_n` `1024`→`256`, `presence_penalty` `1.5`→`0` — revérifié en rejouant "va sur google.fr" via `/v1/chat/completions`, deux tours consécutifs cohérents (`key_type` puis `key_press`, sans dérive). Ce réglage vivait uniquement dans le store Ollama du conteneur (volume `ollama-data`), perdu au moindre `ollama pull`/`cp` refait à la main : `scripts/rebuild-agent-llm.sh <modèle-source>` fige désormais la recette dans le repo pour la réappliquer à l'identique quel que soit le modèle source, y compris après un changement de modèle puis un retour au modèle actuel. `LLM_MAX_TOKENS` (configurable via env, défaut `2048`, `app/graph.py`) conservé en filet de sécurité indépendant, pour plafonner tout dérapage résiduel d'un tour plutôt que de laisser saturer tout le contexte |
 
 Une fausse alerte a aussi été rencontrée puis écartée : un test utilisait un
 monkeypatch global de `httpx.AsyncClient` pour simuler les appels HTTP vers
@@ -202,17 +204,37 @@ conversation avec un message `⚠️ Approbation requise pour : ...` ; répondre
 la refuse (un `ToolMessage` d'erreur "Rejeté par l'utilisateur" est renvoyé
 au LLM, qui peut réagir normalement).
 
-**Exception : auto-approbation des outils souris/capture d'écran GhostDesk**
-(`AUTO_APPROVED_TOOLS`, variable d'env, défaut `screen_shot,mouse_move,
-mouse_click,mouse_double_click,mouse_drag,mouse_scroll`). Un modèle qui vise
-mal à l'écran (limite de vision/grounding, voir plus bas) doit pouvoir
-itérer capture → clic → capture sans qu'un humain valide chaque clic un par
-un. Ces outils n'ont pas d'effet destructeur ni de saisie (pas de clavier,
-pas de lancement d'appli, pas de presse-papiers). Routage dans
-`has_tool_calls` : un tour dont **tous** les tool_calls sont dans cette
-liste saute `require_approval` ; un tour mixte (même un seul outil hors
-liste) reste entièrement soumis à approbation, par sécurité — pas
-d'approbation partielle par outil.
+**Exception : auto-approbation des outils sans effet destructeur ni saisie**
+(`AUTO_APPROVED_TOOLS`, variable d'env, défaut `app_list,app_running,
+screen_shot,mouse_move,mouse_click,mouse_double_click,mouse_drag,
+mouse_scroll`). Critère de sélection : introspection pure (`app_list`,
+`app_running`, aucun effet de bord) et pilotage souris/capture d'écran
+GhostDesk — un modèle qui vise mal à l'écran (limite de vision/grounding,
+voir plus bas) doit pouvoir itérer capture → clic → capture sans qu'un
+humain valide chaque clic un par un. Routage dans `has_tool_calls` : un tour
+dont **tous** les tool_calls sont dans cette liste saute `require_approval` ;
+un tour mixte (même un seul outil hors liste) reste entièrement soumis à
+approbation, par sécurité — pas d'approbation partielle par outil.
+
+Deux exclusions volontaires malgré leur nom trompeur :
+- `clipboard_get` reste soumis à approbation malgré son nom de "lecture" :
+  il peut exfiltrer des données sensibles copiées par l'utilisateur (mot de
+  passe, jeton...), pas moins sensible que `clipboard_set`.
+- `key_type`/`key_press` restent exclus, mais une **suite** de `mouse_click`
+  auto-approuvés peut en théorie composer n'importe quelle saisie via un
+  clavier virtuel à l'écran, contournant de fait cette exclusion — voir
+  `AUTO_APPROVAL_STREAK_LIMIT` juste en dessous.
+
+**Garde-fou contre le clavier virtuel** (`AUTO_APPROVAL_STREAK_LIMIT`,
+variable d'env, défaut `6`) : au-delà de ce nombre de tours auto-approuvés
+consécutifs *sans passage par un humain*, `has_tool_calls` force le tour
+suivant à repasser par `require_approval` — même s'il ne contient que des
+outils normalement auto-approuvés. Compteur `auto_approval_streak` dans
+`AgentState`, incrémenté à chaque tour exécuté (`call_tools`) et remis à 0
+dès qu'un humain valide réellement une approbation (`require_approval`,
+uniquement lors de la reprise, pas pendant la pause). Distinct de
+`tool_iterations`/`MAX_TOOL_ITERATIONS`, qui mesure un budget total pour
+toute la tâche et non un nombre de tours *consécutifs sans supervision*.
 
 **Approbation par bouton d'UI, sans passer par un message texte** : deux
 endpoints complètent le flux texte "approuver"/"refuser" —

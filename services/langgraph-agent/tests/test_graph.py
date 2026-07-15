@@ -148,6 +148,89 @@ async def test_mixed_auto_and_manual_tools_still_requires_approval(mock_side_ser
 
 
 @pytest.mark.asyncio
+async def test_auto_approval_streak_limit_forces_human_checkin(mock_side_services, monkeypatch):
+    """
+    Garde-fou contre le clavier virtuel : une suite de clics auto-approuvés
+    peut en théorie composer n'importe quelle saisie sans jamais qu'un humain
+    ne valide quoi que ce soit. Passé AUTO_APPROVAL_STREAK_LIMIT tours
+    auto-approuvés consécutifs, le tour suivant doit repasser par
+    require_approval même s'il ne contient QUE des outils normalement
+    auto-approuvés.
+    """
+    import app.graph as g
+
+    monkeypatch.setattr(g, "AUTO_APPROVAL_STREAK_LIMIT", 2)
+
+    route = mock_side_services.post("http://fake-vllm/v1/chat/completions")
+    route.side_effect = [
+        _sse_response(tool_call_response("mouse_click", f"call_{i}", '{"x": 1, "y": 2}')) for i in range(3)
+    ] + [_sse_response(text_response(["Terminé", "."]))]
+    mcp_route = mock_side_services.post("http://fake-mcp-client/call").mock(
+        return_value=httpx.Response(200, json={"content": [{"type": "text", "text": "ok"}]})
+    )
+    g.agent_graph = g.build_graph()
+
+    state = {"messages": [{"role": "user", "content": "Clique en boucle"}], "tool_iterations": 0, "approved": None}
+    await g.agent_graph.ainvoke(state, CONFIG)
+
+    snapshot = await g.agent_graph.aget_state(CONFIG)
+    # 2 tours auto-approuvés exécutés (mouse_click, iterations 1 et 2), le
+    # 3e est bloqué en pause malgré mouse_click étant dans AUTO_APPROVED_TOOLS
+    assert snapshot.next == ("require_approval",)
+    assert snapshot.values["auto_approval_streak"] == 2
+    assert mcp_route.call_count == 2
+
+    # Une fois l'humain repassé par require_approval, le compteur est réarmé
+    # à 0 : la pratique n'est pas bloquée définitivement, juste jalonnée d'un
+    # point de contrôle humain périodique.
+    await g.agent_graph.aupdate_state(CONFIG, {"approved": True})
+    await g.agent_graph.ainvoke(None, CONFIG)
+    snapshot = await g.agent_graph.aget_state(CONFIG)
+    assert snapshot.next == ()
+    assert snapshot.values["auto_approval_streak"] == 1  # 0 réarmé, puis +1 pour ce tour exécuté
+    assert mcp_route.call_count == 3
+
+
+@pytest.mark.asyncio
+async def test_max_tool_iterations_ends_loop_with_pending_tool_calls(mock_side_services, monkeypatch):
+    """
+    Non-régression : rencontré en usage réel avec la boucle GhostDesk
+    auto-approuvée (capture/clic en rafale) — has_tool_calls force la fin du
+    graphe dès que tool_iterations atteint MAX_TOOL_ITERATIONS, MÊME SI le
+    dernier message du modèle contient encore un tool_calls en attente. Sans
+    vérification côté appelant (voir app/main.py), ce tool_calls est
+    silencieusement perdu : l'agent semble juste "s'arrêter" en plein milieu
+    d'une tâche, sans erreur ni pause d'approbation pour l'expliquer.
+    """
+    import app.graph as g
+
+    monkeypatch.setattr(g, "MAX_TOOL_ITERATIONS", 2)
+
+    route = mock_side_services.post("http://fake-vllm/v1/chat/completions")
+    # mouse_click est auto-approuvé (AUTO_APPROVED_TOOLS) : la boucle
+    # call_llm -> auto_call_tools ne repasse jamais par une pause tant que le
+    # modèle continue à en redemander.
+    route.side_effect = [
+        _sse_response(tool_call_response("mouse_click", f"call_{i}", '{"x": 1, "y": 2}')) for i in range(3)
+    ]
+    mock_side_services.post("http://fake-mcp-client/call").mock(
+        return_value=httpx.Response(200, json={"content": [{"type": "text", "text": "ok"}]})
+    )
+    g.agent_graph = g.build_graph()
+
+    state = {"messages": [{"role": "user", "content": "Clique en boucle"}], "tool_iterations": 0, "approved": None}
+    result = await g.agent_graph.ainvoke(state, {**CONFIG, "recursion_limit": 50})
+
+    snapshot = await g.agent_graph.aget_state(CONFIG)
+    assert snapshot.next == ()  # le graphe s'est bien terminé, pas mis en pause
+    assert snapshot.values["tool_iterations"] == 2
+    last_message = result["messages"][-1]
+    # le 3e tool_call (mouse_click number 2) n'a jamais été exécuté ni approuvé
+    assert last_message.tool_calls
+    assert last_message.tool_calls[0]["name"] == "mouse_click"
+
+
+@pytest.mark.asyncio
 async def test_approval_resumes_and_calls_mcp_client(mock_side_services):
     import app.graph as g
 
@@ -297,9 +380,17 @@ async def test_tool_image_result_becomes_multimodal_user_message(mock_side_servi
     Image.new("RGB", (2, 2), color="red").save(webp_buf, format="WEBP", lossless=True)
     webp_b64 = base64.b64encode(webp_buf.getvalue()).decode()
 
-    mock_side_services.post("http://fake-vllm/v1/chat/completions").mock(
-        return_value=_sse_response(tool_call_response("screen_shot", "call_1", "{}"))
-    )
+    # screen_shot puis une réponse texte finale : un seul aller-retour d'outil,
+    # pour ne pas dépendre de MAX_TOOL_ITERATIONS pour terminer la boucle
+    # (screen_shot est auto-approuvé, voir AUTO_APPROVED_TOOLS — un
+    # return_value fixe bouclerait donc indéfiniment jusqu'à percuter le
+    # recursion_limit interne de LangGraph, sans rapport avec ce qui est
+    # testé ici).
+    route = mock_side_services.post("http://fake-vllm/v1/chat/completions")
+    route.side_effect = [
+        _sse_response(tool_call_response("screen_shot", "call_1", "{}")),
+        _sse_response(text_response(["Capture", " prise."])),
+    ]
     mock_side_services.post("http://fake-mcp-client/call").mock(
         return_value=httpx.Response(
             200,
@@ -309,9 +400,7 @@ async def test_tool_image_result_becomes_multimodal_user_message(mock_side_servi
     g.agent_graph = g.build_graph()
 
     state = {"messages": [{"role": "user", "content": "Capture le bureau"}], "tool_iterations": 0, "approved": None}
-    await g.agent_graph.ainvoke(state, CONFIG)
-    await g.agent_graph.aupdate_state(CONFIG, {"approved": True})
-    result = await g.agent_graph.ainvoke(None, CONFIG)
+    result = await g.agent_graph.ainvoke(state, CONFIG)
 
     tool_message = next(m for m in result["messages"] if getattr(m, "type", None) == "tool")
     assert webp_b64 not in tool_message.content  # le base64 ne doit plus polluer le ToolMessage

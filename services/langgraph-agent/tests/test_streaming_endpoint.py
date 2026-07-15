@@ -219,6 +219,45 @@ async def test_non_streaming_endpoint_pauses_for_approval(mock_side_services):
 
 
 @pytest.mark.asyncio
+async def test_non_streaming_endpoint_reports_iteration_limit_notice(mock_side_services, monkeypatch):
+    """
+    Non-régression : avant ce correctif, un run qui percutait
+    MAX_TOOL_ITERATIONS avec un tool_call encore en attente (boucle
+    GhostDesk auto-approuvée) rendait juste le dernier texte de raisonnement
+    du modèle tel quel, sans aucune indication que la tâche avait été
+    interrompue — observé en usage réel (l'agent semblait "s'arrêter" en
+    plein milieu d'une phrase).
+    """
+    import app.graph as g
+    import app.main as main_mod
+
+    monkeypatch.setattr(g, "MAX_TOOL_ITERATIONS", 2)
+    monkeypatch.setattr(main_mod, "MAX_TOOL_ITERATIONS", 2)
+
+    route = mock_side_services.post("http://fake-vllm/v1/chat/completions")
+    route.side_effect = [
+        _sse_response(tool_call_response("mouse_click", f"call_{i}", '{"x": 1, "y": 2}')) for i in range(3)
+    ]
+    mock_side_services.post("http://fake-mcp-client/call").mock(
+        return_value=httpx.Response(200, json={"content": [{"type": "text", "text": "ok"}]})
+    )
+    g.agent_graph = g.build_graph()
+    main_mod.agent_graph = g.agent_graph
+
+    transport = httpx.ASGITransport(app=main_mod.app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.post(
+            "/v1/chat/completions",
+            json={"model": "agent-llm", "messages": [{"role": "user", "content": "Clique en boucle"}], "stream": False},
+        )
+
+    assert resp.status_code == 200
+    content = resp.json()["choices"][0]["message"]["content"]
+    assert "Limite d'itérations" in content
+    assert "mouse_click" in content
+
+
+@pytest.mark.asyncio
 async def test_non_streaming_endpoint_resumes_after_approval_reply(mock_side_services):
     import app.graph as g
     import app.main as main_mod

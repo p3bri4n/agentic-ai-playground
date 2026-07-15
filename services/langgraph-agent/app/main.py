@@ -24,7 +24,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
-from app.graph import agent_graph
+from app.graph import MAX_TOOL_ITERATIONS, agent_graph
 
 app = FastAPI(title="LangGraph Agent")
 
@@ -75,6 +75,14 @@ def _format_approval_request(tool_calls: list) -> str:
     return f'⚠️ Approbation requise pour : {demandes}. Réponds "approuver" ou "refuser" pour continuer.'
 
 
+def _format_iteration_limit_notice(tool_calls: list) -> str:
+    demandes = ", ".join(f'`{tc["name"]}`({tc["args"]})' for tc in tool_calls)
+    return (
+        f"⚠️ Limite d'itérations d'outils atteinte pour cette tâche avant d'avoir pu exécuter : "
+        f"{demandes}. Envoie un nouveau message pour relancer une tâche fraîche."
+    )
+
+
 async def _resolve_run(request: ChatCompletionRequest):
     """
     Prépare le (config, run_input) à passer au graphe.
@@ -91,7 +99,19 @@ async def _resolve_run(request: ChatCompletionRequest):
       - tout premier tour de cette conversation -> aucun état persisté encore,
         on soumet l'historique initial tel quel.
     """
-    config = {"configurable": {"thread_id": _derive_thread_id(request.messages)}}
+    # recursion_limit compte les NŒUDS visités (pas les appels d'outils) et
+    # vaut 25 par défaut côté LangGraph — indépendant de MAX_TOOL_ITERATIONS
+    # et bien plus vite atteint : la boucle GhostDesk auto-approuvée peut
+    # enchaîner de nombreux tours call_llm/call_tools sans jamais repasser
+    # par une pause d'approbation qui, elle, découperait le run en plusieurs
+    # appels de ainvoke() avec un budget de récursion frais à chaque fois.
+    # Sans cet ajustement, un run auto-approuvé assez long lève un
+    # GraphRecursionError brut (500) avant même d'atteindre notre propre
+    # notice de limite (voir _format_iteration_limit_notice plus haut).
+    config = {
+        "configurable": {"thread_id": _derive_thread_id(request.messages)},
+        "recursion_limit": MAX_TOOL_ITERATIONS * 4 + 10,
+    }
     snapshot = await agent_graph.aget_state(config)
     # Nombre de messages Open WebUI que ce tour aura entièrement couverts une
     # fois sa réponse (unique) produite : l'historique actuel + cette réponse.
@@ -117,6 +137,7 @@ async def _resolve_run(request: ChatCompletionRequest):
         "owui_message_count": owui_message_count,
         "think_opened": False,
         "think_closed": False,
+        "auto_approval_streak": 0,
     }
     return config, run_input
 
@@ -170,26 +191,35 @@ async def _stream_response(config: dict, run_input: Optional[dict], model: str):
         else:
             yield _sse_chunk(completion_id, model, {"content": chunk.content})
 
+    # Si le modèle a raisonné avant de décider d'appeler un outil, les tokens
+    # <think>...</think> streamés ci-dessus (voir app/graph.py) n'ont jamais
+    # reçu leur balise fermante : côté LLM, un tour qui aboutit à un
+    # tool_call a un content final vide, donc aucun chunk de contenu "réel"
+    # n'arrive jamais pour déclencher la fermeture (voir
+    # _convert_delta_with_reasoning). call_llm referme bien la balise sur le
+    # message PERSISTÉ après coup, mais ça ne corrige pas les chunks déjà
+    # envoyés au client dans la boucle ci-dessus — c'est donc sur ce qui a été
+    # réellement streamé (`streamed_text`) qu'il faut vérifier, pas sur
+    # l'état déjà réparé. Sans ce correctif, le texte ajouté ensuite (pause
+    # d'approbation ou notice de limite) se retrouve avalé dans le <think>
+    # resté ouvert côté client, invisible en dehors de la bulle repliée.
+    full_streamed = "".join(streamed_text)
+    closing_prefix = "</think>\n\n" if full_streamed.count("<think>") > full_streamed.count("</think>") else ""
+
     snapshot = await agent_graph.aget_state(config)
     if snapshot.next:
-        # Si le modèle a raisonné avant de décider d'appeler un outil, les
-        # tokens <think>...</think> streamés ci-dessus (voir app/graph.py)
-        # n'ont jamais reçu leur balise fermante : côté LLM, un tour qui
-        # aboutit à un tool_call a un content final vide, donc aucun chunk de
-        # contenu "réel" n'arrive jamais pour déclencher la fermeture (voir
-        # _convert_delta_with_reasoning). call_llm referme bien la balise sur
-        # le message PERSISTÉ après coup, mais ça ne corrige pas les chunks
-        # déjà envoyés au client dans la boucle ci-dessus — c'est donc sur ce
-        # qui a été réellement streamé (`streamed_text`) qu'il faut vérifier,
-        # pas sur l'état déjà réparé. Sans ce correctif, le texte d'approbation
-        # qui suit se retrouve avalé dans le <think> resté ouvert côté client,
-        # invisible en dehors de la bulle de pensée repliée.
-        full_streamed = "".join(streamed_text)
-        needs_closing_tag = full_streamed.count("<think>") > full_streamed.count("</think>")
-        pending = _format_approval_request(snapshot.values["messages"][-1].tool_calls)
-        if needs_closing_tag:
-            pending = "</think>\n\n" + pending
+        pending = closing_prefix + _format_approval_request(snapshot.values["messages"][-1].tool_calls)
         yield _sse_chunk(completion_id, model, {"role": "assistant", "content": pending})
+    else:
+        last_message = snapshot.values["messages"][-1]
+        if getattr(last_message, "tool_calls", None):
+            # Le graphe s'est arrêté sur MAX_TOOL_ITERATIONS avec un
+            # tool_call encore en attente côté modèle : sans ce message,
+            # l'agent semble juste "s'arrêter" en plein milieu d'une tâche,
+            # sans qu'aucune erreur ni pause d'approbation ne l'explique
+            # (voir MAX_TOOL_ITERATIONS, app/graph.py).
+            notice = closing_prefix + _format_iteration_limit_notice(last_message.tool_calls)
+            yield _sse_chunk(completion_id, model, {"role": "assistant", "content": notice})
 
     yield _sse_chunk(completion_id, model, {}, finish_reason="stop")
     yield "data: [DONE]\n\n"
@@ -199,7 +229,10 @@ async def _current_answer(config: dict) -> str:
     snapshot = await agent_graph.aget_state(config)
     if snapshot.next:
         return _format_approval_request(snapshot.values["messages"][-1].tool_calls)
-    return snapshot.values["messages"][-1].content
+    last_message = snapshot.values["messages"][-1]
+    if getattr(last_message, "tool_calls", None):
+        return _format_iteration_limit_notice(last_message.tool_calls)
+    return last_message.content
 
 
 @app.post("/pending")
@@ -229,7 +262,13 @@ async def approve(request: ApprovalDecisionRequest):
     le découpage `request.messages[already_seen:]` du tour normal suivant et
     de perdre le premier message que l'utilisateur enverra après.
     """
-    config = {"configurable": {"thread_id": _derive_thread_id(request.messages)}}
+    # Voir la note sur recursion_limit dans _resolve_run : ce endpoint reprend
+    # aussi une exécution du graphe (ainvoke plus bas), donc soumis au même
+    # risque de GraphRecursionError sur une boucle auto-approuvée longue.
+    config = {
+        "configurable": {"thread_id": _derive_thread_id(request.messages)},
+        "recursion_limit": MAX_TOOL_ITERATIONS * 4 + 10,
+    }
     snapshot = await agent_graph.aget_state(config)
     if not snapshot.next:
         raise HTTPException(status_code=409, detail="Aucune approbation en attente pour ce thread.")

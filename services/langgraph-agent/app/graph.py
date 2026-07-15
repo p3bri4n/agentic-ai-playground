@@ -77,33 +77,65 @@ CONTEXT_MANAGER_URL = os.environ.get("CONTEXT_MANAGER_URL", "http://context-mana
 SKILL_MANAGER_URL = os.environ.get("SKILL_MANAGER_URL", "http://skill-manager:8001")
 MCP_CLIENT_URL = os.environ.get("MCP_CLIENT_URL", "http://mcp-client:8003")
 
-MAX_TOOL_ITERATIONS = 5
+# Budget cumulé d'appels d'outils pour une même tâche : partagé sur toute la
+# chaîne d'approbations d'un thread, PAS remis à zéro entre deux tours
+# "approuver" (tool_iterations ne repart de 0 que sur un tout nouveau message
+# utilisateur, voir _resolve_run dans app/main.py) — un ancien défaut de 5
+# s'épuisait après 2-3 aller-retours d'approbation à peine, avant même
+# d'atteindre la boucle GhostDesk auto-approuvée (capture/clic) qui consomme
+# elle seule 2 itérations par geste. Dépassement signalé explicitement à
+# l'utilisateur plutôt que silencieux (voir _current_answer, app/main.py).
+MAX_TOOL_ITERATIONS = int(os.environ.get("MAX_TOOL_ITERATIONS", "20"))
 
-# Outils dispensés d'approbation humaine : uniquement du pilotage souris/
-# capture d'écran GhostDesk, sans effet destructeur ni saisie (pas de clavier,
-# pas de lancement d'appli, pas de presse-papiers). Un modèle qui vise mal
-# (limite connue de vision/grounding, voir README) doit pouvoir itérer
-# capture → clic → capture sans qu'un humain valide chaque clic un par un ;
-# tout le reste (terminal, filesystem, git, browser, app_launch, saisie
+# Outils dispensés d'approbation humaine : introspection pure (app_list,
+# app_running — aucun effet de bord, rien à exfiltrer) et pilotage souris/
+# capture d'écran GhostDesk (sans effet destructeur ni saisie). Un modèle qui
+# vise mal (limite connue de vision/grounding, voir README) doit pouvoir
+# itérer capture → clic → capture sans qu'un humain valide chaque clic un par
+# un ; tout le reste (terminal, filesystem, git, browser, app_launch, saisie
 # clavier, presse-papiers) reste soumis à approbation stricte. Un tour dont
 # TOUS les tool_calls sont dans cette liste saute require_approval ; un tour
 # mixte (même un seul outil hors liste) reste entièrement soumis à
 # approbation, par sécurité.
+#
+# Exclusion volontaire de clipboard_get malgré son nom de "lecture" : il peut
+# exfiltrer des données sensibles que l'utilisateur a copiées (mot de passe,
+# jeton...), donc pas moins sensible que clipboard_set — les deux restent
+# soumis à approbation.
+#
+# Un clic seul est anodin, mais une SUITE de clics peut composer une saisie
+# complète via un clavier virtuel à l'écran, contournant de fait l'exclusion
+# de key_type/key_press ci-dessus. Voir AUTO_APPROVAL_STREAK_LIMIT plus bas
+# pour le garde-fou contre ce cas.
 AUTO_APPROVED_TOOLS = set(
     filter(
         None,
         os.environ.get(
             "AUTO_APPROVED_TOOLS",
-            "screen_shot,mouse_move,mouse_click,mouse_double_click,mouse_drag,mouse_scroll",
+            "app_list,app_running,screen_shot,mouse_move,mouse_click,mouse_double_click,mouse_drag,mouse_scroll",
         ).split(","),
     )
 )
+
+# Nombre de tours auto-approuvés consécutifs tolérés avant de forcer malgré
+# tout un passage par require_approval, même si tous les tool_calls du tour
+# restent dans AUTO_APPROVED_TOOLS — le garde-fou contre le clavier virtuel
+# évoqué ci-dessus : sans plafond, une longue suite de clics pourrait au
+# final saisir n'importe quel texte sans jamais qu'un humain ne valide quoi
+# que ce soit. Remis à 0 à chaque passage réel par require_approval (voir
+# cette fonction plus bas), pas seulement au début d'une nouvelle tâche —
+# contrairement à tool_iterations, qui lui mesure un budget total et non un
+# nombre de tours consécutifs SANS supervision humaine.
+AUTO_APPROVAL_STREAK_LIMIT = int(os.environ.get("AUTO_APPROVAL_STREAK_LIMIT", "6"))
 
 
 class AgentState(TypedDict):
     messages: Annotated[list, add_messages]
     tool_iterations: int
     approved: Optional[bool]
+    # Tours auto-approuvés consécutifs depuis le dernier passage par
+    # require_approval (voir AUTO_APPROVAL_STREAK_LIMIT plus haut).
+    auto_approval_streak: int
     # Nombre de messages Open WebUI (rôles user/assistant) déjà intégrés à ce
     # thread — permet à app/main.py de ne soumettre que les nouveaux messages
     # à chaque tour plutôt que tout l'historique renvoyé par Open WebUI (qui
@@ -122,11 +154,21 @@ class AgentState(TypedDict):
     think_closed: bool
 
 
+# Plafond de tokens par TOUR (un seul appel LLM), pas pour la conversation
+# entière : sans lui, une dérive en boucle de répétition (observée en usage
+# réel avec un modèle très quantisé — voir README) génère jusqu'à saturer
+# tout le contexte avant de s'arrêter (des dizaines de secondes, des milliers
+# de tokens), sans jamais produire de tool_calls ni déclencher nos propres
+# garde-fous (MAX_TOOL_ITERATIONS/AUTO_APPROVAL_STREAK_LIMIT), qui ne comptent
+# que des itérations d'outils, pas la longueur d'une génération.
+LLM_MAX_TOKENS = int(os.environ.get("LLM_MAX_TOKENS", "2048"))
+
 llm = ChatOpenAI(
     base_url=LLM_BASE_URL,
     api_key="not-needed",       # vLLM ne vérifie pas la clé par défaut
     model="agent-llm",
     temperature=0.2,
+    max_tokens=LLM_MAX_TOKENS,
 )
 
 # Schéma des outils MCP (terminal/filesystem/git/browser/desktop-GhostDesk),
@@ -227,7 +269,11 @@ def has_tool_calls(state: AgentState) -> str:
     tool_calls = getattr(last, "tool_calls", None)
     if not tool_calls or state["tool_iterations"] >= MAX_TOOL_ITERATIONS:
         return "end"
-    if all(tc["name"] in AUTO_APPROVED_TOOLS for tc in tool_calls):
+    all_auto_approved = all(tc["name"] in AUTO_APPROVED_TOOLS for tc in tool_calls)
+    # Le garde-fou clavier virtuel (voir AUTO_APPROVAL_STREAK_LIMIT) : même un
+    # tour entièrement auto-approuvé repasse par require_approval une fois le
+    # plafond de tours consécutifs sans supervision humaine atteint.
+    if all_auto_approved and state.get("auto_approval_streak", 0) < AUTO_APPROVAL_STREAK_LIMIT:
         return "auto_call_tools"
     return "call_tools"
 
@@ -236,7 +282,9 @@ async def require_approval(state: AgentState) -> dict:
     """Point de pause : bloque tant qu'un humain n'a pas approuvé/refusé (voir app/main.py)."""
     if state.get("approved") is None:
         raise NodeInterrupt("Approbation humaine requise avant exécution d'outil.")
-    return {"messages": []}
+    # Passage réel par un humain : réarme le budget de tours auto-approuvés
+    # consécutifs (voir AUTO_APPROVAL_STREAK_LIMIT).
+    return {"messages": [], "auto_approval_streak": 0}
 
 
 def route_after_approval(state: AgentState) -> str:
@@ -325,6 +373,11 @@ async def call_tools(state: AgentState) -> dict:
         "messages": new_messages,
         "tool_iterations": state["tool_iterations"] + 1,
         "approved": None,  # réarme la pause pour le prochain tour d'outils
+        # Incrémenté systématiquement (tour auto-approuvé ou juste validé par
+        # un humain) : require_approval l'a déjà remis à 0 dans ce second cas,
+        # donc cette exécution repart correctement à 1 (voir
+        # AUTO_APPROVAL_STREAK_LIMIT).
+        "auto_approval_streak": state.get("auto_approval_streak", 0) + 1,
     }
 
 
