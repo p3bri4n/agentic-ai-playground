@@ -3,7 +3,7 @@
 ![Logo](logo-agentic-ai-playground.jpg)
 
 Stack Docker Compose pour un agent IA local : Open WebUI → LangGraph Agent →
-(Skill Manager / Context Manager / MCP Client) → vLLM.
+(Skill Manager / Context Manager / MCP Client) → llama-server.
 
 ## Démarrage rapide
 
@@ -11,6 +11,9 @@ Stack Docker Compose pour un agent IA local : Open WebUI → LangGraph Agent →
 cp .env.example .env
 # éditer .env : WORKSPACE_HOST_PATH doit être le chemin ABSOLU de ./workspace sur l'hôte
 # (requis car mcp-client monte ce chemin dans des conteneurs qu'il spawn lui-même)
+# éditer .env : LLAMA_MODEL_FILE/LLAMA_MMPROJ_FILE doivent correspondre aux
+# .gguf réellement présents dans ./models (voir section Backend d'inférence
+# ci-dessous — jamais téléchargés automatiquement)
 
 docker pull mcp/filesystem:latest
 docker pull mcp/git:latest
@@ -47,12 +50,97 @@ services/
   ghostdesk/           image officielle YV17labs, bureau virtuel piloté par l'agent
                        (pas de code applicatif ici : service docker-compose à part,
                        mcp-client s'y connecte en Streamable HTTP)
+  llama-server/        build du fork llama.cpp servant le modèle (voir
+                       section Backend d'inférence) — pas de code Python ici,
+                       Dockerfile + entrypoint.sh de vérification du modèle
 skills/     à remplir (un sous-dossier par skill, avec un SKILL.md)
 workspace/  partagé avec les serveurs MCP filesystem/git/terminal, ainsi
             qu'avec langgraph-agent pour le journal d'audit (.audit/, voir
             section Supervision humaine)
-models/     poids du modèle servi par vLLM
+models/     poids (.gguf) du modèle et du projecteur multimodal servis par
+            llama-server — jamais téléchargés automatiquement, voir section
+            Backend d'inférence
 ```
+
+## Backend d'inférence
+
+Le backend par défaut est `llama-server`, buildé depuis le fork
+[YV17labs/llama-cpp-turboquant-webp](services/llama-server/Dockerfile)
+(branche `feature/turboquant-webp`) plutôt que llama.cpp upstream — ce fork
+ajoute le décodage WebP natif (voir Conversion d'images plus bas) et un
+type de cache KV `turbo3` (compression propriétaire à ce fork).
+
+Le build, le démarrage ET l'inférence ont été exécutés réellement (GPU +
+accès réseau disponibles), modèle cible chargé (`Qwen3.6-35B-A3B` quant
+`UD-Q4_K_XL` + `mmproj-F16`, réparti sur les deux GPU via `--tensor-split`)
+et une conversation complète menée de bout en bout à travers toute la
+stack (`langgraph-agent` → `llama-server`, streaming SSE, balises
+`<think>` correctement ouvertes/fermées, réponse finale correcte) — cinq
+bugs ont été trouvés et corrigés dans ce processus (packaging du build,
+CLI du serveur, format des deltas de raisonnement), voir le tableau des
+bugs plus bas.
+
+Commande de démarrage (`services/llama-server/entrypoint.sh`) :
+`--tensor-split 0.55,0.45 --ctx-size 32768 --cache-type-k q8_0
+--cache-type-v turbo3 --flash-attn --jinja --mmproj <mmproj> --parallel 1`.
+
+Modèle cible : **Qwen3.6-35B-A3B, quantisation Q5_K_M**, plus un projecteur
+multimodal (`--mmproj`) pour l'entrée image (screen_shot GhostDesk). Fichiers
+attendus dans `./models` (ou `MODELS_HOST_PATH`), noms configurables via
+`LLAMA_MODEL_FILE`/`LLAMA_MMPROJ_FILE` (défauts :
+`Qwen3.6-35B-A3B-Q5_K_M.gguf`/`mmproj-F16.gguf`) — **jamais téléchargés
+automatiquement** : `entrypoint.sh` vérifie leur présence au démarrage du
+conteneur et échoue avec un message clair (sur stderr, avant même de lancer
+`llama-server`) plutôt que de laisser échouer `llama-server` lui-même avec
+une erreur générique de chemin introuvable.
+
+vLLM a été retiré du projet : il attend un format de poids HuggingFace natif
+incompatible avec les `.gguf`, et n'apportait rien que llama.cpp ne couvre
+pas ici. Ollama reste disponible comme backend alternatif dans
+`docker-compose.yml` (llama.cpp sous le capot lui aussi, voir ce fichier
+pour l'activer), notamment pour un modèle non couvert par le fork
+turboquant-webp ; penser alors à repasser `IMAGE_FORMAT_PASSTHROUGH=png`
+(voir Conversion d'images plus bas), le décodeur mtmd d'Ollama échouant
+explicitement sur le WebP.
+
+## Images et thinking adaptatif (`services/langgraph-agent/app/graph.py`)
+
+**Conversion d'images** (`IMAGE_FORMAT_PASSTHROUGH`, variable d'env, défaut
+absent = conversion PNG) : `_to_png_data_uri` reste le chemin par défaut —
+chaque résultat image d'outil (`screen_shot` GhostDesk, WebP natif) est
+systématiquement reconverti en PNG avant transmission au LLM, seul format
+supporté par le décodeur mtmd d'Ollama. `IMAGE_FORMAT_PASSTHROUGH=webp`
+bascule sur `_to_image_data_uri`, qui transmet le WebP brut tel quel (data
+URI directe, aucun passage par Pillow) : à activer avec le backend
+`llama-server` par défaut, dont le fork llama.cpp décode le WebP nativement
+— gain CPU non négligeable sur une boucle capture/clic répétée.
+
+**Rétention d'images** (`MAX_IMAGES_IN_CONTEXT`, variable d'env, défaut `1`) :
+seules les `MAX_IMAGES_IN_CONTEXT` dernières captures d'écran restent en
+blocs `image_url` multimodaux dans l'historique soumis au LLM à chaque
+appel ; les précédentes sont remplacées par le texte indicatif
+`[screenshot antérieure supprimée]` (`_apply_image_retention`). **Ne touche
+jamais au checkpointer** : ce filtrage ne s'applique qu'à la liste de
+messages construite juste avant `bound_llm.astream()`, jamais à
+`state["messages"]` lui-même — l'historique complet, avec toutes les images
+d'origine, reste intact et rejouable (ex. si `MAX_IMAGES_IN_CONTEXT` change
+d'une conversation à l'autre). Motivation : une boucle capture/clic
+GhostDesk répétée peut accumuler de nombreuses captures dans l'historique,
+chacune coûteuse en tokens visuels, pour un intérêt quasi nul au-delà de la
+plus récente (seule reflète l'état actuel de l'écran).
+
+**Thinking adaptatif** (`ADAPTIVE_THINKING`, variable d'env, défaut `false`) :
+Qwen3.6 raisonne par défaut sur chaque tour (balises de pensée étendue),
+coûteux en latence pour une boucle perception-action rapide où chaque tour
+n'a qu'à décider "où cliquer ensuite". Si activé, `_apply_adaptive_thinking`
+ajoute un system prompt transitoire `/no_think` (lui aussi jamais persisté
+dans l'état du graphe, même principe que la rétention d'images ci-dessus)
+quand **tous** les tool_calls du tour précédent étaient auto-approuvés
+(même politique par tiers que `has_tool_calls`, grants de session inclus —
+voir `approval_policy.py`). Pas d'injection sur le tout premier tour d'une
+tâche (aucun tool_calls précédent à évaluer) ni dès qu'un outil sensible
+était en jeu dans ce tour précédent : le raisonnement complet y garde toute
+sa valeur.
 
 ## Tests
 
@@ -100,9 +188,9 @@ Résumé des suites, à date de la dernière vérification :
 |---|---|---|
 | `skill-manager` | 5 | chargement des skills, matching mot-clé, endpoints HTTP |
 | `context-manager` | 4 | ingestion/retrieval Qdrant, mémoire par utilisateur, collection vide |
-| `mcp-client` | 8 | registre d'outils, schéma function-calling (description/inputSchema) exposé pour le LLM, appel réel via stdio, erreur 404 sur outil inconnu, appel réel via Streamable HTTP (serveur "desktop"/GhostDesk) avec vérification du bearer token et de l'en-tête `GhostDesk-Model-Space` |
+| `mcp-client` | 9 | registre d'outils, schéma function-calling (description/inputSchema) exposé pour le LLM, appel réel via stdio, erreur 404 sur outil inconnu, appel réel via Streamable HTTP (serveur "desktop"/GhostDesk) avec vérification du bearer token et de l'en-tête `GhostDesk-Model-Space` (présent avec la valeur configurée ET absent quand `GHOSTDESK_MODEL_SPACE=""`) |
 | `mcp-terminal` | 6 | liste blanche de commandes, lecture de fichier (y compris nom avec espace), blocage du path traversal |
-| `langgraph-agent` | 61 (+1 test d'intégration live, ignoré par défaut) | boucle d'appel d'outil, non-duplication des messages, endpoint streaming et non-streaming, pause/reprise d'approbation humaine (approuvé, refusé, streaming inclus), non-duplication de l'historique sur plusieurs tours de conversation, repli du raisonnement Ollama/Qwen3 (champ `reasoning`) en balises `<think>`, liaison du schéma d'outils mcp-client au LLM (bind_tools), repli des résultats d'outil image en message multimodal PNG, **politique d'approbation par tiers de réversibilité** (`approval_policy.py` : tiers lecture/réversible/sensible par défaut, override `TIER_READ_TOOLS`/`TIER_REVERSIBLE_TOOLS`/`AUTO_APPROVED_TOOLS` rétrocompatible, outil inconnu toujours sensible, tour 100% tiers auto-approuvés vs tour mixte), **règles sur arguments** (`test_approval_rules.py` : `key_type` court/mono-ligne auto-approuvé vs long ou multi-lignes soumis à approbation (au niveau unitaire ET routage réel dans le graphe), règle absente retombe sur le tier statique, ambiguïté entre règles résolue par le plus restrictif, une règle peut durcir un tier autant que l'assouplir, grant de session appliqué après résolution de règle, chargement `APPROVAL_RULES_PATH`/YAML), **grants de session** (`test_session_grants.py` : premier appel toujours soumis à approbation même avec intention de grant, "approuver pour la session" auto-approuve les appels suivants du même outil, portée strictement par outil, grants perdus après reconstruction simulée du checkpointer, champ `grant_session` de `POST /approve`), **journal d'audit** (`test_audit_log.py` : tool_call tiers réversible auto-approuvé tracé, tiers lecture jamais tracé, seul l'appel auto-approuvé via un grant de session apparaît — pas le premier passé par approbation humaine, filtrage `GET /audit?thread_id=`), endpoints `/pending` et `/approve` pour une approbation par bouton d'UI, fermeture de la balise `<think>` restée ouverte en streaming avant le texte d'approbation, fusion d'un seul bloc `<think>` continu sur plusieurs itérations de la boucle d'outils auto-approuvés, notice explicite quand MAX_TOOL_ITERATIONS coupe un run avec un tool_call encore en attente, garde-fou `AUTO_APPROVAL_STREAK_LIMIT` forçant un passage humain après N tours auto-approuvés consécutifs (avec réarmement du compteur après approbation). `tests_integration/` (séparé, non mocké, opt-in via `RUN_LIVE_LLM_TESTS=1`) : non-régression de la dérive du LLM réel sur "va sur google.fr" (longueur de réponse, répétition de trigrammes), vérifiée aussi bien en échouant sur l'ancien Modelfile trop agressif qu'en passant sur le Modelfile corrigé |
+| `langgraph-agent` | 90 (+1 test d'intégration live, ignoré par défaut) | boucle d'appel d'outil, non-duplication des messages, endpoint streaming et non-streaming, pause/reprise d'approbation humaine (approuvé, refusé, streaming inclus), non-duplication de l'historique sur plusieurs tours de conversation, repli du raisonnement en balises `<think>` (champ `reasoning` Ollama OU `reasoning_content` llama-server), **récupération de réponse vide** (`test_empty_answer_recovery.py` : extraction d'un tool_call `<tool_call><function=...>` piégé en prose et reconstruction en tool_calls structuré, tour normalement soumis à approbation après récupération si l'outil est sensible, retry automatique jusqu'à `MAX_EMPTY_ANSWER_RETRIES` puis succès, reset de l'état `<think>` au retry, abandon propre une fois le budget épuisé, flux normal inchangé) + **notice de réponse vide** (`test_non_streaming_endpoint_reports_empty_answer_notice`/`test_streaming_endpoint_reports_empty_answer_notice` : dernier filet si les deux mitigations précédentes échouent), liaison du schéma d'outils mcp-client au LLM (bind_tools), repli des résultats d'outil image en message multimodal, **rétention d'images et thinking adaptatif** (`test_image_retention_and_thinking.py` : ne garde que les `MAX_IMAGES_IN_CONTEXT` dernières captures dans la requête envoyée au LLM sans jamais toucher au checkpointer, passthrough WebP vs conversion PNG par défaut selon `IMAGE_FORMAT_PASSTHROUGH`, injection `/no_think` après un tour entièrement auto-approuvé si `ADAPTIVE_THINKING` est actif, absence d'injection sur le premier tour ou après un outil sensible), **politique d'approbation par tiers de réversibilité** (`approval_policy.py` : tiers lecture/réversible/sensible par défaut, override `TIER_READ_TOOLS`/`TIER_REVERSIBLE_TOOLS`/`AUTO_APPROVED_TOOLS` rétrocompatible, outil inconnu toujours sensible, tour 100% tiers auto-approuvés vs tour mixte), **règles sur arguments** (`test_approval_rules.py` : `key_type` court/mono-ligne auto-approuvé vs long ou multi-lignes soumis à approbation (au niveau unitaire ET routage réel dans le graphe), règle absente retombe sur le tier statique, ambiguïté entre règles résolue par le plus restrictif, une règle peut durcir un tier autant que l'assouplir, grant de session appliqué après résolution de règle, chargement `APPROVAL_RULES_PATH`/YAML), **grants de session** (`test_session_grants.py` : premier appel toujours soumis à approbation même avec intention de grant, "approuver pour la session" auto-approuve les appels suivants du même outil, portée strictement par outil, grants perdus après reconstruction simulée du checkpointer, champ `grant_session` de `POST /approve`), **journal d'audit** (`test_audit_log.py` : tool_call tiers réversible auto-approuvé tracé, tiers lecture jamais tracé, seul l'appel auto-approuvé via un grant de session apparaît — pas le premier passé par approbation humaine, filtrage `GET /audit?thread_id=`), endpoints `/pending` et `/approve` pour une approbation par bouton d'UI, fermeture de la balise `<think>` restée ouverte en streaming avant le texte d'approbation, fusion d'un seul bloc `<think>` continu sur plusieurs itérations de la boucle d'outils auto-approuvés, notice explicite quand MAX_TOOL_ITERATIONS coupe un run avec un tool_call encore en attente, garde-fou `AUTO_APPROVAL_STREAK_LIMIT` forçant un passage humain après N tours auto-approuvés consécutifs (avec réarmement du compteur après approbation). `tests_integration/` (séparé, non mocké, opt-in via `RUN_LIVE_LLM_TESTS=1`) : non-régression de la dérive du LLM réel sur "va sur google.fr" (longueur de réponse, répétition de trigrammes), vérifiée aussi bien en échouant sur l'ancien Modelfile trop agressif qu'en passant sur le Modelfile corrigé |
 
 ## Bugs trouvés et corrigés pendant le développement
 
@@ -128,6 +216,12 @@ Cette démarche a permis de trouver et corriger les bugs suivants :
 | `langgraph-agent` | avec `AUTO_APPROVED_TOOLS`, `call_llm` peut s'exécuter plusieurs fois d'affilée sans pause d'approbation (boucle capture/clic GhostDesk) ; chaque appel remettait l'état de la balise `<think>` à zéro, donc chaque itération de raisonnement rouvrait sa propre balise en plein milieu du flux — Open WebUI n'affiche en bulle repliable que celle en tout début de message, les suivantes apparaissaient en texte brut visible (ex. observé en usage réel : `<think>...<think>...</think>Cliqué.`) | état `think_opened`/`think_closed` déplacé de la variable de contexte locale à `AgentState` (comme `tool_iterations`), reporté d'un appel de `call_llm` à l'autre au sein d'un même tour et remis à `False` uniquement au tout début d'un nouveau tour (`_resolve_run`, `app/main.py`) — un seul bloc `<think>` continu sur toute la boucle |
 | `langgraph-agent` | `tool_iterations` ne se réinitialise jamais entre deux tours "approuver" (seulement sur un tout nouveau message utilisateur) : le budget de `MAX_TOOL_ITERATIONS` (5 à l'origine) est donc partagé sur toute une chaîne d'approbations, épuisé en 2-3 aller-retours à peine, avant même la boucle GhostDesk auto-approuvée qui en consomme 2 par geste (capture+clic) — `has_tool_calls` force alors la fin du graphe MÊME SI le dernier message du modèle contient un tool_calls en attente, silencieusement jeté sans aucun message d'explication (observé en usage réel : l'agent semblait "s'arrêter" en plein milieu d'une tâche, ex. en train de taper une URL) | `MAX_TOOL_ITERATIONS` relevé (configurable via env, défaut `20`) ; `app/main.py` détecte désormais ce cas (dernier message avec `tool_calls` mais graphe non mis en pause) et renvoie une notice explicite au lieu du texte de raisonnement brut ; `recursion_limit` de LangGraph (25 par défaut, indépendant de `MAX_TOOL_ITERATIONS` et bien plus vite atteint par une longue boucle auto-approuvée) relevé en conséquence pour éviter un `GraphRecursionError` brut avant même d'atteindre cette notice |
 | `ollama` (modèle `agent-llm`, quant IQ2_M) | un tour de raisonnement pouvait dégénérer en dérive sémantique (pas une répétition mot à mot, mais une cascade de synonymes de plus en plus rares/incohérents, ex. observé en usage réel sur la tâche "va sur google.fr" : dérive vers une énumération de gentilés régionaux français puis d'ères géologiques) sans jamais produire de `tool_calls`, jusqu'à saturer tout le contexte (`OLLAMA_CONTEXT_LENGTH`). Nos garde-fous (`MAX_TOOL_ITERATIONS`/`AUTO_APPROVAL_STREAK_LIMIT`) ne s'appliquent pas ici : ils comptent des itérations d'*outils*, pas la longueur d'une génération. Cause réelle, confirmée en comparant l'horodatage du manifest Ollama (recréation à 10:56) à celui de la conversation cassée (11:12) puis en rejouant la même tâche après correction : le Modelfile de `agent-llm` avait été durci un peu plus tôt dans la même session (`repeat_penalty` `1.0`→`1.15`, `repeat_last_n` `64`→`1024`, `presence_penalty` déjà à `1.5`) pour parer une boucle de répétition redoutée, mais cette combinaison était en réalité bien trop agressive pour un modèle aussi quantisé — en interdisant la réutilisation de mots sur une fenêtre de 1024 tokens, elle forçait le modèle à piocher un vocabulaire toujours plus rare pour continuer, provoquant elle-même la dérive observée. Une première explication écrite ici ("`repeat_last_n` trop court") s'est donc révélée fausse : le réglage durci était déjà actif *pendant* la dérive, pas absent | Modelfile assoupli : `repeat_penalty` `1.15`→`1.05`, `repeat_last_n` `1024`→`256`, `presence_penalty` `1.5`→`0` — revérifié en rejouant "va sur google.fr" via `/v1/chat/completions`, deux tours consécutifs cohérents (`key_type` puis `key_press`, sans dérive). Ce réglage vivait uniquement dans le store Ollama du conteneur (volume `ollama-data`), perdu au moindre `ollama pull`/`cp` refait à la main : `scripts/rebuild-agent-llm.sh <modèle-source>` fige désormais la recette dans le repo pour la réappliquer à l'identique quel que soit le modèle source, y compris après un changement de modèle puis un retour au modèle actuel. `LLM_MAX_TOKENS` (configurable via env, défaut `2048`, `app/graph.py`) conservé en filet de sécurité indépendant, pour plafonner tout dérapage résiduel d'un tour plutôt que de laisser saturer tout le contexte |
+| `llama-server` | build CUDA échouant à l'édition de liens (`undefined reference to cuMemCreate/cuDeviceGet/cuGetErrorString/...`) : ggml active par défaut l'allocateur "CUDA Virtual Memory Management" (pooling KV-cache), qui lie `ggml-cuda` contre le driver CUDA réel (`libcuda.so`, cible CMake `CUDA::cuda_driver`) — absent d'une image `*-devel` au moment du build (fourni seulement au runtime par le driver hôte via `nvidia-container-toolkit`, jamais pendant un `docker build` classique) | `-DGGML_CUDA_NO_VMM=ON` ajouté à la configuration CMake — ne touche ni `--flash-attn` ni `--cache-type-v turbo3`, seulement cet allocateur de pooling (peu pertinent ici avec `--parallel 1`) |
+| `llama-server` | Blackwell (sm_120, RTX 5060 Ti) non pris en charge : la base `nvidia/cuda:12.4.1-*` initialement choisie ne supporte pas la compilation pour cette architecture (confirmé dans le CMakeLists du fork : `120a-real` nécessite CUDA >= 12.8) | base `nvidia/cuda:12.8.1-devel/runtime-ubuntu22.04` + `CMAKE_CUDA_ARCHITECTURES="89-real;120a-real"` explicite (Ada + Blackwell) plutôt que la détection "native" (nécessite un GPU visible PENDANT le build, absent d'un `docker build` standard) — revérifié via `llama-server --list-devices --gpus all`, les deux GPU détectés |
+| `llama-server` | binaire buildé mais inexécutable : `libllama-common.so.0`/`libmtmd.so.0`/`libllama.so.0`/`libggml-base.so.0` introuvables au lancement (`cannot open shared object file`) — le build CMake de ce fork produit les bibliothèques partagées dans le même dossier que les exécutables, mais SANS RPATH/RUNPATH embarqué (vérifié via `readelf -d`), contrairement à l'hypothèse initiale d'une résolution `$ORIGIN` ; `libgomp.so.1` (OpenMP, utilisé par le backend CPU de ggml) manquait aussi de l'image runtime | `COPY --from=build /src/build/bin/ /app/` (tout le dossier, pas seulement le binaire) + `ENV LD_LIBRARY_PATH=/app` + `libgomp1` ajouté aux paquets runtime |
+| `llama-server` | conteneur en boucle de redémarrage au premier lancement réel : `--flash-attn` (passé sans valeur dans `entrypoint.sh`, comme un simple flag booléen) avalait l'argument suivant (`--jinja`) comme sa propre valeur — `error: unknown value for --flash-attn: '--jinja'`. Ce fork a changé `-fa`/`--flash-attn` d'un flag booléen vers une option à valeur obligatoire (`on`/`off`/`auto`), confirmé via `llama-server --help` | `--flash-attn on` explicite dans `entrypoint.sh` — revérifié en relançant le conteneur, plus de boucle de redémarrage, modèle chargé jusqu'au bout |
+| `langgraph-agent` | avec llama-server (fork turboquant-webp) comme backend, le raisonnement du modèle disparaissait silencieusement du flux streamé (aucune erreur, juste absent) — le patch `_convert_delta_with_reasoning` (`app/graph.py`) ne lisait que le champ `reasoning` (convention Ollama, sur laquelle il avait été écrit et testé), alors que llama-server streame le raisonnement dans un champ `reasoning_content` (convention DeepSeek-R1/OpenAI o1). Confirmé en inspectant les deltas SSE bruts d'un vrai appel streamé contre le vrai binaire : jamais de clé `reasoning`, toujours `reasoning_content` | le patch lit désormais `reasoning` OU `reasoning_content` (`_dict.get("reasoning") or _dict.get("reasoning_content")`) — revérifié de bout en bout via `langgraph-agent` réel : `<think>` s'ouvre, le raisonnement s'affiche, `</think>` se ferme avant la réponse finale, comme avec Ollama |
+| `langgraph-agent` | observé en usage réel (conversation "va sur wikipedia.org et cherche l'article sur la ville de toulouse, en français", pilotage GhostDesk) : le modèle finissait parfois un tour SANS aucun `tool_calls` structuré ET sans texte de réponse visible — sa tentative d'appel d'outil restait écrite en prose façon Qwen (`<tool_call><function=NOM><parameter=...>`) noyée dans le raisonnement (`reasoning_content`), jamais reconnue comme un vrai tool_calls OpenAI. **Cause racine confirmée** en lisant le parseur du fork (`common/chat-auto-parser-generator.cpp`) : le raisonnement (`<think>...`) est capturé comme texte LIBRE, non contraint par la grammaire, jusqu'à rencontrer `</think>` — la grammaire stricte du tool-calling n'est appliquée qu'APRÈS cette balise. Si le modèle "tente" un appel avant d'avoir fermé `</think>` (observé après un raisonnement anormalement long/répétitif, à rapprocher de la dérive sémantique déjà documentée pour Ollama), la tentative reste piégée dans la zone non contrainte. Confirmé non-déterministe (rejouer le même prompt donne tantôt un `tool_calls` correct, tantôt cet échec) et confirmé résolu par `/no_think` (contourne entièrement ce chemin de code, voir Thinking adaptatif) — mais celui-ci ne s'injecte qu'à partir du tour suivant un tour auto-approuvé, pas sur le tout premier tour d'une tâche, là où le bug a justement été observé la première fois. Sans correctif, l'utilisateur ne voyait que la bulle de raisonnement se refermer sur rien, exactement le symptôme "l'agent s'arrête en plein milieu d'une tâche" déjà documenté pour `MAX_TOOL_ITERATIONS` | Trois mitigations complémentaires (aucune ne corrige la cause côté serveur/modèle, hors de portée ici) : **(1)** `_extract_fallback_tool_call` (`app/graph.py`) reconnaît la syntaxe `<tool_call><function=...>` piégée dans le texte et la reconstruit en tool_calls structuré avant même de compter le tour comme un échec (log `WARNING` à chaque récupération, pour garder la visibilité sur la fréquence réelle du problème) ; **(2)** `retry_empty_answer` reboucle automatiquement sur `call_llm` jusqu'à `MAX_EMPTY_ANSWER_RETRIES` fois (défaut `1`, budget cumulé pour toute la tâche comme `tool_iterations`) quand la reconstruction échoue aussi ; **(3)** au-delà, `has_visible_answer`/`_format_empty_answer_notice` (`app/main.py`) affiche une notice explicite plutôt qu'un message vide. **Confirmé efficace en conditions réelles** : sur 4 tâches indépendantes rejouées après déploiement du correctif, le parseur de secours s'est déclenché 5 fois (`app_launch`, `app_running` ×2, `screen_shot`) et a récupéré l'intention du modèle à chaque fois, sans qu'aucune des 4 tâches n'affiche la notice de repli |
 
 Une fausse alerte a aussi été rencontrée puis écartée : un test utilisait un
 monkeypatch global de `httpx.AsyncClient` pour simuler les appels HTTP vers
@@ -390,11 +484,16 @@ documentée plus haut pour le streaming n'a donc pas été touchée.
 - **Spawn réel de conteneurs Docker par `mcp-client`** : couvert avec un vrai
   serveur MCP lancé en process Python direct (même protocole que les vrais
   serveurs), mais pas avec le socket Docker ni les images `mcp/*` réelles.
-- **vLLM et le GPU** : aucune inférence réelle, aucun test de charge.
-- **Function calling streamé par un vrai vLLM** : le format exact peut varier
-  légèrement selon le modèle servi (Qwen, Devstral, etc.) par rapport au
-  format simulé dans les tests ; une vérification contre un déploiement vLLM
-  réel est recommandée avant mise en production.
+- **`llama-server` : build, démarrage et inférence texte vérifiés
+  réellement** (modèle `Qwen3.6-35B-A3B` quant `UD-Q4_K_XL` + `mmproj-F16`,
+  conversation complète de bout en bout à travers `langgraph-agent`, voir
+  section Backend d'inférence et tableau des bugs). **Non vérifié : function
+  calling réel avec un tool_call effectif** (les tests d'intégration
+  couvrant `has_tool_calls`/`require_approval`/`call_tools` restent basés
+  sur des réponses LLM simulées, voir section Tests) **et le décodage WebP
+  natif en conditions réelles** (`IMAGE_FORMAT_PASSTHROUGH=webp` — testé
+  uniquement en conversation texte pure, jamais avec un `screen_shot`
+  GhostDesk réel) ; aucun test de charge non plus.
 
 ## Limites connues assumées (choix de conception, pas des bugs)
 
@@ -417,10 +516,15 @@ documentée plus haut pour le streaming n'a donc pas été touchée.
   qui le justifie réellement — les deux coexistent sciemment plutôt que de
   remplacer l'un par l'autre. Accès : http://localhost:6080 une fois le
   service démarré, mot de passe = `GHOSTDESK_VNC_PASSWORD` (voir `.env`).
-- **Les outils de capture d'écran/clic guidé de `ghostdesk` ne sont pas
-  exploitables par l'agent actuel** : le modèle servi (Qwen2.5-Coder) n'est
-  pas multimodal, donc l'interprétation de captures d'écran nécessiterait un
-  LLM avec capacité vision — non fait ici.
+- **Limite historique levée** : les outils de capture d'écran/clic guidé de
+  `ghostdesk` n'étaient pas exploitables par l'agent tant que le modèle
+  servi (Qwen2.5-Coder, via vLLM) n'était pas multimodal. Le backend par
+  défaut est désormais `llama-server` (voir section Backend d'inférence),
+  servant Qwen3.6-35B-A3B avec un projecteur multimodal (`--mmproj`) —
+  l'agent peut donc désormais recevoir et interpréter les captures d'écran
+  GhostDesk. Reste néanmoins une limite distincte, non résolue : la
+  précision du grounding (viser le bon élément à l'écran) d'un modèle de
+  vision généraliste sans OCR/détection d'éléments UI dédiée.
 - **`ghostdesk` est un serveur MCP HTTP persistant avec état** (bureau/session
   VNC), contrairement aux autres serveurs MCP du projet qui sont spawnés en
   STDIO éphémère par `mcp-client` (`docker run -i --rm` par appel). Il tourne

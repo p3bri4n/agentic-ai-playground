@@ -102,16 +102,19 @@ def reasoning_tool_call_response(reasoning_tokens, tool_name, tool_call_id, argu
     )
 
 
-def reasoning_response(reasoning_tokens, content_tokens):
+def reasoning_response(reasoning_tokens, content_tokens, field="reasoning"):
     """
-    Simule une réponse Ollama (Qwen3+) qui streame un raisonnement dans le
-    champ "reasoning" des deltas, en plus de "content" — format hors standard
-    OpenAI que langchain-openai ignore nativement (voir app/graph.py, patch de
-    _convert_delta_to_message_chunk).
+    Simule une réponse qui streame un raisonnement dans un champ dédié des
+    deltas, en plus de "content" — format hors standard OpenAI que
+    langchain-openai ignore nativement (voir app/graph.py, patch de
+    _convert_delta_to_message_chunk). `field` distingue les deux conventions
+    rencontrées en conditions réelles : "reasoning" (Ollama, Qwen3+) et
+    "reasoning_content" (llama-server/fork turboquant-webp, convention
+    DeepSeek-R1/OpenAI o1 — confirmé par un appel streamé réel).
     """
     return sse_body(
         [({"role": "assistant", "content": ""}, None)]
-        + [({"reasoning": tok}, None) for tok in reasoning_tokens]
+        + [({field: tok}, None) for tok in reasoning_tokens]
         + [({"content": tok}, None) for tok in content_tokens]
         + [({}, "stop")]
     )

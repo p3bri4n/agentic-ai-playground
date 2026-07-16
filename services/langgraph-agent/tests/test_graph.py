@@ -501,6 +501,31 @@ async def test_reasoning_field_is_folded_into_think_tags(mock_side_services):
 
 
 @pytest.mark.asyncio
+async def test_reasoning_content_field_is_folded_into_think_tags(mock_side_services):
+    """
+    Non-régression : llama-server (fork turboquant-webp servant Qwen3.6)
+    streame le raisonnement dans un champ "reasoning_content", PAS
+    "reasoning" comme Ollama — convention DeepSeek-R1/OpenAI o1, confirmée
+    par un appel HTTP streamé réel contre le vrai binaire. Sans gérer ce
+    second nom de champ, le raisonnement de llama-server disparaissait
+    silencieusement (aucune erreur, juste absent du contenu streamé).
+    """
+    import app.graph as g
+
+    mock_side_services.post("http://fake-vllm/v1/chat/completions").mock(
+        return_value=_sse_response(
+            reasoning_response(["12*7", "=84"], ["Ça fait", " 84."], field="reasoning_content")
+        )
+    )
+    g.agent_graph = g.build_graph()
+
+    state = {"messages": [{"role": "user", "content": "Combien font 12*7 ?"}], "tool_iterations": 0, "approved": None}
+    result = await g.agent_graph.ainvoke(state, CONFIG)
+
+    assert result["messages"][-1].content == "<think>12*7=84</think>\n\nÇa fait 84."
+
+
+@pytest.mark.asyncio
 async def test_reasoning_without_trailing_content_still_closes_think_tag(mock_side_services):
     """Cas limite : le raisonnement va jusqu'au bout sans contenu final après (jamais
     observé en pratique avec Qwen3, mais call_llm doit rester robuste : la balise

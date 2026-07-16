@@ -81,6 +81,22 @@ def echo_http_server_with_model_space():
         proc.wait(timeout=5)
 
 
+@pytest.fixture
+def echo_http_server_rejecting_model_space_header():
+    """Comme echo_http_server, mais échoue si un header GhostDesk-Model-Space est reçu."""
+    port = _free_port()
+    token = "secret-token"
+    proc = subprocess.Popen(
+        [sys.executable, str(TEST_HTTP_SERVER_PATH), str(port), token, ""]
+    )
+    try:
+        _wait_for_port(port)
+        yield {"url": f"http://127.0.0.1:{port}/mcp", "token": token}
+    finally:
+        proc.terminate()
+        proc.wait(timeout=5)
+
+
 def _client():
     import app.main as main_mod
     return TestClient(main_mod.app)
@@ -168,6 +184,28 @@ def test_http_server_sends_model_space_header(echo_http_server_with_model_space)
         "url": echo_http_server_with_model_space["url"],
         "token": echo_http_server_with_model_space["token"],
         "model_space": echo_http_server_with_model_space["model_space"],
+    }
+
+    resp = _client().post("/call", json={"tool": "echo", "arguments": {"message": "bonjour"}})
+    assert resp.status_code == 200
+    assert resp.json()["content"][0]["text"] == "echo: bonjour"
+
+
+def test_http_server_omits_model_space_header_when_unset(echo_http_server_rejecting_model_space_header):
+    """
+    GHOSTDESK_MODEL_SPACE="" (modèle frontière travaillant nativement en
+    pixels écran, ex. Claude/GPT-4o) : le header ne doit JAMAIS être envoyé,
+    pas seulement être absent de la config par défaut — server["model_space"]
+    falsy (chaîne vide) doit empêcher tout ajout du header, voir
+    _run_on_server dans app/main.py.
+    """
+    import app.main as main_mod
+
+    main_mod.SERVERS["desktop"] = {
+        "transport": "http",
+        "url": echo_http_server_rejecting_model_space_header["url"],
+        "token": echo_http_server_rejecting_model_space_header["token"],
+        "model_space": "",
     }
 
     resp = _client().post("/call", json={"tool": "echo", "arguments": {"message": "bonjour"}})

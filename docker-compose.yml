@@ -29,7 +29,7 @@ services:
     container_name: langgraph-agent
     restart: unless-stopped
     environment:
-      - LLM_BASE_URL=${LLM_BASE_URL:-http://vllm:8000/v1}
+      - LLM_BASE_URL=${LLM_BASE_URL:-http://llama-server:8000/v1}
       - SKILL_MANAGER_URL=http://skill-manager:8001
       - CONTEXT_MANAGER_URL=http://context-manager:8002
       - MCP_CLIENT_URL=http://mcp-client:8003
@@ -37,13 +37,35 @@ services:
       # section Supervision humaine) : /workspace/.audit, sur le même bind
       # mount que les autres serveurs MCP filesystem/git/terminal.
       - AUDIT_LOG_DIR=/workspace/.audit
+      # Décodage image natif du fork llama.cpp servi par llama-server (voir
+      # plus bas) : transmet le WebP brut de screen_shot GhostDesk plutôt que
+      # de le reconvertir en PNG côté agent (défaut historique, nécessaire
+      # avec Ollama dont le décodeur mtmd échoue sur le WebP — voir tableau
+      # des bugs). Repasser à "png" (ou vider) si LLM_BASE_URL pointe de
+      # nouveau vers ollama.
+      - IMAGE_FORMAT_PASSTHROUGH=${IMAGE_FORMAT_PASSTHROUGH:-webp}
+      # Qwen3.6 raisonne par défaut sur chaque tour : coûteux pour la boucle
+      # perception-action rapide capture/clic de GhostDesk. Injecte /no_think
+      # dans le system prompt quand tous les tool_calls du tour précédent
+      # sont auto-approuvés (voir approval_policy.py) ; laisse le
+      # raisonnement normal sinon (première décision d'un tour, tool
+      # sensible...). Voir app/graph.py, _adaptive_thinking_directive.
+      - ADAPTIVE_THINKING=${ADAPTIVE_THINKING:-true}
+      # Filet de sécurité (voir README, tableau des bugs) : certains modèles
+      # écrivent parfois leur appel d'outil en prose au lieu d'un tool_calls
+      # structuré, piégé dans le raisonnement. Nombre de relances
+      # automatiques avant d'abandonner et d'afficher une notice, une fois
+      # la récupération de secours (_extract_fallback_tool_call) elle-même
+      # infructueuse. Budget cumulé pour toute la tâche, comme
+      # MAX_TOOL_ITERATIONS.
+      - MAX_EMPTY_ANSWER_RETRIES=${MAX_EMPTY_ANSWER_RETRIES:-1}
     volumes:
       - ./workspace:/workspace
     depends_on:
       - skill-manager
       - context-manager
       - mcp-client
-      - vllm
+      - llama-server
     networks:
       - agent-net
     # pas de port publié : uniquement accessible via le réseau interne
@@ -70,7 +92,7 @@ services:
     restart: unless-stopped
     environment:
       - QDRANT_URL=http://qdrant:6333
-      - LLM_BASE_URL=${LLM_BASE_URL:-http://vllm:8000/v1}
+      - LLM_BASE_URL=${LLM_BASE_URL:-http://llama-server:8000/v1}
     depends_on:
       qdrant:
         condition: service_healthy
@@ -168,27 +190,29 @@ services:
   # ──────────────────────────────────────────────────────────────
   # Inférence
   # ──────────────────────────────────────────────────────────────
-  # ⚠️ vLLM attend un modèle au format HuggingFace natif (dossier avec
-  # config.json/tokenizer/*.safetensors) sous ./models, PAS un .gguf : un
-  # .gguf isolé (format Ollama/llama.cpp) est réinterprété comme un repo_id
-  # HuggingFace mal formé et fait planter vLLM en boucle de redémarrage dès
-  # le démarrage (huggingface_hub.errors.HFValidationError). Support GGUF
-  # dans vLLM encore expérimental (--quantization gguf), non utilisé ici.
-  # Pour du GGUF/quants I-quants, utiliser le backend ollama plus bas à la
-  # place (voir LLM_BASE_URL).
-  vllm:
-    image: vllm/vllm-openai:latest
-    container_name: vllm
+  # Backend par défaut : llama-server, buildé depuis le fork YV17labs/
+  # llama-cpp-turboquant-webp (branche feature/turboquant-webp — décodage
+  # WebP natif + cache KV "turbo3", voir services/llama-server/Dockerfile).
+  # vLLM a été retiré du projet (utilisait un format de poids HuggingFace
+  # natif incompatible avec les .gguf, et n'apportait rien que llama.cpp ne
+  # couvre pas ici) ; Ollama reste disponible comme backend alternatif
+  # (llama.cpp sous le capot lui aussi) plus bas, hors depends_on par défaut.
+  #
+  # ⚠️ Ni ce Dockerfile ni le modèle cible n'ont pu être réellement buildés
+  # / exécutés dans l'environnement de développement utilisé (pas d'accès
+  # réseau au fork, pas de GPU) — voir l'avertissement détaillé dans
+  # services/llama-server/Dockerfile, à valider avant mise en production.
+  llama-server:
+    build: ./services/llama-server
+    container_name: llama-server
     restart: unless-stopped
-    command:
-      - "--model"
-      - "/models/Qwen2.5-Coder-32B-Instruct"   # adapter au modèle HF réellement présent dans ./models
-      - "--served-model-name"
-      - "agent-llm"
-      - "--host"
-      - "0.0.0.0"
-      - "--port"
-      - "8000"
+    environment:
+      # Modèle cible : Qwen3.6-35B-A3B, quantisation Q5_K_M. Fichiers
+      # attendus tels quels dans ./models (jamais téléchargés par ce
+      # service, voir entrypoint.sh) — adapter ces deux noms de fichier si
+      # les .gguf réellement présents diffèrent.
+      - LLAMA_MODEL_FILE=${LLAMA_MODEL_FILE:-Qwen3.6-35B-A3B-Q5_K_M.gguf}
+      - LLAMA_MMPROJ_FILE=${LLAMA_MMPROJ_FILE:-mmproj-F16.gguf}
     volumes:
       - ${MODELS_HOST_PATH:-./models}:/models
     deploy:
@@ -198,7 +222,6 @@ services:
             - driver: nvidia
               count: all
               capabilities: [gpu]
-    ipc: host              # requis par vLLM pour le shared memory PyTorch
     networks:
       - agent-net
     # décommenter pour exposer l'API OpenAI-compatible directement sur l'hôte
@@ -206,11 +229,11 @@ services:
     #   - "8000:8000"
 
   # --- Backend alternatif : Ollama (GGUF, quants I-quants/K-quants inclus) --
-  # Non utilisé par défaut (voir LLM_BASE_URL, qui pointe sur vllm par
+  # Non utilisé par défaut (voir LLM_BASE_URL, qui pointe sur llama-server par
   # défaut) : pour l'activer, définir dans .env
   #   LLM_BASE_URL=http://ollama:11434/v1
   # puis démarrer ce service explicitement (il n'est pas dans les depends_on
-  # de langgraph-agent/context-manager, qui restent câblés sur vllm) :
+  # de langgraph-agent/context-manager, qui restent câblés sur llama-server) :
   #   docker compose up -d ollama
   # Après le pull, aliaser le modèle en "agent-llm" pour matcher le nom en
   # dur dans le code (services/langgraph-agent/app/graph.py), avec les

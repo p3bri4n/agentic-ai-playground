@@ -258,6 +258,61 @@ async def test_non_streaming_endpoint_reports_iteration_limit_notice(mock_side_s
 
 
 @pytest.mark.asyncio
+async def test_non_streaming_endpoint_reports_empty_answer_notice(mock_side_services):
+    """
+    Non-régression (bug réel observé en usage réel, voir tableau des bugs du
+    README) : un modèle peut terminer un tour sans aucun tool_calls
+    structuré ET sans texte de réponse visible (tout son output tenait dans
+    le raisonnement, ex. une tentative d'appel d'outil écrite en prose
+    jamais reconnue comme un vrai tool_calls). Sans ce correctif, l'agent
+    répond juste "<think>...</think>" — vide une fois la bulle de
+    raisonnement repliée, sans aucune indication que quelque chose a mal
+    tourné.
+    """
+    import app.main as main_mod
+    import app.graph as g
+
+    mock_side_services.post("http://fake-vllm/v1/chat/completions").mock(
+        return_value=_sse_response(reasoning_response(["Je vais ", "réfléchir."], []))
+    )
+    g.agent_graph = g.build_graph()
+    main_mod.agent_graph = g.agent_graph
+
+    transport = httpx.ASGITransport(app=main_mod.app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.post(
+            "/v1/chat/completions",
+            json={"model": "agent-llm", "messages": [{"role": "user", "content": "Fais quelque chose"}], "stream": False},
+        )
+
+    assert resp.status_code == 200
+    content = resp.json()["choices"][0]["message"]["content"]
+    assert "réponse exploitable" in content
+
+
+@pytest.mark.asyncio
+async def test_streaming_endpoint_reports_empty_answer_notice(mock_side_services):
+    """Pendant du test non-streaming ci-dessus, côté flux SSE."""
+    import app.main as main_mod
+    import app.graph as g
+
+    mock_side_services.post("http://fake-vllm/v1/chat/completions").mock(
+        return_value=_sse_response(reasoning_response(["Je vais ", "réfléchir."], []))
+    )
+    g.agent_graph = g.build_graph()
+    main_mod.agent_graph = g.agent_graph
+
+    transport = httpx.ASGITransport(app=main_mod.app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        content = await _stream_contents(client, [{"role": "user", "content": "Fais quelque chose"}])
+
+    assert "réponse exploitable" in content
+    # la balise <think> doit être refermée AVANT la notice, comme pour les
+    # autres notices (approbation, limite d'itérations)
+    assert content.index("</think>") < content.index("réponse exploitable")
+
+
+@pytest.mark.asyncio
 async def test_non_streaming_endpoint_resumes_after_approval_reply(mock_side_services):
     import app.graph as g
     import app.main as main_mod

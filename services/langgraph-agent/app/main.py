@@ -25,7 +25,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from app import audit_log
-from app.graph import MAX_TOOL_ITERATIONS, agent_graph
+from app.graph import MAX_TOOL_ITERATIONS, agent_graph, has_visible_answer
 
 app = FastAPI(title="LangGraph Agent")
 
@@ -105,6 +105,27 @@ def _format_iteration_limit_notice(tool_calls: list) -> str:
     )
 
 
+def _format_empty_answer_notice() -> str:
+    """
+    Non-régression (bug réel observé en usage réel, cf. tableau des bugs du
+    README) : un modèle peut terminer un tour sans aucun tool_calls
+    structuré ET sans texte de réponse visible — ex. une tentative d'appel
+    d'outil écrite en prose (imitant la syntaxe <tool_call> qu'il voit
+    rendue par le template pour ses propres tours précédents) noyée dans le
+    raisonnement, jamais reconnue comme un tool_calls OpenAI. Sans ce
+    message, l'utilisateur ne voit que la bulle de raisonnement se refermer
+    sur rien : le même symptôme de "l'agent semble s'arrêter en plein
+    milieu d'une tâche" que MAX_TOOL_ITERATIONS (voir
+    _format_iteration_limit_notice), mais via un chemin différent (aucun
+    tool_calls en attente, juste une réponse vide).
+    """
+    return (
+        "⚠️ Le modèle a terminé son tour sans réponse exploitable (probablement une "
+        "tentative d'appel d'outil restée noyée dans son raisonnement plutôt que d'être "
+        "émise comme un vrai appel d'outil structuré). Envoie un nouveau message pour réessayer."
+    )
+
+
 async def _resolve_run(request: ChatCompletionRequest):
     """
     Prépare le (config, run_input) à passer au graphe.
@@ -163,6 +184,7 @@ async def _resolve_run(request: ChatCompletionRequest):
         "auto_approval_streak": 0,
         "session_grants": [],
         "grant_session": False,
+        "empty_answer_retries": 0,
     }
     return config, run_input
 
@@ -255,6 +277,12 @@ async def _stream_response(config: dict, run_input: Optional[dict], model: str):
             # (voir MAX_TOOL_ITERATIONS, app/graph.py).
             notice = closing_prefix + _format_iteration_limit_notice(last_message.tool_calls)
             yield _sse_chunk(completion_id, model, {"role": "assistant", "content": notice})
+        elif not has_visible_answer(full_streamed + closing_prefix):
+            # Voir _format_empty_answer_notice : aucun tool_calls en attente
+            # ET rien de visible hors <think> — même symptôme "agent
+            # silencieux" que ci-dessus, cause différente.
+            notice = closing_prefix + _format_empty_answer_notice()
+            yield _sse_chunk(completion_id, model, {"role": "assistant", "content": notice})
 
     yield _sse_chunk(completion_id, model, {}, finish_reason="stop")
     yield "data: [DONE]\n\n"
@@ -267,6 +295,8 @@ async def _current_answer(config: dict) -> str:
     last_message = snapshot.values["messages"][-1]
     if getattr(last_message, "tool_calls", None):
         return _format_iteration_limit_notice(last_message.tool_calls)
+    if not has_visible_answer(last_message.content):
+        return _format_empty_answer_notice()
     return last_message.content
 
 

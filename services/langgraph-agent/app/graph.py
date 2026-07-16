@@ -4,7 +4,8 @@ Graphe d'orchestration LangGraph.
 Flux :
   1. retrieve_context   -> interroge Context Manager (RAG / mémoire)
   2. select_skill        -> interroge Skill Manager pour injecter un prompt de skill pertinent
-  3. call_llm             -> appelle vLLM (API OpenAI-compatible) avec function calling
+  3. call_llm             -> appelle le backend d'inférence (llama-server par
+     défaut, API OpenAI-compatible) avec function calling
   4. has_tool_calls       -> route vers require_approval, ou directement vers
      auto_call_tools si TOUS les tool_calls du tour sont auto-approuvés selon
      la politique par tiers (app/approval_policy.py, voir plus bas)
@@ -32,12 +33,16 @@ redémarre (acceptable pour un usage local, voir README).
 import base64
 import contextvars
 import io
+import logging
 import os
 import json
+import re
+import uuid
 from typing import Annotated, Optional, TypedDict
 
 import httpx
 import langchain_openai.chat_models.base as _openai_base
+from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
 from PIL import Image
 from langgraph.checkpoint.memory import MemorySaver
@@ -47,13 +52,24 @@ from langgraph.graph.message import add_messages
 
 from app import approval_policy, audit_log
 
-# Ollama (modèles Qwen3+) renvoie le raisonnement dans un champ "reasoning" des
-# deltas SSE, en plus de "content" — un champ hors du format OpenAI standard,
-# que langchain-openai ignore silencieusement (_convert_delta_to_message_chunk
-# ne lit que "content"/"tool_calls"/"function_call"). On l'y réinjecte en le
-# repliant dans "content", entouré de <think>...</think> (convention reconnue
-# par Open WebUI pour afficher une bulle de pensée repliable), ce qui le fait
-# apparaître dans le flux de streaming existant sans toucher à app/main.py.
+logger = logging.getLogger(__name__)
+
+# Le raisonnement d'un modèle "thinking" arrive dans un champ dédié des
+# deltas SSE, en plus de "content" — hors du format OpenAI standard, que
+# langchain-openai ignore silencieusement (_convert_delta_to_message_chunk ne
+# lit que "content"/"tool_calls"/"function_call"). Le NOM de ce champ diffère
+# selon le backend : "reasoning" avec Ollama (modèles Qwen3+), "reasoning_
+# content" avec llama-server (confirmé en conditions réelles avec le fork
+# turboquant-webp servant Qwen3.6 — llama-server suit ici la convention
+# DeepSeek-R1/OpenAI o1, pas celle d'Ollama). Sans gérer les deux noms, le
+# raisonnement streamé par llama-server disparaîtrait silencieusement (aucune
+# erreur, juste absent du flux) — vérifié par un vrai appel streamé avant ce
+# correctif : les deltas ne contenaient que "reasoning_content", jamais
+# "reasoning". On réinjecte le contenu trouvé (quel que soit le nom du champ)
+# en le repliant dans "content", entouré de <think>...</think> (convention
+# reconnue par Open WebUI pour afficher une bulle de pensée repliable), ce
+# qui le fait apparaître dans le flux de streaming existant sans toucher à
+# app/main.py.
 _think_state: contextvars.ContextVar[Optional[dict]] = contextvars.ContextVar(
     "_think_state", default=None
 )
@@ -65,7 +81,7 @@ def _convert_delta_with_reasoning(_dict, default_class):
     state = _think_state.get()
     if state is None:
         return chunk
-    reasoning = _dict.get("reasoning")
+    reasoning = _dict.get("reasoning") or _dict.get("reasoning_content")
     if reasoning:
         prefix = "<think>" if not state["opened"] else ""
         state["opened"] = True
@@ -78,10 +94,20 @@ def _convert_delta_with_reasoning(_dict, default_class):
 
 _openai_base._convert_delta_to_message_chunk = _convert_delta_with_reasoning
 
-LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "http://vllm:8000/v1")
+LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "http://llama-server:8000/v1")
 CONTEXT_MANAGER_URL = os.environ.get("CONTEXT_MANAGER_URL", "http://context-manager:8002")
 SKILL_MANAGER_URL = os.environ.get("SKILL_MANAGER_URL", "http://skill-manager:8001")
 MCP_CLIENT_URL = os.environ.get("MCP_CLIENT_URL", "http://mcp-client:8003")
+
+# Format transmis au LLM pour les résultats image d'outil (screen_shot
+# GhostDesk, format WebP natif) : "webp" transmet le format brut tel quel,
+# en s'appuyant sur le décodage WebP natif du fork llama.cpp servi par
+# défaut (llama-server, voir README section Backend d'inférence). Toute
+# autre valeur (y compris vide, le défaut) reconvertit systématiquement en
+# PNG — nécessaire avec Ollama, dont le décodeur mtmd échoue explicitement
+# sur le WebP (voir _to_png_data_uri plus bas et le tableau des bugs du
+# README).
+IMAGE_FORMAT_PASSTHROUGH = os.environ.get("IMAGE_FORMAT_PASSTHROUGH", "").lower() == "webp"
 
 # Budget cumulé d'appels d'outils pour une même tâche : partagé sur toute la
 # chaîne d'approbations d'un thread, PAS remis à zéro entre deux tours
@@ -114,6 +140,119 @@ MAX_TOOL_ITERATIONS = int(os.environ.get("MAX_TOOL_ITERATIONS", "20"))
 # qui lui mesure un budget total et non un nombre de tours consécutifs SANS
 # supervision humaine.
 AUTO_APPROVAL_STREAK_LIMIT = int(os.environ.get("AUTO_APPROVAL_STREAK_LIMIT", "6"))
+
+# Rétention d'images dans l'historique soumis au LLM : chaque screenshot
+# GhostDesk (screen_shot) ajoute un message multimodal coûteux en tokens
+# visuels (voir _split_image_blocks) ; sur une boucle capture/clic répétée,
+# les conserver TOUTES finit par saturer le contexte pour un intérêt
+# quasi nul (seule la capture la plus récente reflète l'état actuel de
+# l'écran). Ne garde que les MAX_IMAGES_IN_CONTEXT dernières images dans ce
+# qui est envoyé au LLM ; les précédentes sont remplacées par un texte
+# indicatif — uniquement pour CET appel (voir _apply_image_retention),
+# jamais persisté dans l'état du graphe/checkpointer : l'historique complet
+# (avec toutes les images d'origine) reste inchangé et consultable/rejoué.
+MAX_IMAGES_IN_CONTEXT = int(os.environ.get("MAX_IMAGES_IN_CONTEXT", "1"))
+IMAGE_RETENTION_PLACEHOLDER = "[screenshot antérieure supprimée]"
+
+# Qwen3.6 raisonne par défaut sur chaque tour (balises de pensée étendue) —
+# utile pour une décision initiale, coûteux en latence/tokens pour une
+# boucle perception-action rapide (capture -> clic -> capture...) où chaque
+# tour n'a qu'à décider "où cliquer ensuite" sans reconsidérer toute la
+# tâche. Si ADAPTIVE_THINKING est activé, /no_think est injecté (system
+# prompt transitoire, non persisté — voir _apply_adaptive_thinking) quand
+# TOUS les tool_calls du tour précédent étaient auto-approuvés (même
+# politique par tiers que has_tool_calls, voir approval_policy.py) ; le
+# thinking normal reste actif pour le premier tour d'une tâche ou dès qu'un
+# outil sensible est en jeu, où le raisonnement a le plus de valeur.
+ADAPTIVE_THINKING = os.environ.get("ADAPTIVE_THINKING", "false").lower() == "true"
+NO_THINK_DIRECTIVE = "/no_think"
+
+# Filet de sécurité (bug réel observé en usage réel avec llama-server —
+# fork turboquant-webp — sur la tâche "va sur wikipedia.org et cherche
+# l'article sur la ville de toulouse", voir README, tableau des bugs) : un
+# modèle peut terminer un tour SANS tool_calls structuré ET sans texte de
+# réponse visible.
+#
+# Cause racine confirmée en lisant le parseur du fork
+# (common/chat-auto-parser-generator.cpp) : le raisonnement (<think>...)
+# est capturé comme texte LIBRE, NON contraint par la grammaire, jusqu'à
+# rencontrer la balise fermante </think> — la grammaire stricte du
+# tool-calling n'est appliquée qu'APRÈS cette balise. Si le modèle "tente"
+# un appel d'outil en prose (ex. syntaxe <tool_call><function=...> qu'il a
+# vue rendue par le template pour ses propres tours précédents) SANS avoir
+# fermé </think> au préalable — typiquement après un raisonnement anormalement
+# long/répétitif, à rapprocher de la dérive sémantique déjà documentée pour
+# Ollama — cette tentative reste piégée dans la zone non contrainte et
+# n'est jamais reconnue comme un vrai tool_calls OpenAI. Confirmé
+# NON-déterministe par ailleurs (rejouer le MÊME prompt donne tantôt un
+# tool_calls correct, tantôt cet échec) et confirmé résolu par
+# ADAPTIVE_THINKING/no_think (qui évite entièrement ce chemin de code
+# vulnérable, voir plus haut) — mais /no_think ne s'injecte qu'à partir du
+# tour SUIVANT un tour auto-approuvé, pas sur le tout premier tour d'une
+# tâche, là où le bug a justement été observé.
+#
+# Deux mitigations complémentaires, aucune ne corrigeant la cause côté
+# modèle/serveur (hors de portée ici) :
+#   1. has_tool_calls reboucle automatiquement sur call_llm jusqu'à
+#      MAX_EMPTY_ANSWER_RETRIES fois avant d'abandonner (voir cette
+#      fonction plus bas) — budget cumulé pour toute la tâche, comme
+#      tool_iterations, pas remis à zéro à chaque tentative.
+#   2. _extract_fallback_tool_call (voir plus bas) : avant même de compter
+#      ce tour comme un échec, tente d'extraire un appel <tool_call> piégé
+#      dans le texte et de le reconstruire en tool_calls structuré — quand
+#      ça réussit, le tour continue normalement (approbation, exécution...)
+#      sans jamais consommer de retry ni afficher la notice de repli.
+# Au-delà des deux, app/main.py affiche une notice explicite
+# (_format_empty_answer_notice) plutôt que de laisser la conversation
+# silencieuse.
+MAX_EMPTY_ANSWER_RETRIES = int(os.environ.get("MAX_EMPTY_ANSWER_RETRIES", "1"))
+
+# Reconnaît un appel d'outil écrit en prose au format XML-ish de Qwen
+# (<tool_call><function=NOM><parameter=CLE>VALEUR</parameter>...</function>
+# </tool_call>), tel qu'observé piégé dans reasoning_content en usage réel.
+# DOTALL pour capturer des valeurs de paramètre multi-lignes (ex. texte à
+# taper contenant un saut de ligne).
+_FALLBACK_TOOL_CALL_RE = re.compile(
+    r"<tool_call>\s*<function=([a-zA-Z0-9_]+)>(.*?)</function>\s*</tool_call>", re.DOTALL
+)
+_FALLBACK_PARAMETER_RE = re.compile(
+    r"<parameter=([a-zA-Z0-9_]+)>(.*?)</parameter>", re.DOTALL
+)
+
+
+def _extract_fallback_tool_call(content: str) -> Optional[dict]:
+    """
+    Tente d'extraire un tool_call valide depuis du texte (reasoning ou
+    content) quand le modèle en a écrit un en prose au lieu de le faire
+    reconnaître par la grammaire du serveur (voir le commentaire de
+    MAX_EMPTY_ANSWER_RETRIES ci-dessus pour la cause racine). Best-effort :
+    un seul appel reconnu par tour (le premier trouvé), aucune validation
+    contre le schéma JSON de l'outil — call_tools/mcp-client échoueront
+    proprement si les arguments extraits sont incorrects, comme pour un
+    tool_call normalement structuré. Retourne None si rien de reconnaissable
+    n'est trouvé.
+    """
+    match = _FALLBACK_TOOL_CALL_RE.search(content or "")
+    if not match:
+        return None
+    tool_name = match.group(1)
+    params_blob = match.group(2)
+    arguments = {
+        key: value.strip() for key, value in _FALLBACK_PARAMETER_RE.findall(params_blob)
+    }
+    return {"name": tool_name, "args": arguments, "id": f"fallback_{uuid.uuid4().hex[:12]}"}
+
+# Le "?" final rend la balise fermante optionnelle : couvre aussi bien le
+# contenu déjà persisté par call_llm (toujours refermé avant retour) que du
+# texte encore en cours de streaming côté app/main.py (potentiellement pas
+# encore refermé au moment du test).
+_THINK_BLOCK_RE = re.compile(r"<think>.*?(</think>|\Z)", re.DOTALL)
+
+
+def has_visible_answer(content: str) -> bool:
+    """Reste-t-il du texte hors balise <think> ? Utilisé par has_tool_calls
+    (retry automatique) et app/main.py (notice de réponse vide)."""
+    return bool(_THINK_BLOCK_RE.sub("", content or "").strip())
 
 
 class AgentState(TypedDict):
@@ -155,6 +294,10 @@ class AgentState(TypedDict):
     # a appliqué le grant, pour ne pas re-déclencher un grant à chaque reprise
     # ultérieure du thread.
     grant_session: bool
+    # Compteur de retries pour le filet de sécurité "réponse vide" (voir
+    # MAX_EMPTY_ANSWER_RETRIES plus haut) — budget cumulé pour toute la
+    # tâche, comme tool_iterations, jamais remis à zéro entre deux retries.
+    empty_answer_retries: int
 
 
 # Plafond de tokens par TOUR (un seul appel LLM), pas pour la conversation
@@ -168,7 +311,7 @@ LLM_MAX_TOKENS = int(os.environ.get("LLM_MAX_TOKENS", "2048"))
 
 llm = ChatOpenAI(
     base_url=LLM_BASE_URL,
-    api_key="not-needed",       # vLLM ne vérifie pas la clé par défaut
+    api_key="not-needed",       # llama-server/Ollama ne vérifient pas la clé par défaut
     model="agent-llm",
     temperature=0.2,
     max_tokens=LLM_MAX_TOKENS,
@@ -238,8 +381,73 @@ async def select_skill(state: AgentState) -> dict:
     return {"messages": [{"role": "system", "content": f"Skill activée : {skill['name']}\n{skill['content']}"}]}
 
 
+def _is_image_message(message) -> bool:
+    return (
+        getattr(message, "type", None) == "human"
+        and isinstance(message.content, list)
+        and any(isinstance(b, dict) and b.get("type") == "image_url" for b in message.content)
+    )
+
+
+def _apply_image_retention(messages: list) -> list:
+    """
+    Ne garde que les MAX_IMAGES_IN_CONTEXT derniers messages image (voir
+    _is_image_message) dans la liste envoyée au LLM ; les précédents sont
+    remplacés par un message texte indicatif. Retourne une NOUVELLE liste
+    (jamais de mutation en place des messages d'origine, qui sont les mêmes
+    objets Python que ceux persistés par le checkpointer) — c'est ce qui
+    garantit que ce filtrage reste local à cet appel, sans jamais toucher à
+    l'état du graphe.
+    """
+    image_indices = [i for i, m in enumerate(messages) if _is_image_message(m)]
+    cutoff = len(image_indices) - max(MAX_IMAGES_IN_CONTEXT, 0)
+    if cutoff <= 0:
+        return messages
+
+    filtered = list(messages)
+    for i in image_indices[:cutoff]:
+        filtered[i] = HumanMessage(content=IMAGE_RETENTION_PLACEHOLDER)
+    return filtered
+
+
+def _previous_turn_tool_calls(messages: list) -> Optional[list]:
+    """Dernier message AI avec tool_calls dans l'historique — le tour qui a mené à cet appel de call_llm."""
+    for message in reversed(messages):
+        if getattr(message, "type", None) == "ai" and getattr(message, "tool_calls", None):
+            return message.tool_calls
+    return None
+
+
+def _apply_adaptive_thinking(messages: list, session_grants) -> list:
+    """
+    Ajoute un system prompt transitoire "/no_think" (jamais persisté dans
+    l'état du graphe, voir _apply_image_retention pour le même principe)
+    quand ADAPTIVE_THINKING est activé ET que le tour précédent était
+    entièrement auto-approuvé (même politique par tiers que has_tool_calls) —
+    typiquement une boucle perception-action GhostDesk (capture -> clic ->
+    capture) où le raisonnement étendu de Qwen3.6 coûte plus qu'il n'apporte.
+    Pas d'injection sur le tout premier tour d'une tâche (aucun tool_calls
+    précédent) ni dès qu'un outil sensible était en jeu : le raisonnement y
+    a le plus de valeur.
+    """
+    if not ADAPTIVE_THINKING:
+        return messages
+    previous_tool_calls = _previous_turn_tool_calls(messages)
+    if not previous_tool_calls:
+        return messages
+    all_auto_approved = all(
+        approval_policy.is_auto_approved(tc["name"], tc.get("args"), session_grants)
+        for tc in previous_tool_calls
+    )
+    if not all_auto_approved:
+        return messages
+    return messages + [SystemMessage(content=NO_THINK_DIRECTIVE)]
+
+
 async def call_llm(state: AgentState) -> dict:
     bound_llm = await _get_bound_llm()
+    messages_for_llm = _apply_image_retention(state["messages"])
+    messages_for_llm = _apply_adaptive_thinking(messages_for_llm, state.get("session_grants") or [])
     # Repris tel quel depuis l'appel précédent au sein de ce tour (voir
     # AgentState.think_opened/think_closed) plutôt que remis à False, pour ne
     # produire qu'une seule balise <think> continue même si call_llm boucle
@@ -249,7 +457,7 @@ async def call_llm(state: AgentState) -> dict:
     )
     try:
         merged = None
-        async for chunk in bound_llm.astream(state["messages"]):
+        async for chunk in bound_llm.astream(messages_for_llm):
             merged = chunk if merged is None else merged + chunk
     finally:
         think = _think_state.get()
@@ -264,13 +472,39 @@ async def call_llm(state: AgentState) -> dict:
         merged.content += "</think>"
         think["closed"] = True
 
+    # Filet de sécurité (voir MAX_EMPTY_ANSWER_RETRIES plus haut pour la
+    # cause racine) : le modèle a parfois écrit son appel d'outil en prose
+    # au lieu de le faire reconnaître par la grammaire du serveur. Avant de
+    # compter ce tour comme un échec (voir has_tool_calls), on tente de
+    # récupérer l'intention plutôt que de perdre le tour.
+    if not getattr(merged, "tool_calls", None):
+        fallback = _extract_fallback_tool_call(merged.content)
+        if fallback:
+            logger.warning(
+                "Tool call de secours extrait d'une réponse non structurée "
+                "(outil=%s, args=%s) : le modèle a écrit son appel en prose "
+                "au lieu d'émettre un tool_calls OpenAI reconnu par le serveur.",
+                fallback["name"],
+                fallback["args"],
+            )
+            merged.tool_calls = [fallback]
+
     return {"messages": [merged], "think_opened": think["opened"], "think_closed": think["closed"]}
 
 
 def has_tool_calls(state: AgentState) -> str:
     last = state["messages"][-1]
     tool_calls = getattr(last, "tool_calls", None)
-    if not tool_calls or state["tool_iterations"] >= MAX_TOOL_ITERATIONS:
+    if not tool_calls:
+        # Filet de sécurité "réponse vide" (voir MAX_EMPTY_ANSWER_RETRIES) :
+        # aucun tool_calls (même après tentative d'extraction de secours
+        # dans call_llm) ET rien de visible hors <think> -> reboucle sur
+        # call_llm plutôt que d'abandonner immédiatement, tant que le budget
+        # de retries n'est pas épuisé.
+        if not has_visible_answer(last.content) and state.get("empty_answer_retries", 0) < MAX_EMPTY_ANSWER_RETRIES:
+            return "retry_empty_answer"
+        return "end"
+    if state["tool_iterations"] >= MAX_TOOL_ITERATIONS:
         return "end"
     grants = state.get("session_grants") or []
     all_auto_approved = all(
@@ -282,6 +516,22 @@ def has_tool_calls(state: AgentState) -> str:
     if all_auto_approved and state.get("auto_approval_streak", 0) < AUTO_APPROVAL_STREAK_LIMIT:
         return "auto_call_tools"
     return "call_tools"
+
+
+async def retry_empty_answer(state: AgentState) -> dict:
+    """
+    Point de reboucle du filet de sécurité "réponse vide" (voir
+    MAX_EMPTY_ANSWER_RETRIES). Remet aussi think_opened/think_closed à False
+    pour que la nouvelle tentative reparte sur une balise <think> fraîche —
+    sans ça, le raisonnement du retry s'afficherait en texte brut (déjà
+    "opened" selon l'état persisté par la tentative ratée), invisible en
+    dehors d'une bulle repliable.
+    """
+    return {
+        "empty_answer_retries": state.get("empty_answer_retries", 0) + 1,
+        "think_opened": False,
+        "think_closed": False,
+    }
 
 
 async def require_approval(state: AgentState) -> dict:
@@ -315,6 +565,8 @@ def _to_png_data_uri(data_b64: str, mime_type: str) -> str:
     ("Failed to load image or audio file") — or c'est le format par défaut de
     l'outil screen_shot de GhostDesk. Convertir ici plutôt que de compter sur
     le modèle pour systématiquement demander format="png" à chaque appel.
+    Chemin par défaut (IMAGE_FORMAT_PASSTHROUGH non activé) — voir
+    _to_image_data_uri pour le chemin WebP direct.
     """
     if mime_type == "image/png":
         return f"data:image/png;base64,{data_b64}"
@@ -323,6 +575,21 @@ def _to_png_data_uri(data_b64: str, mime_type: str) -> str:
     buf = io.BytesIO()
     img.save(buf, format="PNG")
     return f"data:image/png;base64,{base64.b64encode(buf.getvalue()).decode()}"
+
+
+def _to_image_data_uri(data_b64: str, mime_type: str) -> str:
+    """
+    IMAGE_FORMAT_PASSTHROUGH=webp : transmet le WebP brut de screen_shot tel
+    quel (data URI directe, aucun décodage/réencodage Pillow), en s'appuyant
+    sur le décodage WebP natif du fork llama.cpp servi par llama-server
+    (voir README, section Backend d'inférence) — évite le coût CPU de la
+    reconversion PNG à chaque capture. Défaut (variable absente/différente
+    de "webp") : conversion PNG systématique via _to_png_data_uri, seule
+    compatible avec Ollama (voir cette fonction).
+    """
+    if IMAGE_FORMAT_PASSTHROUGH:
+        return f"data:{mime_type};base64,{data_b64}"
+    return _to_png_data_uri(data_b64, mime_type)
 
 
 def _split_image_blocks(result: dict) -> tuple[dict, list[dict]]:
@@ -395,7 +662,7 @@ async def _execute_tool_calls(state: AgentState, config: dict, *, audit: bool) -
                             {
                                 "type": "image_url",
                                 "image_url": {
-                                    "url": _to_png_data_uri(image["data"], image.get("mimeType", "image/png"))
+                                    "url": _to_image_data_uri(image["data"], image.get("mimeType", "image/png"))
                                 },
                             }
                         ],
@@ -451,6 +718,7 @@ def build_graph(checkpointer=None):
     graph.add_node("call_tools", call_tools)
     graph.add_node("auto_call_tools", auto_call_tools)
     graph.add_node("reject_tools", reject_tools)
+    graph.add_node("retry_empty_answer", retry_empty_answer)
 
     graph.set_entry_point("retrieve_context")
     graph.add_edge("retrieve_context", "select_skill")
@@ -458,7 +726,12 @@ def build_graph(checkpointer=None):
     graph.add_conditional_edges(
         "call_llm",
         has_tool_calls,
-        {"call_tools": "require_approval", "auto_call_tools": "auto_call_tools", "end": END},
+        {
+            "call_tools": "require_approval",
+            "auto_call_tools": "auto_call_tools",
+            "retry_empty_answer": "retry_empty_answer",
+            "end": END,
+        },
     )
     graph.add_conditional_edges(
         "require_approval", route_after_approval, {"call_tools": "call_tools", "reject_tools": "reject_tools"}
@@ -466,6 +739,7 @@ def build_graph(checkpointer=None):
     graph.add_edge("call_tools", "call_llm")
     graph.add_edge("auto_call_tools", "call_llm")
     graph.add_edge("reject_tools", "call_llm")
+    graph.add_edge("retry_empty_answer", "call_llm")
 
     return graph.compile(checkpointer=checkpointer or MemorySaver())
 
