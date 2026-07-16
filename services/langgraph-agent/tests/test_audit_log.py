@@ -96,8 +96,8 @@ async def test_granted_sensitive_tool_is_audited_once_auto_approved(mock_side_se
 
     route = mock_side_services.post("http://fake-vllm/v1/chat/completions")
     route.side_effect = [
-        _sse_response(tool_call_response("key_type", "call_1", '{"text": "hello"}')),
-        _sse_response(tool_call_response("key_type", "call_2", '{"text": "world"}')),
+        _sse_response(tool_call_response("key_type", "call_1", '{"text": "Ceci est un texte assez long pour rester sensible par defaut"}')),
+        _sse_response(tool_call_response("key_type", "call_2", '{"text": "Un second texte tout aussi long pour verifier le comportement"}')),
         _sse_response(text_response(["Fini", "."])),
     ]
     mock_side_services.post("http://fake-mcp-client/call").mock(
@@ -113,7 +113,7 @@ async def test_granted_sensitive_tool_is_audited_once_auto_approved(mock_side_se
     entries = audit_log.read_entries()
     assert len(entries) == 1  # seul le deuxième appel (auto-approuvé via le grant) est audité
     assert entries[0]["tool"] == "key_type"
-    assert entries[0]["arguments"] == {"text": "world"}
+    assert entries[0]["arguments"] == {"text": "Un second texte tout aussi long pour verifier le comportement"}
 
 
 @pytest.mark.asyncio

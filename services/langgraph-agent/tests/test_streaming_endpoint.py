@@ -384,8 +384,8 @@ async def test_approve_endpoint_grant_session_field_auto_approves_next_call(mock
 
     route = mock_side_services.post("http://fake-vllm/v1/chat/completions")
     route.side_effect = [
-        _sse_response(tool_call_response("key_type", "call_1", '{"text": "hello"}')),
-        _sse_response(tool_call_response("key_type", "call_2", '{"text": "world"}')),
+        _sse_response(tool_call_response("key_type", "call_1", '{"text": "Ceci est un texte assez long pour rester sensible par defaut"}')),
+        _sse_response(tool_call_response("key_type", "call_2", '{"text": "Un second texte tout aussi long pour verifier le comportement"}')),
         _sse_response(text_response(["Fini", "."])),
     ]
     mcp_route = mock_side_services.post("http://fake-mcp-client/call").mock(

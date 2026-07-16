@@ -48,7 +48,7 @@ async def test_first_call_of_sensitive_tool_still_requires_approval_even_with_gr
     import app.graph as g
 
     mock_side_services.post("http://fake-vllm/v1/chat/completions").mock(
-        return_value=_sse_response(tool_call_response("key_type", "call_1", '{"text": "hello"}'))
+        return_value=_sse_response(tool_call_response("key_type", "call_1", '{"text": "Ceci est un texte assez long pour rester sensible par defaut"}'))
     )
     mcp_route = mock_side_services.post("http://fake-mcp-client/call").mock(
         return_value=httpx.Response(200, json={"content": [{"type": "text", "text": "ok"}]})
@@ -74,8 +74,8 @@ async def test_grant_session_auto_approves_subsequent_calls_of_same_tool(mock_si
 
     route = mock_side_services.post("http://fake-vllm/v1/chat/completions")
     route.side_effect = [
-        _sse_response(tool_call_response("key_type", "call_1", '{"text": "hello"}')),
-        _sse_response(tool_call_response("key_type", "call_2", '{"text": "world"}')),
+        _sse_response(tool_call_response("key_type", "call_1", '{"text": "Ceci est un texte assez long pour rester sensible par defaut"}')),
+        _sse_response(tool_call_response("key_type", "call_2", '{"text": "Un second texte tout aussi long pour verifier le comportement"}')),
         _sse_response(text_response(["Fini", "."])),
     ]
     mcp_route = mock_side_services.post("http://fake-mcp-client/call").mock(
@@ -111,7 +111,7 @@ async def test_grant_only_covers_the_granted_tool_name(mock_side_services):
 
     route = mock_side_services.post("http://fake-vllm/v1/chat/completions")
     route.side_effect = [
-        _sse_response(tool_call_response("key_type", "call_1", '{"text": "hello"}')),
+        _sse_response(tool_call_response("key_type", "call_1", '{"text": "Ceci est un texte assez long pour rester sensible par defaut"}')),
         _sse_response(tool_call_response("browser_navigate", "call_2", '{"url": "http://example.com"}')),
     ]
     mock_side_services.post("http://fake-mcp-client/call").mock(
@@ -143,7 +143,7 @@ async def test_session_grants_are_lost_after_simulated_checkpointer_restart(mock
 
     route = mock_side_services.post("http://fake-vllm/v1/chat/completions")
     route.side_effect = [
-        _sse_response(tool_call_response("key_type", "call_1", '{"text": "hello"}')),
+        _sse_response(tool_call_response("key_type", "call_1", '{"text": "Ceci est un texte assez long pour rester sensible par defaut"}')),
         _sse_response(text_response(["OK", "."])),
     ]
     mock_side_services.post("http://fake-mcp-client/call").mock(
@@ -163,7 +163,7 @@ async def test_session_grants_are_lost_after_simulated_checkpointer_restart(mock
     g.agent_graph = g.build_graph()
 
     route.side_effect = [
-        _sse_response(tool_call_response("key_type", "call_2", '{"text": "world"}')),
+        _sse_response(tool_call_response("key_type", "call_2", '{"text": "Un second texte tout aussi long pour verifier le comportement"}')),
     ]
     fresh_state = {
         "messages": [{"role": "user", "content": "Tape world"}],

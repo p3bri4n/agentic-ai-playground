@@ -6,3 +6,4 @@ openai==1.51.2
 httpx==0.27.2
 pydantic==2.9.2
 Pillow==10.4.0
+PyYAML==6.0.2

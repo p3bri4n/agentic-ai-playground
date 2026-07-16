@@ -28,6 +28,7 @@ ci-dessous.
 """
 
 import os
+from typing import Optional
 
 TIER_READ = "read"
 TIER_REVERSIBLE = "reversible"
@@ -130,20 +131,123 @@ def tool_tier(tool_name: str) -> str:
     return TIER_SENSITIVE
 
 
-def effective_tier(tool_name: str, session_grants=None) -> str:
+def effective_tier(tool_name: str, args=None, session_grants=None) -> str:
     """
-    Tier réel d'un outil pour CE thread, tenant compte des grants de session
-    (Phase 3, voir AgentState.session_grants dans app/graph.py) : un outil
-    accordé "pour la session" via require_approval est plafonné à
-    TIER_REVERSIBLE (auto + audit) même s'il serait normalement
-    TIER_SENSITIVE. Un grant ne peut qu'assouplir un tier, jamais le
-    durcir — un outil déjà TIER_READ/TIER_REVERSIBLE n'est pas affecté.
+    Tier réel d'un tool_call précis (nom + arguments) pour CE thread :
+
+      1. Règles sur arguments (Phase 4, voir plus bas) : si au moins une
+         règle nommée pour cet outil matche ces arguments, son tier
+         l'emporte sur le tier statique de l'outil — PAS un ET logique avec
+         celui-ci. Si plusieurs règles matchent avec des tiers différents,
+         le plus restrictif gagne (ambiguïté).
+      2. Sinon, tier statique de l'outil (tool_tier(), sans regard aux
+         arguments ni aux grants).
+      3. Grants de session (Phase 3, voir AgentState.session_grants dans
+         app/graph.py) : si le résultat des deux étapes précédentes est
+         TIER_SENSITIVE et que l'outil est dans session_grants, plafonné à
+         TIER_REVERSIBLE. Un grant ne peut qu'assouplir, jamais durcir — un
+         outil déjà TIER_READ/TIER_REVERSIBLE n'est pas affecté par cette
+         étape.
     """
-    base = tool_tier(tool_name)
-    if base == TIER_SENSITIVE and session_grants and tool_name in session_grants:
+    rule_tier = _match_rules(tool_name, args or {})
+    resolved = rule_tier if rule_tier is not None else tool_tier(tool_name)
+    if resolved == TIER_SENSITIVE and session_grants and tool_name in session_grants:
         return TIER_REVERSIBLE
-    return base
+    return resolved
 
 
-def is_auto_approved(tool_name: str, session_grants=None) -> bool:
-    return effective_tier(tool_name, session_grants) in (TIER_READ, TIER_REVERSIBLE)
+def is_auto_approved(tool_name: str, args=None, session_grants=None) -> bool:
+    return effective_tier(tool_name, args, session_grants) in (TIER_READ, TIER_REVERSIBLE)
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Phase 4 : règles sur arguments ("outil(pattern)", à la Claude Code) —
+# permettent d'affiner le tier d'un outil selon SES ARGUMENTS plutôt que son
+# seul nom. Implémentation minimale volontaire : des matchers nommés en
+# Python (pas de DSL de pattern générique à parser/valider), une table de
+# règles ci-dessous, surchargeable/complétable via un fichier YAML optionnel
+# (APPROVAL_RULES_PATH).
+# ─────────────────────────────────────────────────────────────────────────
+
+
+class Rule:
+    __slots__ = ("tool", "matcher", "tier")
+
+    def __init__(self, tool: str, matcher, tier: str):
+        self.tool = tool
+        self.matcher = matcher
+        self.tier = tier
+
+
+def _matcher_any(args: dict) -> bool:
+    return True
+
+
+def _matcher_key_type_short(args: dict) -> bool:
+    """key_type(len<50,no_newline) : saisie courte et sans retour à la ligne
+    — assez anodin pour ne pas justifier une approbation à chaque frappe,
+    contrairement à un texte long ou multi-lignes (rédaction de code, script
+    collé...), qui reste TIER_SENSITIVE par défaut (tool_tier)."""
+    text = args.get("text", "")
+    return len(text) < 50 and "\n" not in text
+
+
+def _matcher_command_prefix(prefixes):
+    """commandes terminal par préfixe, ex. run_command(prefix:git status)."""
+
+    def _match(args: dict) -> bool:
+        command = args.get("command", "")
+        return any(command == p or command.startswith(p + " ") for p in prefixes)
+
+    return _match
+
+
+# Registre des matchers surchargeables par nom depuis un fichier YAML (voir
+# _load_rules_from_yaml) — "command_prefix" attend un paramètre ("prefixes"),
+# les autres sont utilisés tels quels.
+_MATCHER_REGISTRY = {
+    "any": _matcher_any,
+    "key_type_short": _matcher_key_type_short,
+    "command_prefix": _matcher_command_prefix,
+}
+
+# key_type(*) reste TIER_SENSITIVE par défaut : tool_tier("key_type") le
+# classe déjà ainsi (absent de TIER_READ_TOOLS/TIER_REVERSIBLE_TOOLS), donc
+# nul besoin d'une règle catch-all explicite ici — seule l'exception (saisie
+# courte) a besoin d'une règle.
+DEFAULT_RULES = [
+    Rule("key_type", _matcher_key_type_short, TIER_REVERSIBLE),
+]
+
+
+def _load_rules_from_yaml(path: str) -> list:
+    import yaml  # import paresseux : seuls les déploiements qui fixent APPROVAL_RULES_PATH en ont besoin
+
+    with open(path, encoding="utf-8") as f:
+        data = yaml.safe_load(f) or {}
+
+    rules = []
+    for item in data.get("rules", []):
+        matcher_name = item["matcher"]
+        factory = _MATCHER_REGISTRY[matcher_name]
+        matcher = factory(item["prefixes"]) if matcher_name == "command_prefix" else factory
+        rules.append(Rule(item["tool"], matcher, item["tier"]))
+    return rules
+
+
+def _load_rules() -> list:
+    rules = list(DEFAULT_RULES)
+    path = os.environ.get("APPROVAL_RULES_PATH")
+    if path:
+        rules += _load_rules_from_yaml(path)
+    return rules
+
+
+RULES = _load_rules()
+
+
+def _match_rules(tool_name: str, args: dict) -> Optional[str]:
+    matched = [r.tier for r in RULES if r.tool == tool_name and r.matcher(args)]
+    if not matched:
+        return None
+    return max(matched, key=lambda t: _TIER_RANK[t])

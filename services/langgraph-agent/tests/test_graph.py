@@ -320,7 +320,7 @@ async def test_rejection_skips_mcp_client_and_synthesizes_refusal(mock_side_serv
 
     route = mock_side_services.post("http://fake-vllm/v1/chat/completions")
     route.side_effect = [
-        _sse_response(tool_call_response("key_type", "call_1", '{"text": "rm -rf /"}')),
+        _sse_response(tool_call_response("key_type", "call_1", '{"text": "un texte assez long pour rester sensible: rm -rf /"}')),
         _sse_response(text_response(["Compris", ", annulé."])),
     ]
     mcp_route = mock_side_services.post("http://fake-mcp-client/call").mock(

@@ -273,7 +273,9 @@ def has_tool_calls(state: AgentState) -> str:
     if not tool_calls or state["tool_iterations"] >= MAX_TOOL_ITERATIONS:
         return "end"
     grants = state.get("session_grants") or []
-    all_auto_approved = all(approval_policy.is_auto_approved(tc["name"], grants) for tc in tool_calls)
+    all_auto_approved = all(
+        approval_policy.is_auto_approved(tc["name"], tc.get("args"), grants) for tc in tool_calls
+    )
     # Le garde-fou clavier virtuel (voir AUTO_APPROVAL_STREAK_LIMIT) : même un
     # tour entièrement auto-approuvé repasse par require_approval une fois le
     # plafond de tours consécutifs sans supervision humaine atteint.
@@ -362,7 +364,7 @@ async def _execute_tool_calls(state: AgentState, config: dict, *, audit: bool) -
     async with httpx.AsyncClient(timeout=60) as client:
         for tool_call in last.tool_calls:
             if audit:
-                tier = approval_policy.effective_tier(tool_call["name"], grants)
+                tier = approval_policy.effective_tier(tool_call["name"], tool_call.get("args"), grants)
                 if tier == approval_policy.TIER_REVERSIBLE:
                     audit_log.log_tool_call(thread_id, tool_call["name"], tool_call["args"], tier)
             try:
