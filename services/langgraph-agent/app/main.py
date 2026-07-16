@@ -63,6 +63,10 @@ class ApprovalDecisionRequest(BaseModel):
 
     messages: List[ChatMessage]
     approved: bool
+    # "approuver pour la session" (Phase 3) : accorde l'outil pour tout le
+    # thread plutôt que pour ce seul tour — voir AgentState.session_grants,
+    # app/graph.py. Ignoré si approved=False.
+    grant_session: bool = False
 
 
 def _derive_thread_id(messages: List[ChatMessage]) -> str:
@@ -72,7 +76,24 @@ def _derive_thread_id(messages: List[ChatMessage]) -> str:
 
 def _format_approval_request(tool_calls: list) -> str:
     demandes = ", ".join(f'`{tc["name"]}`({tc["args"]})' for tc in tool_calls)
-    return f'⚠️ Approbation requise pour : {demandes}. Réponds "approuver" ou "refuser" pour continuer.'
+    return (
+        f'⚠️ Approbation requise pour : {demandes}. Réponds "approuver" (une fois), '
+        f'"approuver pour la session" (pour ne plus être sollicité sur ce(s) outil(s) '
+        f"tant que dure cette conversation) ou \"refuser\" pour continuer."
+    )
+
+
+def _parse_approval_reply(text: str) -> tuple:
+    """
+    Distingue les trois réponses possibles au message d'approbation (voir
+    _format_approval_request) : "approuver pour la session" contenant lui-même
+    "approuver", le grant est détecté en cherchant "session" EN PLUS
+    d'"approuver" — un simple "approuver" ne grant jamais rien.
+    """
+    lowered = text.lower()
+    approved = "approuver" in lowered
+    grant_session = approved and "session" in lowered
+    return approved, grant_session
 
 
 def _format_iteration_limit_notice(tool_calls: list) -> str:
@@ -121,9 +142,10 @@ async def _resolve_run(request: ChatCompletionRequest):
         last_human = next(
             (m.content for m in reversed(request.messages) if m.role == "user"), ""
         )
-        approved = "approuver" in last_human.lower()
+        approved, grant_session = _parse_approval_reply(last_human)
         await agent_graph.aupdate_state(
-            config, {"approved": approved, "owui_message_count": owui_message_count}
+            config,
+            {"approved": approved, "grant_session": grant_session, "owui_message_count": owui_message_count},
         )
         return config, None
 
@@ -138,6 +160,8 @@ async def _resolve_run(request: ChatCompletionRequest):
         "think_opened": False,
         "think_closed": False,
         "auto_approval_streak": 0,
+        "session_grants": [],
+        "grant_session": False,
     }
     return config, run_input
 
@@ -285,7 +309,12 @@ async def approve(request: ApprovalDecisionRequest):
 
     owui_message_count = len(request.messages)
     await agent_graph.aupdate_state(
-        config, {"approved": request.approved, "owui_message_count": owui_message_count}
+        config,
+        {
+            "approved": request.approved,
+            "grant_session": request.approved and request.grant_session,
+            "owui_message_count": owui_message_count,
+        },
     )
     await agent_graph.ainvoke(None, config)
 

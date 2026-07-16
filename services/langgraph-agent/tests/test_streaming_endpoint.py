@@ -372,6 +372,55 @@ async def test_approve_endpoint_resumes_without_text_reply(mock_side_services):
 
 
 @pytest.mark.asyncio
+async def test_approve_endpoint_grant_session_field_auto_approves_next_call(mock_side_services):
+    """
+    /approve accepte un champ optionnel grant_session (Phase 3), miroir de la
+    réponse texte "approuver pour la session" côté /v1/chat/completions : le
+    deuxième appel du même outil (ici key_type, TIER_SENSITIVE par défaut) ne
+    doit plus déclencher de pause.
+    """
+    import app.graph as g
+    import app.main as main_mod
+
+    route = mock_side_services.post("http://fake-vllm/v1/chat/completions")
+    route.side_effect = [
+        _sse_response(tool_call_response("key_type", "call_1", '{"text": "hello"}')),
+        _sse_response(tool_call_response("key_type", "call_2", '{"text": "world"}')),
+        _sse_response(text_response(["Fini", "."])),
+    ]
+    mcp_route = mock_side_services.post("http://fake-mcp-client/call").mock(
+        return_value=httpx.Response(200, json={"content": [{"type": "text", "text": "ok"}]})
+    )
+    g.agent_graph = g.build_graph()
+    main_mod.agent_graph = g.agent_graph
+
+    transport = httpx.ASGITransport(app=main_mod.app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        first = await client.post(
+            "/v1/chat/completions",
+            json={"model": "agent-llm", "messages": [{"role": "user", "content": "Tape hello"}], "stream": False},
+        )
+        approval_text = first.json()["choices"][0]["message"]["content"]
+        assert "session" in approval_text.lower()
+
+        approved = await client.post(
+            "/approve",
+            json={
+                "messages": [
+                    {"role": "user", "content": "Tape hello"},
+                    {"role": "assistant", "content": approval_text},
+                ],
+                "approved": True,
+                "grant_session": True,
+            },
+        )
+        assert approved.status_code == 200
+        assert approved.json()["content"] == "Fini."
+
+    assert mcp_route.call_count == 2  # key_type call_1 ET call_2, sans nouvelle pause entre les deux
+
+
+@pytest.mark.asyncio
 async def test_approve_endpoint_returns_409_without_pending_approval(mock_side_services):
     import app.graph as g
     import app.main as main_mod

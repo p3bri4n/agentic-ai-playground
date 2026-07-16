@@ -100,7 +100,7 @@ Résumé des suites, à date de la dernière vérification :
 | `context-manager` | 4 | ingestion/retrieval Qdrant, mémoire par utilisateur, collection vide |
 | `mcp-client` | 8 | registre d'outils, schéma function-calling (description/inputSchema) exposé pour le LLM, appel réel via stdio, erreur 404 sur outil inconnu, appel réel via Streamable HTTP (serveur "desktop"/GhostDesk) avec vérification du bearer token et de l'en-tête `GhostDesk-Model-Space` |
 | `mcp-terminal` | 6 | liste blanche de commandes, lecture de fichier (y compris nom avec espace), blocage du path traversal |
-| `langgraph-agent` | 38 (+1 test d'intégration live, ignoré par défaut) | boucle d'appel d'outil, non-duplication des messages, endpoint streaming et non-streaming, pause/reprise d'approbation humaine (approuvé, refusé, streaming inclus), non-duplication de l'historique sur plusieurs tours de conversation, repli du raisonnement Ollama/Qwen3 (champ `reasoning`) en balises `<think>`, liaison du schéma d'outils mcp-client au LLM (bind_tools), repli des résultats d'outil image en message multimodal PNG, **politique d'approbation par tiers de réversibilité** (`approval_policy.py` : tiers lecture/réversible/sensible par défaut, override `TIER_READ_TOOLS`/`TIER_REVERSIBLE_TOOLS`/`AUTO_APPROVED_TOOLS` rétrocompatible, outil inconnu toujours sensible, tour 100% tiers auto-approuvés vs tour mixte), endpoints `/pending` et `/approve` pour une approbation par bouton d'UI, fermeture de la balise `<think>` restée ouverte en streaming avant le texte d'approbation, fusion d'un seul bloc `<think>` continu sur plusieurs itérations de la boucle d'outils auto-approuvés, notice explicite quand MAX_TOOL_ITERATIONS coupe un run avec un tool_call encore en attente, garde-fou `AUTO_APPROVAL_STREAK_LIMIT` forçant un passage humain après N tours auto-approuvés consécutifs (avec réarmement du compteur après approbation). `tests_integration/` (séparé, non mocké, opt-in via `RUN_LIVE_LLM_TESTS=1`) : non-régression de la dérive du LLM réel sur "va sur google.fr" (longueur de réponse, répétition de trigrammes), vérifiée aussi bien en échouant sur l'ancien Modelfile trop agressif qu'en passant sur le Modelfile corrigé |
+| `langgraph-agent` | 43 (+1 test d'intégration live, ignoré par défaut) | boucle d'appel d'outil, non-duplication des messages, endpoint streaming et non-streaming, pause/reprise d'approbation humaine (approuvé, refusé, streaming inclus), non-duplication de l'historique sur plusieurs tours de conversation, repli du raisonnement Ollama/Qwen3 (champ `reasoning`) en balises `<think>`, liaison du schéma d'outils mcp-client au LLM (bind_tools), repli des résultats d'outil image en message multimodal PNG, **politique d'approbation par tiers de réversibilité** (`approval_policy.py` : tiers lecture/réversible/sensible par défaut, override `TIER_READ_TOOLS`/`TIER_REVERSIBLE_TOOLS`/`AUTO_APPROVED_TOOLS` rétrocompatible, outil inconnu toujours sensible, tour 100% tiers auto-approuvés vs tour mixte), **grants de session** (`test_session_grants.py` : premier appel toujours soumis à approbation même avec intention de grant, "approuver pour la session" auto-approuve les appels suivants du même outil, portée strictement par outil, grants perdus après reconstruction simulée du checkpointer, champ `grant_session` de `POST /approve`), endpoints `/pending` et `/approve` pour une approbation par bouton d'UI, fermeture de la balise `<think>` restée ouverte en streaming avant le texte d'approbation, fusion d'un seul bloc `<think>` continu sur plusieurs itérations de la boucle d'outils auto-approuvés, notice explicite quand MAX_TOOL_ITERATIONS coupe un run avec un tool_call encore en attente, garde-fou `AUTO_APPROVAL_STREAK_LIMIT` forçant un passage humain après N tours auto-approuvés consécutifs (avec réarmement du compteur après approbation). `tests_integration/` (séparé, non mocké, opt-in via `RUN_LIVE_LLM_TESTS=1`) : non-régression de la dérive du LLM réel sur "va sur google.fr" (longueur de réponse, répétition de trigrammes), vérifiée aussi bien en échouant sur l'ancien Modelfile trop agressif qu'en passant sur le Modelfile corrigé |
 
 ## Bugs trouvés et corrigés pendant le développement
 
@@ -199,10 +199,10 @@ Tout appel d'outil demandé par le LLM (`terminal`, `filesystem`, `git`,
 `browser`, `desktop`/GhostDesk) suspend le graphe LangGraph au lieu de
 s'exécuter automatiquement (nœud `require_approval`,
 `services/langgraph-agent/app/graph.py`). L'agent répond alors dans la
-conversation avec un message `⚠️ Approbation requise pour : ...` ; répondre
-"approuver" au tour suivant relance l'exécution réelle, toute autre réponse
-la refuse (un `ToolMessage` d'erreur "Rejeté par l'utilisateur" est renvoyé
-au LLM, qui peut réagir normalement).
+conversation avec un message `⚠️ Approbation requise pour : ...` proposant
+trois réponses : "approuver" (une fois), "approuver pour la session" (voir
+Grants de session plus bas) ou "refuser" (un `ToolMessage` d'erreur "Rejeté
+par l'utilisateur" est renvoyé au LLM, qui peut réagir normalement).
 
 **Politique par tiers de réversibilité** (`services/langgraph-agent/app/
 approval_policy.py`), qui remplace l'ancienne whitelist binaire :
@@ -254,8 +254,30 @@ uniquement lors de la reprise, pas pendant la pause). Distinct de
 `tool_iterations`/`MAX_TOOL_ITERATIONS`, qui mesure un budget total pour
 toute la tâche et non un nombre de tours *consécutifs sans supervision*.
 
+**Grants de session** (Phase 3, `AgentState.session_grants` dans
+`app/graph.py`) : répondre "approuver pour la session" plutôt que
+"approuver" ajoute le(s) outil(s) du tour en attente à une liste
+`session_grants` propre à ce thread. Un outil qui y figure est ensuite
+plafonné à `TIER_REVERSIBLE` (auto + audit, voir Phase 2 ci-dessous) pour le
+reste de la conversation — `approval_policy.effective_tier()` en tient
+compte en plus du tier statique de l'outil. Un grant ne s'applique jamais
+rétroactivement : le tour qui le demande reste soumis à CETTE approbation,
+seuls les appels *suivants* du même outil en profitent. Portée strictement
+par outil : accorder `key_type` ne dispense pas `browser_navigate`.
+
+Ces grants vivent dans l'état du graphe, donc dans le même checkpointer
+`MemorySaver` (en mémoire uniquement, voir section Persistance des données)
+que le reste du thread — **ils meurent avec lui** : un redémarrage du
+service les perd exactement comme il perd une approbation en attente,
+puisqu'il n'existe aucune distinction entre "perdre l'état du thread" et
+"perdre les grants qu'il contenait". Comportement voulu pour un usage
+local : pas de persistance de grants inter-redémarrage, chaque nouvelle
+conversation (ou reprise après redémarrage) repart sans historique
+d'approbation.
+
 **Approbation par bouton d'UI, sans passer par un message texte** : deux
-endpoints complètent le flux texte "approuver"/"refuser" —
+endpoints complètent le flux texte "approuver"/"approuver pour la
+session"/"refuser" —
 
 - `POST /pending` (lecture seule, ne modifie aucun état) : indique si le
   thread dérivé de `messages` est en pause d'approbation, et renvoie le
@@ -263,12 +285,15 @@ endpoints complètent le flux texte "approuver"/"refuser" —
   du `thread_id`), jamais du contenu du dernier message assistant — celui-ci
   peut être vide ou tronqué côté client selon la façon dont Open WebUI
   interprète les balises `<think>`.
-- `POST /approve` (`{"messages": [...], "approved": bool}`) : reprend le
-  thread en pause directement depuis une décision hors bande (Open WebUI
-  Action function), en éditant en place le message "⚠️ Approbation requise"
-  existant plutôt qu'en ajoutant un nouveau message — d'où un bookkeeping de
-  `owui_message_count` sans le `+1` appliqué au flux texte normal. Renvoie
-  409 s'il n'y a aucune approbation en attente pour ce thread.
+- `POST /approve` (`{"messages": [...], "approved": bool, "grant_session":
+  bool}`) : reprend le thread en pause directement depuis une décision hors
+  bande (Open WebUI Action function), en éditant en place le message "⚠️
+  Approbation requise" existant plutôt qu'en ajoutant un nouveau message —
+  d'où un bookkeeping de `owui_message_count` sans le `+1` appliqué au flux
+  texte normal. `grant_session` (optionnel, défaut `false`, ignoré si
+  `approved=false`) est le miroir de "approuver pour la session" pour ce
+  flux hors bande. Renvoie 409 s'il n'y a aucune approbation en attente pour
+  ce thread.
 
 **Correctif streaming** : quand le modèle raisonne (balises `<think>`) avant
 de décider d'un appel d'outil, le tour se termine avec un `content` réel

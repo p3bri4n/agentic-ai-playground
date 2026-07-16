@@ -121,8 +121,8 @@ AUTO_APPROVED_TOOLS = set(filter(None, os.environ.get("AUTO_APPROVED_TOOLS", "")
 
 def tool_tier(tool_name: str) -> str:
     """Tier statique d'un outil, sans tenir compte des grants de session
-    (Phase 3) ni des règles sur arguments (Phase 4) — voir approval_tier()
-    une fois ces phases en place. Défaut = TIER_SENSITIVE."""
+    (Phase 3) ni des règles sur arguments (Phase 4) — voir effective_tier()
+    pour la résolution complète. Défaut = TIER_SENSITIVE."""
     if tool_name in TIER_READ_TOOLS:
         return TIER_READ
     if tool_name in TIER_REVERSIBLE_TOOLS or tool_name in AUTO_APPROVED_TOOLS:
@@ -130,5 +130,20 @@ def tool_tier(tool_name: str) -> str:
     return TIER_SENSITIVE
 
 
-def is_auto_approved(tool_name: str) -> bool:
-    return tool_tier(tool_name) in (TIER_READ, TIER_REVERSIBLE)
+def effective_tier(tool_name: str, session_grants=None) -> str:
+    """
+    Tier réel d'un outil pour CE thread, tenant compte des grants de session
+    (Phase 3, voir AgentState.session_grants dans app/graph.py) : un outil
+    accordé "pour la session" via require_approval est plafonné à
+    TIER_REVERSIBLE (auto + audit) même s'il serait normalement
+    TIER_SENSITIVE. Un grant ne peut qu'assouplir un tier, jamais le
+    durcir — un outil déjà TIER_READ/TIER_REVERSIBLE n'est pas affecté.
+    """
+    base = tool_tier(tool_name)
+    if base == TIER_SENSITIVE and session_grants and tool_name in session_grants:
+        return TIER_REVERSIBLE
+    return base
+
+
+def is_auto_approved(tool_name: str, session_grants=None) -> bool:
+    return effective_tier(tool_name, session_grants) in (TIER_READ, TIER_REVERSIBLE)

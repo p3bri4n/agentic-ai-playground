@@ -135,6 +135,22 @@ class AgentState(TypedDict):
     # (voir _resolve_run, app/main.py), comme tool_iterations.
     think_opened: bool
     think_closed: bool
+    # Grants de session (Phase 3) : noms d'outils qu'un humain a approuvés
+    # "pour la session" via require_approval (voir ce nœud plus bas) plutôt
+    # qu'une fois seulement. Un outil dans cette liste est plafonné à
+    # TIER_REVERSIBLE (auto + audit) pour le reste du thread, même s'il
+    # serait normalement TIER_SENSITIVE (voir approval_policy.effective_tier).
+    # Vit dans l'état du graphe, donc dans le checkpointer MemorySaver (en
+    # mémoire uniquement) : un redémarrage du service perd les grants en même
+    # temps que le reste du thread — comportement voulu, pas un bug (voir
+    # README, section Supervision humaine).
+    session_grants: list
+    # Décision transitoire couplée à "approved" (voir require_approval) :
+    # True si l'humain a répondu "approuver pour la session" plutôt que
+    # "approuver" seul. Consommée puis remise à False dès que require_approval
+    # a appliqué le grant, pour ne pas re-déclencher un grant à chaque reprise
+    # ultérieure du thread.
+    grant_session: bool
 
 
 # Plafond de tokens par TOUR (un seul appel LLM), pas pour la conversation
@@ -252,7 +268,8 @@ def has_tool_calls(state: AgentState) -> str:
     tool_calls = getattr(last, "tool_calls", None)
     if not tool_calls or state["tool_iterations"] >= MAX_TOOL_ITERATIONS:
         return "end"
-    all_auto_approved = all(approval_policy.is_auto_approved(tc["name"]) for tc in tool_calls)
+    grants = state.get("session_grants") or []
+    all_auto_approved = all(approval_policy.is_auto_approved(tc["name"], grants) for tc in tool_calls)
     # Le garde-fou clavier virtuel (voir AUTO_APPROVAL_STREAK_LIMIT) : même un
     # tour entièrement auto-approuvé repasse par require_approval une fois le
     # plafond de tours consécutifs sans supervision humaine atteint.
@@ -267,7 +284,18 @@ async def require_approval(state: AgentState) -> dict:
         raise NodeInterrupt("Approbation humaine requise avant exécution d'outil.")
     # Passage réel par un humain : réarme le budget de tours auto-approuvés
     # consécutifs (voir AUTO_APPROVAL_STREAK_LIMIT).
-    return {"messages": [], "auto_approval_streak": 0}
+    updates = {"messages": [], "auto_approval_streak": 0, "grant_session": False}
+    # "approuver pour la session" (Phase 3) : les outils du tour en attente
+    # rejoignent session_grants, plafonnés à TIER_REVERSIBLE (auto + audit)
+    # pour le reste du thread — voir approval_policy.effective_tier() et
+    # AgentState.session_grants. Le tour lui-même reste soumis à CETTE
+    # approbation (un grant ne s'applique qu'à partir du PROCHAIN appel du
+    # même outil, pas rétroactivement à celui qui l'a demandé).
+    if state.get("grant_session"):
+        last = state["messages"][-1]
+        granted_names = {tc["name"] for tc in last.tool_calls}
+        updates["session_grants"] = list(set(state.get("session_grants") or []) | granted_names)
+    return updates
 
 
 def route_after_approval(state: AgentState) -> str:
