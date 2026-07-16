@@ -100,7 +100,7 @@ Résumé des suites, à date de la dernière vérification :
 | `context-manager` | 4 | ingestion/retrieval Qdrant, mémoire par utilisateur, collection vide |
 | `mcp-client` | 8 | registre d'outils, schéma function-calling (description/inputSchema) exposé pour le LLM, appel réel via stdio, erreur 404 sur outil inconnu, appel réel via Streamable HTTP (serveur "desktop"/GhostDesk) avec vérification du bearer token et de l'en-tête `GhostDesk-Model-Space` |
 | `mcp-terminal` | 6 | liste blanche de commandes, lecture de fichier (y compris nom avec espace), blocage du path traversal |
-| `langgraph-agent` | 28 (+1 test d'intégration live, ignoré par défaut) | boucle d'appel d'outil, non-duplication des messages, endpoint streaming et non-streaming, pause/reprise d'approbation humaine (approuvé, refusé, streaming inclus), non-duplication de l'historique sur plusieurs tours de conversation, repli du raisonnement Ollama/Qwen3 (champ `reasoning`) en balises `<think>`, liaison du schéma d'outils mcp-client au LLM (bind_tools), repli des résultats d'outil image en message multimodal PNG, auto-approbation des outils souris/capture d'écran GhostDesk (`AUTO_APPROVED_TOOLS`) y compris tours mixtes, endpoints `/pending` et `/approve` pour une approbation par bouton d'UI, fermeture de la balise `<think>` restée ouverte en streaming avant le texte d'approbation, fusion d'un seul bloc `<think>` continu sur plusieurs itérations de la boucle d'outils auto-approuvés, notice explicite quand MAX_TOOL_ITERATIONS coupe un run avec un tool_call encore en attente, garde-fou `AUTO_APPROVAL_STREAK_LIMIT` forçant un passage humain après N tours auto-approuvés consécutifs (avec réarmement du compteur après approbation). `tests_integration/` (séparé, non mocké, opt-in via `RUN_LIVE_LLM_TESTS=1`) : non-régression de la dérive du LLM réel sur "va sur google.fr" (longueur de réponse, répétition de trigrammes), vérifiée aussi bien en échouant sur l'ancien Modelfile trop agressif qu'en passant sur le Modelfile corrigé |
+| `langgraph-agent` | 38 (+1 test d'intégration live, ignoré par défaut) | boucle d'appel d'outil, non-duplication des messages, endpoint streaming et non-streaming, pause/reprise d'approbation humaine (approuvé, refusé, streaming inclus), non-duplication de l'historique sur plusieurs tours de conversation, repli du raisonnement Ollama/Qwen3 (champ `reasoning`) en balises `<think>`, liaison du schéma d'outils mcp-client au LLM (bind_tools), repli des résultats d'outil image en message multimodal PNG, **politique d'approbation par tiers de réversibilité** (`approval_policy.py` : tiers lecture/réversible/sensible par défaut, override `TIER_READ_TOOLS`/`TIER_REVERSIBLE_TOOLS`/`AUTO_APPROVED_TOOLS` rétrocompatible, outil inconnu toujours sensible, tour 100% tiers auto-approuvés vs tour mixte), endpoints `/pending` et `/approve` pour une approbation par bouton d'UI, fermeture de la balise `<think>` restée ouverte en streaming avant le texte d'approbation, fusion d'un seul bloc `<think>` continu sur plusieurs itérations de la boucle d'outils auto-approuvés, notice explicite quand MAX_TOOL_ITERATIONS coupe un run avec un tool_call encore en attente, garde-fou `AUTO_APPROVAL_STREAK_LIMIT` forçant un passage humain après N tours auto-approuvés consécutifs (avec réarmement du compteur après approbation). `tests_integration/` (séparé, non mocké, opt-in via `RUN_LIVE_LLM_TESTS=1`) : non-régression de la dérive du LLM réel sur "va sur google.fr" (longueur de réponse, répétition de trigrammes), vérifiée aussi bien en échouant sur l'ancien Modelfile trop agressif qu'en passant sur le Modelfile corrigé |
 
 ## Bugs trouvés et corrigés pendant le développement
 
@@ -204,26 +204,44 @@ conversation avec un message `⚠️ Approbation requise pour : ...` ; répondre
 la refuse (un `ToolMessage` d'erreur "Rejeté par l'utilisateur" est renvoyé
 au LLM, qui peut réagir normalement).
 
-**Exception : auto-approbation des outils sans effet destructeur ni saisie**
-(`AUTO_APPROVED_TOOLS`, variable d'env, défaut `app_list,app_running,
-screen_shot,mouse_move,mouse_click,mouse_double_click,mouse_drag,
-mouse_scroll`). Critère de sélection : introspection pure (`app_list`,
-`app_running`, aucun effet de bord) et pilotage souris/capture d'écran
-GhostDesk — un modèle qui vise mal à l'écran (limite de vision/grounding,
-voir plus bas) doit pouvoir itérer capture → clic → capture sans qu'un
-humain valide chaque clic un par un. Routage dans `has_tool_calls` : un tour
-dont **tous** les tool_calls sont dans cette liste saute `require_approval` ;
-un tour mixte (même un seul outil hors liste) reste entièrement soumis à
-approbation, par sécurité — pas d'approbation partielle par outil.
+**Politique par tiers de réversibilité** (`services/langgraph-agent/app/
+approval_policy.py`), qui remplace l'ancienne whitelist binaire :
 
-Deux exclusions volontaires malgré leur nom trompeur :
-- `clipboard_get` reste soumis à approbation malgré son nom de "lecture" :
-  il peut exfiltrer des données sensibles copiées par l'utilisateur (mot de
-  passe, jeton...), pas moins sensible que `clipboard_set`.
-- `key_type`/`key_press` restent exclus, mais une **suite** de `mouse_click`
-  auto-approuvés peut en théorie composer n'importe quelle saisie via un
-  clavier virtuel à l'écran, contournant de fait cette exclusion — voir
-  `AUTO_APPROVAL_STREAK_LIMIT` juste en dessous.
+| Tier | Comportement | Exemples par défaut |
+|---|---|---|
+| `TIER_READ` (lecture) | auto, silencieux | `screen_shot`, `mouse_move`, `app_list`, `app_running`, `app_status`, lecture filesystem/git (`read_file`, `git_status`, `git_log`...), `run_command` (mcp-terminal, déjà une liste blanche stricte en lecture seule) |
+| `TIER_REVERSIBLE` (réversible) | auto + journalisation (voir Phase 2, journal d'audit) | `mouse_click`, `mouse_double_click`, `mouse_drag`, `mouse_scroll`, `key_press`, `app_launch`, `clipboard_set`, écritures filesystem/git confinées (`write_file`, `git_commit`...) |
+| `TIER_SENSITIVE` (sensible) | approbation humaine requise | `key_type` (saisie de texte libre), tout le reste, **et tout outil inconnu** |
+
+Le défaut est toujours le tier le plus restrictif, jamais l'inverse : un
+outil qui n'apparaît dans aucune des listes `TIER_READ_TOOLS`/
+`TIER_REVERSIBLE_TOOLS` (surchargeables via ces variables d'env,
+CSV) est automatiquement `TIER_SENSITIVE`. Routage dans `has_tool_calls` :
+un tour dont **tous** les tool_calls sont en tier lecture ou réversible
+saute `require_approval` ; un tour mixte (même un seul outil sensible)
+reste entièrement soumis à approbation, par sécurité — pas d'approbation
+partielle par outil.
+
+`AUTO_APPROVED_TOOLS` (ancienne variable d'env) reste utilisable comme
+override rétrocompatible : tout outil qui y figure est traité comme
+`TIER_REVERSIBLE` même s'il n'est dans aucune des deux listes ci-dessus.
+Vide par défaut désormais — les anciens défauts historiques (`app_list,
+app_running,screen_shot,mouse_move,mouse_click,mouse_double_click,
+mouse_drag,mouse_scroll`) sont déjà couverts par les tiers par défaut
+ci-dessus, donc ce nouveau défaut vide reproduit le même comportement pour
+un déploiement qui ne fixe pas cette variable.
+
+Une exclusion volontaire malgré son nom trompeur : `clipboard_get` reste
+`TIER_SENSITIVE` malgré son nom de "lecture" — il peut exfiltrer des
+données sensibles copiées par l'utilisateur (mot de passe, jeton...), pas
+moins sensible que `clipboard_set`.
+
+`key_type`/`key_press` restent hors `TIER_READ`, mais une **suite** de
+`mouse_click` auto-approuvés peut en théorie composer n'importe quelle
+saisie via un clavier virtuel à l'écran, contournant de fait cette
+exclusion — voir `AUTO_APPROVAL_STREAK_LIMIT` juste en dessous, qui
+s'applique à tout outil auto-approuvé (tier lecture ou réversible), pas
+seulement à l'ancienne liste `AUTO_APPROVED_TOOLS`.
 
 **Garde-fou contre le clavier virtuel** (`AUTO_APPROVAL_STREAK_LIMIT`,
 variable d'env, défaut `6`) : au-delà de ce nombre de tours auto-approuvés

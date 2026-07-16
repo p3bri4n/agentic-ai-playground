@@ -71,7 +71,7 @@ async def test_tool_call_pauses_for_approval_without_calling_mcp_client(mock_sid
     import app.graph as g
 
     mock_side_services.post("http://fake-vllm/v1/chat/completions").mock(
-        return_value=_sse_response(tool_call_response("run_command", "call_1", '{"command": "pwd"}'))
+        return_value=_sse_response(tool_call_response("browser_navigate", "call_1", '{"url": "http://example.com"}'))
     )
     mcp_route = mock_side_services.post("http://fake-mcp-client/call").mock(
         return_value=httpx.Response(200, json={"content": [{"type": "text", "text": "42"}]})
@@ -116,11 +116,67 @@ async def test_auto_approved_tool_skips_require_approval(mock_side_services):
 
 
 @pytest.mark.asyncio
+async def test_all_tier_read_tools_skip_approval_silently(mock_side_services):
+    """
+    Un tour dont TOUS les tool_calls sont en tier 1 (lecture pure, ex.
+    run_command/git_status côté MCP) doit s'exécuter sans jamais passer par
+    require_approval — pas seulement les outils historiques d'AUTO_APPROVED_TOOLS.
+    """
+    import app.graph as g
+
+    route = mock_side_services.post("http://fake-vllm/v1/chat/completions")
+    route.side_effect = [
+        _sse_response(
+            multi_tool_call_response(
+                [
+                    ("run_command", "call_1", '{"command": "pwd"}'),
+                    ("git_status", "call_2", "{}"),
+                ]
+            )
+        ),
+        _sse_response(text_response(["Terminé", "."])),
+    ]
+    mcp_route = mock_side_services.post("http://fake-mcp-client/call").mock(
+        return_value=httpx.Response(200, json={"content": [{"type": "text", "text": "ok"}]})
+    )
+    g.agent_graph = g.build_graph()
+
+    state = {"messages": [{"role": "user", "content": "Regarde l'état"}], "tool_iterations": 0, "approved": None}
+    result = await g.agent_graph.ainvoke(state, CONFIG)
+
+    snapshot = await g.agent_graph.aget_state(CONFIG)
+    assert snapshot.next == ()
+    assert mcp_route.call_count == 2
+    assert result["messages"][-1].content == "Terminé."
+
+
+@pytest.mark.asyncio
+async def test_unknown_tool_requires_approval(mock_side_services):
+    """Défaut = le tier le plus restrictif : un outil jamais classé nulle part reste sensible."""
+    import app.graph as g
+
+    mock_side_services.post("http://fake-vllm/v1/chat/completions").mock(
+        return_value=_sse_response(tool_call_response("some_never_seen_tool", "call_1", "{}"))
+    )
+    mcp_route = mock_side_services.post("http://fake-mcp-client/call").mock(
+        return_value=httpx.Response(200, json={"content": [{"type": "text", "text": "ok"}]})
+    )
+    g.agent_graph = g.build_graph()
+
+    state = {"messages": [{"role": "user", "content": "Fais un truc inédit"}], "tool_iterations": 0, "approved": None}
+    await g.agent_graph.ainvoke(state, CONFIG)
+
+    snapshot = await g.agent_graph.aget_state(CONFIG)
+    assert snapshot.next == ("require_approval",)
+    assert mcp_route.call_count == 0
+
+
+@pytest.mark.asyncio
 async def test_mixed_auto_and_manual_tools_still_requires_approval(mock_side_services):
     """
     Un tour qui mélange un outil auto-approuvé (mouse_click) et un outil
-    sensible (run_command) doit rester intégralement soumis à approbation —
-    pas d'approbation partielle par outil.
+    sensible (browser_navigate) doit rester intégralement soumis à
+    approbation — pas d'approbation partielle par outil.
     """
     import app.graph as g
 
@@ -129,7 +185,7 @@ async def test_mixed_auto_and_manual_tools_still_requires_approval(mock_side_ser
             multi_tool_call_response(
                 [
                     ("mouse_click", "call_1", '{"x": 100, "y": 200}'),
-                    ("run_command", "call_2", '{"command": "pwd"}'),
+                    ("browser_navigate", "call_2", '{"url": "http://example.com"}'),
                 ]
             )
         )
@@ -236,7 +292,7 @@ async def test_approval_resumes_and_calls_mcp_client(mock_side_services):
 
     route = mock_side_services.post("http://fake-vllm/v1/chat/completions")
     route.side_effect = [
-        _sse_response(tool_call_response("run_command", "call_1", '{"command": "pwd"}')),
+        _sse_response(tool_call_response("browser_navigate", "call_1", '{"url": "http://example.com"}')),
         _sse_response(text_response(["Resultat", ": 42."])),
     ]
     mcp_route = mock_side_services.post("http://fake-mcp-client/call").mock(
@@ -264,7 +320,7 @@ async def test_rejection_skips_mcp_client_and_synthesizes_refusal(mock_side_serv
 
     route = mock_side_services.post("http://fake-vllm/v1/chat/completions")
     route.side_effect = [
-        _sse_response(tool_call_response("run_command", "call_1", '{"command": "rm -rf /"}')),
+        _sse_response(tool_call_response("key_type", "call_1", '{"text": "rm -rf /"}')),
         _sse_response(text_response(["Compris", ", annulé."])),
     ]
     mcp_route = mock_side_services.post("http://fake-mcp-client/call").mock(
@@ -297,7 +353,7 @@ async def test_tool_call_loop_resolves_and_does_not_duplicate_messages(mock_side
 
     route = mock_side_services.post("http://fake-vllm/v1/chat/completions")
     route.side_effect = [
-        _sse_response(tool_call_response("run_command", "call_1", '{"command": "pwd"}')),
+        _sse_response(tool_call_response("browser_navigate", "call_1", '{"url": "http://example.com"}')),
         _sse_response(text_response(["Resultat", ": 42."])),
     ]
     g.agent_graph = g.build_graph()

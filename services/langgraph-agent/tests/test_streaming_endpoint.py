@@ -110,7 +110,7 @@ async def test_streaming_endpoint_closes_dangling_think_tag_before_approval_text
 
     mock_side_services.post("http://fake-vllm/v1/chat/completions").mock(
         return_value=_sse_response(
-            reasoning_tool_call_response(["Je vais ", "utiliser l'outil."], "run_command", "call_1", '{"command": "pwd"}')
+            reasoning_tool_call_response(["Je vais ", "utiliser l'outil."], "browser_navigate", "call_1", '{"url": "http://example.com"}')
         )
     )
     g.agent_graph = g.build_graph()
@@ -197,7 +197,7 @@ async def test_non_streaming_endpoint_pauses_for_approval(mock_side_services):
     import app.main as main_mod
 
     mock_side_services.post("http://fake-vllm/v1/chat/completions").mock(
-        return_value=_sse_response(tool_call_response("run_command", "call_1", '{"command": "pwd"}'))
+        return_value=_sse_response(tool_call_response("browser_navigate", "call_1", '{"url": "http://example.com"}'))
     )
     mcp_route = mock_side_services.post("http://fake-mcp-client/call").mock(
         return_value=httpx.Response(200, json={"content": [{"type": "text", "text": "42"}]})
@@ -264,7 +264,7 @@ async def test_non_streaming_endpoint_resumes_after_approval_reply(mock_side_ser
 
     route = mock_side_services.post("http://fake-vllm/v1/chat/completions")
     route.side_effect = [
-        _sse_response(tool_call_response("run_command", "call_1", '{"command": "pwd"}')),
+        _sse_response(tool_call_response("browser_navigate", "call_1", '{"url": "http://example.com"}')),
         _sse_response(text_response(["Resultat", ": 42."])),
     ]
     mcp_route = mock_side_services.post("http://fake-mcp-client/call").mock(
@@ -314,7 +314,7 @@ async def test_approve_endpoint_resumes_without_text_reply(mock_side_services):
 
     route = mock_side_services.post("http://fake-vllm/v1/chat/completions")
     route.side_effect = [
-        _sse_response(tool_call_response("run_command", "call_1", '{"command": "pwd"}')),
+        _sse_response(tool_call_response("browser_navigate", "call_1", '{"url": "http://example.com"}')),
         _sse_response(text_response(["Resultat", ": 42."])),
         _sse_response(text_response(["Autre", " reponse."])),
     ]
@@ -411,7 +411,7 @@ async def test_pending_endpoint_reports_status_without_side_effects(mock_side_se
     import app.main as main_mod
 
     mock_side_services.post("http://fake-vllm/v1/chat/completions").mock(
-        return_value=_sse_response(tool_call_response("run_command", "call_1", '{"command": "pwd"}'))
+        return_value=_sse_response(tool_call_response("browser_navigate", "call_1", '{"url": "http://example.com"}'))
     )
     g.agent_graph = g.build_graph()
     main_mod.agent_graph = g.agent_graph
@@ -485,7 +485,7 @@ async def test_streaming_endpoint_hides_tool_call_iteration_then_asks_approval(m
     import app.main as main_mod
 
     mock_side_services.post("http://fake-vllm/v1/chat/completions").mock(
-        return_value=_sse_response(tool_call_response("run_command", "call_1", '{"command": "pwd"}'))
+        return_value=_sse_response(tool_call_response("browser_navigate", "call_1", '{"url": "http://example.com"}'))
     )
     mcp_route = mock_side_services.post("http://fake-mcp-client/call").mock(
         return_value=httpx.Response(200, json={"content": [{"type": "text", "text": "42"}]})
@@ -508,7 +508,7 @@ async def test_streaming_endpoint_resumes_after_approval_reply(mock_side_service
 
     route = mock_side_services.post("http://fake-vllm/v1/chat/completions")
     route.side_effect = [
-        _sse_response(tool_call_response("run_command", "call_1", '{"command": "pwd"}')),
+        _sse_response(tool_call_response("browser_navigate", "call_1", '{"url": "http://example.com"}')),
         _sse_response(text_response(["Resultat", ": 42."])),
     ]
     mcp_route = mock_side_services.post("http://fake-mcp-client/call").mock(
@@ -552,7 +552,7 @@ async def test_streaming_endpoint_reopens_think_tag_after_approval_resume(mock_s
     route = mock_side_services.post("http://fake-vllm/v1/chat/completions")
     route.side_effect = [
         _sse_response(
-            reasoning_tool_call_response(["Je cherche."], "run_command", "call_1", '{"command": "pwd"}')
+            reasoning_tool_call_response(["Je cherche."], "browser_navigate", "call_1", '{"url": "http://example.com"}')
         ),
         _sse_response(reasoning_response(["Je formule la réponse."], ["Resultat", ": 42."])),
     ]

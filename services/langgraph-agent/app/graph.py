@@ -6,8 +6,8 @@ Flux :
   2. select_skill        -> interroge Skill Manager pour injecter un prompt de skill pertinent
   3. call_llm             -> appelle vLLM (API OpenAI-compatible) avec function calling
   4. has_tool_calls       -> route vers require_approval, ou directement vers
-     call_tools si TOUS les tool_calls du tour sont dans AUTO_APPROVED_TOOLS
-     (voir plus bas)
+     call_tools si TOUS les tool_calls du tour sont auto-approuvés selon la
+     politique par tiers (app/approval_policy.py, voir plus bas)
   5. require_approval (option) -> si le LLM demande un outil non auto-approuvé,
      met le graphe en pause (NodeInterrupt) tant qu'un humain n'a pas
      approuvé/refusé via l'état "approved"
@@ -17,12 +17,12 @@ Flux :
 
 Supervision humaine : par défaut, tout appel d'outil est soumis à
 approbation (voir require_approval/reject_tools ci-dessous), à l'exception
-des outils listés dans AUTO_APPROVED_TOOLS (souris/capture d'écran
-GhostDesk par défaut — voir la constante plus bas pour le raisonnement). Le
-graphe est donc compilé avec un checkpointer (MemorySaver, en mémoire) pour
-pouvoir suspendre puis reprendre l'exécution — au prix de perdre les
-approbations en attente si le service redémarre (acceptable pour un usage
-local, voir README).
+des outils classés tier "read" ou "reversible" par app/approval_policy.py
+(souris/capture d'écran GhostDesk, lecture filesystem/git, par défaut — voir
+ce module pour le détail des tiers). Le graphe est donc compilé avec un
+checkpointer (MemorySaver, en mémoire) pour pouvoir suspendre puis reprendre
+l'exécution — au prix de perdre les approbations en attente si le service
+redémarre (acceptable pour un usage local, voir README).
 """
 
 import base64
@@ -40,6 +40,8 @@ from langgraph.checkpoint.memory import MemorySaver
 from langgraph.errors import NodeInterrupt
 from langgraph.graph import StateGraph, END
 from langgraph.graph.message import add_messages
+
+from app import approval_policy
 
 # Ollama (modèles Qwen3+) renvoie le raisonnement dans un champ "reasoning" des
 # deltas SSE, en plus de "content" — un champ hors du format OpenAI standard,
@@ -87,45 +89,26 @@ MCP_CLIENT_URL = os.environ.get("MCP_CLIENT_URL", "http://mcp-client:8003")
 # l'utilisateur plutôt que silencieux (voir _current_answer, app/main.py).
 MAX_TOOL_ITERATIONS = int(os.environ.get("MAX_TOOL_ITERATIONS", "20"))
 
-# Outils dispensés d'approbation humaine : introspection pure (app_list,
-# app_running — aucun effet de bord, rien à exfiltrer) et pilotage souris/
-# capture d'écran GhostDesk (sans effet destructeur ni saisie). Un modèle qui
-# vise mal (limite connue de vision/grounding, voir README) doit pouvoir
-# itérer capture → clic → capture sans qu'un humain valide chaque clic un par
-# un ; tout le reste (terminal, filesystem, git, browser, app_launch, saisie
-# clavier, presse-papiers) reste soumis à approbation stricte. Un tour dont
-# TOUS les tool_calls sont dans cette liste saute require_approval ; un tour
-# mixte (même un seul outil hors liste) reste entièrement soumis à
-# approbation, par sécurité.
-#
-# Exclusion volontaire de clipboard_get malgré son nom de "lecture" : il peut
-# exfiltrer des données sensibles que l'utilisateur a copiées (mot de passe,
-# jeton...), donc pas moins sensible que clipboard_set — les deux restent
-# soumis à approbation.
-#
-# Un clic seul est anodin, mais une SUITE de clics peut composer une saisie
-# complète via un clavier virtuel à l'écran, contournant de fait l'exclusion
-# de key_type/key_press ci-dessus. Voir AUTO_APPROVAL_STREAK_LIMIT plus bas
-# pour le garde-fou contre ce cas.
-AUTO_APPROVED_TOOLS = set(
-    filter(
-        None,
-        os.environ.get(
-            "AUTO_APPROVED_TOOLS",
-            "app_list,app_running,screen_shot,mouse_move,mouse_click,mouse_double_click,mouse_drag,mouse_scroll",
-        ).split(","),
-    )
-)
+# Politique d'approbation par tiers de réversibilité (voir
+# app/approval_policy.py) : un tour est auto-approuvé si TOUS ses tool_calls
+# sont en tier "read" ou "reversible" ; un tour mixte (même un seul outil en
+# tier "sensitive") reste entièrement soumis à approbation, par sécurité —
+# pas d'approbation partielle par outil. AUTO_APPROVED_TOOLS (ancienne
+# variable d'env) continue de fonctionner comme override rétrocompatible,
+# géré dans approval_policy.tool_tier().
 
 # Nombre de tours auto-approuvés consécutifs tolérés avant de forcer malgré
 # tout un passage par require_approval, même si tous les tool_calls du tour
-# restent dans AUTO_APPROVED_TOOLS — le garde-fou contre le clavier virtuel
-# évoqué ci-dessus : sans plafond, une longue suite de clics pourrait au
-# final saisir n'importe quel texte sans jamais qu'un humain ne valide quoi
-# que ce soit. Remis à 0 à chaque passage réel par require_approval (voir
-# cette fonction plus bas), pas seulement au début d'une nouvelle tâche —
-# contrairement à tool_iterations, qui lui mesure un budget total et non un
-# nombre de tours consécutifs SANS supervision humaine.
+# restent auto-approuvés (tier "read"/"reversible") — le garde-fou contre le
+# clavier virtuel : un clic seul est anodin, mais une SUITE de clics peut
+# composer une saisie complète via un clavier virtuel à l'écran, contournant
+# de fait l'exclusion de key_type/key_press (tier "sensitive"). Sans plafond,
+# une longue suite de clics pourrait au final saisir n'importe quel texte
+# sans jamais qu'un humain ne valide quoi que ce soit. Remis à 0 à chaque
+# passage réel par require_approval (voir cette fonction plus bas), pas
+# seulement au début d'une nouvelle tâche — contrairement à tool_iterations,
+# qui lui mesure un budget total et non un nombre de tours consécutifs SANS
+# supervision humaine.
 AUTO_APPROVAL_STREAK_LIMIT = int(os.environ.get("AUTO_APPROVAL_STREAK_LIMIT", "6"))
 
 
@@ -269,7 +252,7 @@ def has_tool_calls(state: AgentState) -> str:
     tool_calls = getattr(last, "tool_calls", None)
     if not tool_calls or state["tool_iterations"] >= MAX_TOOL_ITERATIONS:
         return "end"
-    all_auto_approved = all(tc["name"] in AUTO_APPROVED_TOOLS for tc in tool_calls)
+    all_auto_approved = all(approval_policy.is_auto_approved(tc["name"]) for tc in tool_calls)
     # Le garde-fou clavier virtuel (voir AUTO_APPROVAL_STREAK_LIMIT) : même un
     # tour entièrement auto-approuvé repasse par require_approval une fois le
     # plafond de tours consécutifs sans supervision humaine atteint.

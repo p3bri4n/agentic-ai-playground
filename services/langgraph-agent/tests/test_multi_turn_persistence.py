@@ -91,7 +91,7 @@ async def test_tool_approval_then_new_turn_message_count():
         )
         route = mock.post("http://fake-vllm/v1/chat/completions")
         route.side_effect = [
-            _sse_response(tool_call_response("run_command", "call_1", '{"command": "pwd"}')),
+            _sse_response(tool_call_response("browser_navigate", "call_1", '{"url": "http://example.com"}')),
             _sse_response(text_response(["Resultat", ": 42."])),
             _sse_response(text_response(["Autre", " reponse."])),
         ]
