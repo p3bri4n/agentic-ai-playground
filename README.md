@@ -48,7 +48,9 @@ services/
                        (pas de code applicatif ici : service docker-compose à part,
                        mcp-client s'y connecte en Streamable HTTP)
 skills/     à remplir (un sous-dossier par skill, avec un SKILL.md)
-workspace/  partagé avec les serveurs MCP filesystem/git/terminal
+workspace/  partagé avec les serveurs MCP filesystem/git/terminal, ainsi
+            qu'avec langgraph-agent pour le journal d'audit (.audit/, voir
+            section Supervision humaine)
 models/     poids du modèle servi par vLLM
 ```
 
@@ -100,7 +102,7 @@ Résumé des suites, à date de la dernière vérification :
 | `context-manager` | 4 | ingestion/retrieval Qdrant, mémoire par utilisateur, collection vide |
 | `mcp-client` | 8 | registre d'outils, schéma function-calling (description/inputSchema) exposé pour le LLM, appel réel via stdio, erreur 404 sur outil inconnu, appel réel via Streamable HTTP (serveur "desktop"/GhostDesk) avec vérification du bearer token et de l'en-tête `GhostDesk-Model-Space` |
 | `mcp-terminal` | 6 | liste blanche de commandes, lecture de fichier (y compris nom avec espace), blocage du path traversal |
-| `langgraph-agent` | 43 (+1 test d'intégration live, ignoré par défaut) | boucle d'appel d'outil, non-duplication des messages, endpoint streaming et non-streaming, pause/reprise d'approbation humaine (approuvé, refusé, streaming inclus), non-duplication de l'historique sur plusieurs tours de conversation, repli du raisonnement Ollama/Qwen3 (champ `reasoning`) en balises `<think>`, liaison du schéma d'outils mcp-client au LLM (bind_tools), repli des résultats d'outil image en message multimodal PNG, **politique d'approbation par tiers de réversibilité** (`approval_policy.py` : tiers lecture/réversible/sensible par défaut, override `TIER_READ_TOOLS`/`TIER_REVERSIBLE_TOOLS`/`AUTO_APPROVED_TOOLS` rétrocompatible, outil inconnu toujours sensible, tour 100% tiers auto-approuvés vs tour mixte), **grants de session** (`test_session_grants.py` : premier appel toujours soumis à approbation même avec intention de grant, "approuver pour la session" auto-approuve les appels suivants du même outil, portée strictement par outil, grants perdus après reconstruction simulée du checkpointer, champ `grant_session` de `POST /approve`), endpoints `/pending` et `/approve` pour une approbation par bouton d'UI, fermeture de la balise `<think>` restée ouverte en streaming avant le texte d'approbation, fusion d'un seul bloc `<think>` continu sur plusieurs itérations de la boucle d'outils auto-approuvés, notice explicite quand MAX_TOOL_ITERATIONS coupe un run avec un tool_call encore en attente, garde-fou `AUTO_APPROVAL_STREAK_LIMIT` forçant un passage humain après N tours auto-approuvés consécutifs (avec réarmement du compteur après approbation). `tests_integration/` (séparé, non mocké, opt-in via `RUN_LIVE_LLM_TESTS=1`) : non-régression de la dérive du LLM réel sur "va sur google.fr" (longueur de réponse, répétition de trigrammes), vérifiée aussi bien en échouant sur l'ancien Modelfile trop agressif qu'en passant sur le Modelfile corrigé |
+| `langgraph-agent` | 47 (+1 test d'intégration live, ignoré par défaut) | boucle d'appel d'outil, non-duplication des messages, endpoint streaming et non-streaming, pause/reprise d'approbation humaine (approuvé, refusé, streaming inclus), non-duplication de l'historique sur plusieurs tours de conversation, repli du raisonnement Ollama/Qwen3 (champ `reasoning`) en balises `<think>`, liaison du schéma d'outils mcp-client au LLM (bind_tools), repli des résultats d'outil image en message multimodal PNG, **politique d'approbation par tiers de réversibilité** (`approval_policy.py` : tiers lecture/réversible/sensible par défaut, override `TIER_READ_TOOLS`/`TIER_REVERSIBLE_TOOLS`/`AUTO_APPROVED_TOOLS` rétrocompatible, outil inconnu toujours sensible, tour 100% tiers auto-approuvés vs tour mixte), **grants de session** (`test_session_grants.py` : premier appel toujours soumis à approbation même avec intention de grant, "approuver pour la session" auto-approuve les appels suivants du même outil, portée strictement par outil, grants perdus après reconstruction simulée du checkpointer, champ `grant_session` de `POST /approve`), **journal d'audit** (`test_audit_log.py` : tool_call tiers réversible auto-approuvé tracé, tiers lecture jamais tracé, seul l'appel auto-approuvé via un grant de session apparaît — pas le premier passé par approbation humaine, filtrage `GET /audit?thread_id=`), endpoints `/pending` et `/approve` pour une approbation par bouton d'UI, fermeture de la balise `<think>` restée ouverte en streaming avant le texte d'approbation, fusion d'un seul bloc `<think>` continu sur plusieurs itérations de la boucle d'outils auto-approuvés, notice explicite quand MAX_TOOL_ITERATIONS coupe un run avec un tool_call encore en attente, garde-fou `AUTO_APPROVAL_STREAK_LIMIT` forçant un passage humain après N tours auto-approuvés consécutifs (avec réarmement du compteur après approbation). `tests_integration/` (séparé, non mocké, opt-in via `RUN_LIVE_LLM_TESTS=1`) : non-régression de la dérive du LLM réel sur "va sur google.fr" (longueur de réponse, répétition de trigrammes), vérifiée aussi bien en échouant sur l'ancien Modelfile trop agressif qu'en passant sur le Modelfile corrigé |
 
 ## Bugs trouvés et corrigés pendant le développement
 
@@ -274,6 +276,32 @@ puisqu'il n'existe aucune distinction entre "perdre l'état du thread" et
 local : pas de persistance de grants inter-redémarrage, chaque nouvelle
 conversation (ou reprise après redémarrage) repart sans historique
 d'approbation.
+
+**Journal d'audit** (Phase 2, `services/langgraph-agent/app/audit_log.py`) :
+chaque tool_call `TIER_REVERSIBLE` **effectivement auto-approuvé** (arrivé
+directement depuis `has_tool_calls`, sans passer par `require_approval` CE
+tour-ci) est loggé en JSONL sous `AUDIT_LOG_DIR` (défaut `/workspace/.audit`,
+même bind mount que les serveurs MCP filesystem/git/terminal — voir
+`docker-compose.yml`), un fichier par jour (`YYYY-MM-DD.jsonl`, rotation par
+nom de fichier). Chaque ligne : `timestamp`, `thread_id`, `tool`,
+`arguments`, `tier`. Volontairement **pas** de trace pour :
+- les tool_calls `TIER_READ` (silencieux par design, rien de nouveau à
+  auditer) ;
+- les tool_calls exécutés après un passage par `require_approval` (même
+  s'ils sont `TIER_REVERSIBLE`) : ce tour a déjà un humain dans la boucle,
+  déjà tracé dans l'historique de conversation ("⚠️ Approbation requise" +
+  la réponse) — dupliquer cette trace dans le journal d'audit irait à
+  l'encontre de son objet, qui est justement de tracer ce qu'un humain n'a
+  PAS vu passer.
+
+Concrètement, pour un outil accordé "pour la session" (voir Grants de
+session ci-dessus) : le tout premier appel (celui qui a déclenché
+`require_approval`) n'apparaît jamais dans le journal, seuls les appels
+*suivants* du même outil, désormais auto-approuvés via le grant, y
+apparaissent. `GET /audit?thread_id=...` (optionnel, sans lui renvoie tout
+le journal disponible) permet la consultation ; une ligne corrompue
+individuelle est ignorée à la lecture plutôt que de faire échouer toute la
+requête.
 
 **Approbation par bouton d'UI, sans passer par un message texte** : deux
 endpoints complètent le flux texte "approuver"/"approuver pour la

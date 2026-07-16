@@ -24,6 +24,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
+from app import audit_log
 from app.graph import MAX_TOOL_ITERATIONS, agent_graph
 
 app = FastAPI(title="LangGraph Agent")
@@ -277,6 +278,18 @@ async def pending(request: PendingCheckRequest):
     if not snapshot.next:
         return {"pending": False}
     return {"pending": True, "text": _format_approval_request(snapshot.values["messages"][-1].tool_calls)}
+
+
+@app.get("/audit")
+async def audit(thread_id: Optional[str] = None):
+    """
+    Consultation du journal d'audit (Phase 2, app/audit_log.py) : les
+    tool_calls TIER_REVERSIBLE effectivement exécutés (auto-approuvés ou
+    accordés pour la session). Sans thread_id, renvoie tout le journal
+    disponible (tous fichiers journaliers confondus) ; avec thread_id, ne
+    renvoie que les entrées de ce thread.
+    """
+    return {"entries": audit_log.read_entries(thread_id)}
 
 
 @app.post("/approve")

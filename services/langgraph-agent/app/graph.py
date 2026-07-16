@@ -6,13 +6,17 @@ Flux :
   2. select_skill        -> interroge Skill Manager pour injecter un prompt de skill pertinent
   3. call_llm             -> appelle vLLM (API OpenAI-compatible) avec function calling
   4. has_tool_calls       -> route vers require_approval, ou directement vers
-     call_tools si TOUS les tool_calls du tour sont auto-approuvés selon la
-     politique par tiers (app/approval_policy.py, voir plus bas)
+     auto_call_tools si TOUS les tool_calls du tour sont auto-approuvés selon
+     la politique par tiers (app/approval_policy.py, voir plus bas)
   5. require_approval (option) -> si le LLM demande un outil non auto-approuvé,
      met le graphe en pause (NodeInterrupt) tant qu'un humain n'a pas
      approuvé/refusé via l'état "approved"
-  6. call_tools | reject_tools -> exécute l'outil via MCP Client, ou synthétise un
-     refus si l'humain a refusé, puis reboucle sur call_llm
+  6. call_tools | auto_call_tools | reject_tools -> exécute l'outil via MCP
+     Client (même logique partagée, voir _execute_tool_calls), ou synthétise
+     un refus si l'humain a refusé, puis reboucle sur call_llm. Seul
+     auto_call_tools journalise dans le journal d'audit (Phase 2, voir
+     app/audit_log.py) : call_tools est TOUJOURS atteint après un passage
+     humain par require_approval CE tour-ci, déjà tracé dans la conversation.
   7. END                  -> réponse finale
 
 Supervision humaine : par défaut, tout appel d'outil est soumis à
@@ -41,7 +45,7 @@ from langgraph.errors import NodeInterrupt
 from langgraph.graph import StateGraph, END
 from langgraph.graph.message import add_messages
 
-from app import approval_policy
+from app import approval_policy, audit_log
 
 # Ollama (modèles Qwen3+) renvoie le raisonnement dans un champ "reasoning" des
 # deltas SSE, en plus de "content" — un champ hors du format OpenAI standard,
@@ -339,12 +343,28 @@ def _split_image_blocks(result: dict) -> tuple[dict, list[dict]]:
     return {**result, "content": rest or "(voir image ci-dessous)"}, images
 
 
-async def call_tools(state: AgentState) -> dict:
+async def _execute_tool_calls(state: AgentState, config: dict, *, audit: bool) -> dict:
+    """
+    Logique partagée entre call_tools (atteint après require_approval, donc
+    un humain vient d'examiner ce tour) et auto_call_tools (atteint
+    directement depuis has_tool_calls, jamais vu par un humain CE tour-ci).
+    `audit` distingue les deux : seul auto_call_tools journalise (Phase 2,
+    app/audit_log.py) — un tour passé par require_approval a déjà sa trace
+    dans l'historique de conversation ("⚠️ Approbation requise" + la réponse
+    de l'utilisateur), inutile de le dupliquer dans le journal d'audit, qui
+    sert justement à tracer ce qui n'a PAS été vu par un humain.
+    """
     last = state["messages"][-1]
     new_messages = []
+    grants = state.get("session_grants") or []
+    thread_id = config.get("configurable", {}).get("thread_id", "")
 
     async with httpx.AsyncClient(timeout=60) as client:
         for tool_call in last.tool_calls:
+            if audit:
+                tier = approval_policy.effective_tier(tool_call["name"], grants)
+                if tier == approval_policy.TIER_REVERSIBLE:
+                    audit_log.log_tool_call(thread_id, tool_call["name"], tool_call["args"], tier)
             try:
                 resp = await client.post(
                     f"{MCP_CLIENT_URL}/call",
@@ -392,6 +412,16 @@ async def call_tools(state: AgentState) -> dict:
     }
 
 
+async def call_tools(state: AgentState, config: dict) -> dict:
+    """Atteint après require_approval (humain déjà passé) : jamais audité, voir _execute_tool_calls."""
+    return await _execute_tool_calls(state, config, audit=False)
+
+
+async def auto_call_tools(state: AgentState, config: dict) -> dict:
+    """Atteint directement depuis has_tool_calls (aucun humain CE tour) : audité, voir _execute_tool_calls."""
+    return await _execute_tool_calls(state, config, audit=True)
+
+
 async def reject_tools(state: AgentState) -> dict:
     """Miroir de call_tools quand l'humain a refusé : synthétise un refus, n'appelle jamais mcp-client."""
     last = state["messages"][-1]
@@ -417,6 +447,7 @@ def build_graph(checkpointer=None):
     graph.add_node("call_llm", call_llm)
     graph.add_node("require_approval", require_approval)
     graph.add_node("call_tools", call_tools)
+    graph.add_node("auto_call_tools", auto_call_tools)
     graph.add_node("reject_tools", reject_tools)
 
     graph.set_entry_point("retrieve_context")
@@ -425,12 +456,13 @@ def build_graph(checkpointer=None):
     graph.add_conditional_edges(
         "call_llm",
         has_tool_calls,
-        {"call_tools": "require_approval", "auto_call_tools": "call_tools", "end": END},
+        {"call_tools": "require_approval", "auto_call_tools": "auto_call_tools", "end": END},
     )
     graph.add_conditional_edges(
         "require_approval", route_after_approval, {"call_tools": "call_tools", "reject_tools": "reject_tools"}
     )
     graph.add_edge("call_tools", "call_llm")
+    graph.add_edge("auto_call_tools", "call_llm")
     graph.add_edge("reject_tools", "call_llm")
 
     return graph.compile(checkpointer=checkpointer or MemorySaver())

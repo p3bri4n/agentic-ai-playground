@@ -33,6 +33,12 @@ services:
       - SKILL_MANAGER_URL=http://skill-manager:8001
       - CONTEXT_MANAGER_URL=http://context-manager:8002
       - MCP_CLIENT_URL=http://mcp-client:8003
+      # Journal d'audit des tool_calls TIER_REVERSIBLE (Phase 2, voir README
+      # section Supervision humaine) : /workspace/.audit, sur le même bind
+      # mount que les autres serveurs MCP filesystem/git/terminal.
+      - AUDIT_LOG_DIR=/workspace/.audit
+    volumes:
+      - ./workspace:/workspace
     depends_on:
       - skill-manager
       - context-manager
