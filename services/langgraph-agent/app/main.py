@@ -16,6 +16,7 @@ local mono-utilisateur.
 
 import hashlib
 import json
+import logging
 import time
 import uuid
 from datetime import datetime, timezone
@@ -29,6 +30,7 @@ from app import audit_log
 from app.graph import MAX_TOOL_ITERATIONS, agent_graph, describe_context, has_visible_answer
 
 app = FastAPI(title="LangGraph Agent")
+logger = logging.getLogger(__name__)
 
 
 class ChatMessage(BaseModel):
@@ -250,70 +252,89 @@ async def _stream_response(config: dict, run_input: Optional[dict], model: str):
     sent_role = False
     streamed_text = []
 
-    # Ne transmet au client QUE les tokens de contenu (on_chat_model_stream).
-    # Les itérations qui décident d'un appel d'outil ont un contenu vide côté
-    # LLM (le tool_call arrive dans un canal séparé), donc rien de visible
-    # n'est envoyé pendant la résolution des outils : seule la réponse finale
-    # apparaît, token par token. Si le graphe se met en pause pour
-    # approbation, aucun token n'est émis par ce mécanisme (voir plus bas).
-    async for event in agent_graph.astream_events(run_input, config, version="v2"):
-        if event["event"] != "on_chat_model_stream":
-            continue
-        chunk = event["data"]["chunk"]
-        if not chunk.content:
-            continue
-        streamed_text.append(chunk.content)
-        if not sent_role:
-            yield _sse_chunk(completion_id, model, {"role": "assistant", "content": chunk.content})
-            sent_role = True
+    try:
+        # Ne transmet au client QUE les tokens de contenu (on_chat_model_stream).
+        # Les itérations qui décident d'un appel d'outil ont un contenu vide côté
+        # LLM (le tool_call arrive dans un canal séparé), donc rien de visible
+        # n'est envoyé pendant la résolution des outils : seule la réponse finale
+        # apparaît, token par token. Si le graphe se met en pause pour
+        # approbation, aucun token n'est émis par ce mécanisme (voir plus bas).
+        async for event in agent_graph.astream_events(run_input, config, version="v2"):
+            if event["event"] != "on_chat_model_stream":
+                continue
+            chunk = event["data"]["chunk"]
+            if not chunk.content:
+                continue
+            streamed_text.append(chunk.content)
+            if not sent_role:
+                yield _sse_chunk(completion_id, model, {"role": "assistant", "content": chunk.content})
+                sent_role = True
+            else:
+                yield _sse_chunk(completion_id, model, {"content": chunk.content})
+
+        # Si le modèle a raisonné avant de décider d'appeler un outil, les tokens
+        # <think>...</think> streamés ci-dessus (voir app/graph.py) n'ont jamais
+        # reçu leur balise fermante : côté LLM, un tour qui aboutit à un
+        # tool_call a un content final vide, donc aucun chunk de contenu "réel"
+        # n'arrive jamais pour déclencher la fermeture (voir
+        # _convert_delta_with_reasoning). call_llm referme bien la balise sur le
+        # message PERSISTÉ après coup, mais ça ne corrige pas les chunks déjà
+        # envoyés au client dans la boucle ci-dessus — c'est donc sur ce qui a été
+        # réellement streamé (`streamed_text`) qu'il faut vérifier, pas sur
+        # l'état déjà réparé. Sans ce correctif, le texte ajouté ensuite (pause
+        # d'approbation ou notice de limite) se retrouve avalé dans le <think>
+        # resté ouvert côté client, invisible en dehors de la bulle repliée.
+        full_streamed = "".join(streamed_text)
+        closing_prefix = "</think>\n\n" if full_streamed.count("<think>") > full_streamed.count("</think>") else ""
+        # closing_prefix ferme la balise côté client, mais AgentState.think_closed
+        # (app/graph.py) reste False puisque call_llm n'a pas pu la fermer
+        # lui-même (tool_calls présent). Sans cette mise à jour, une reprise après
+        # approbation repartirait avec think_opened=True/think_closed=False :
+        # un nouveau round de raisonnement ne recevrait alors aucune balise
+        # ouvrante (déjà "opened" selon l'état persisté) mais recevrait quand
+        # même une balise fermante en fin de tour — un </think> orphelin visible
+        # côté client, sans <think> correspondant dans ce qu'il a reçu.
+        if closing_prefix:
+            await agent_graph.aupdate_state(config, {"think_opened": False, "think_closed": False})
+
+        snapshot = await agent_graph.aget_state(config)
+        if snapshot.next:
+            pending = closing_prefix + _format_approval_request(snapshot.values["messages"][-1].tool_calls)
+            yield _sse_chunk(completion_id, model, {"role": "assistant", "content": pending})
         else:
-            yield _sse_chunk(completion_id, model, {"content": chunk.content})
-
-    # Si le modèle a raisonné avant de décider d'appeler un outil, les tokens
-    # <think>...</think> streamés ci-dessus (voir app/graph.py) n'ont jamais
-    # reçu leur balise fermante : côté LLM, un tour qui aboutit à un
-    # tool_call a un content final vide, donc aucun chunk de contenu "réel"
-    # n'arrive jamais pour déclencher la fermeture (voir
-    # _convert_delta_with_reasoning). call_llm referme bien la balise sur le
-    # message PERSISTÉ après coup, mais ça ne corrige pas les chunks déjà
-    # envoyés au client dans la boucle ci-dessus — c'est donc sur ce qui a été
-    # réellement streamé (`streamed_text`) qu'il faut vérifier, pas sur
-    # l'état déjà réparé. Sans ce correctif, le texte ajouté ensuite (pause
-    # d'approbation ou notice de limite) se retrouve avalé dans le <think>
-    # resté ouvert côté client, invisible en dehors de la bulle repliée.
-    full_streamed = "".join(streamed_text)
-    closing_prefix = "</think>\n\n" if full_streamed.count("<think>") > full_streamed.count("</think>") else ""
-    # closing_prefix ferme la balise côté client, mais AgentState.think_closed
-    # (app/graph.py) reste False puisque call_llm n'a pas pu la fermer
-    # lui-même (tool_calls présent). Sans cette mise à jour, une reprise après
-    # approbation repartirait avec think_opened=True/think_closed=False :
-    # un nouveau round de raisonnement ne recevrait alors aucune balise
-    # ouvrante (déjà "opened" selon l'état persisté) mais recevrait quand
-    # même une balise fermante en fin de tour — un </think> orphelin visible
-    # côté client, sans <think> correspondant dans ce qu'il a reçu.
-    if closing_prefix:
-        await agent_graph.aupdate_state(config, {"think_opened": False, "think_closed": False})
-
-    snapshot = await agent_graph.aget_state(config)
-    if snapshot.next:
-        pending = closing_prefix + _format_approval_request(snapshot.values["messages"][-1].tool_calls)
-        yield _sse_chunk(completion_id, model, {"role": "assistant", "content": pending})
-    else:
-        last_message = snapshot.values["messages"][-1]
-        if getattr(last_message, "tool_calls", None):
-            # Le graphe s'est arrêté sur MAX_TOOL_ITERATIONS avec un
-            # tool_call encore en attente côté modèle : sans ce message,
-            # l'agent semble juste "s'arrêter" en plein milieu d'une tâche,
-            # sans qu'aucune erreur ni pause d'approbation ne l'explique
-            # (voir MAX_TOOL_ITERATIONS, app/graph.py).
-            notice = closing_prefix + _format_iteration_limit_notice(last_message.tool_calls)
-            yield _sse_chunk(completion_id, model, {"role": "assistant", "content": notice})
-        elif not has_visible_answer(full_streamed + closing_prefix):
-            # Voir _format_empty_answer_notice : aucun tool_calls en attente
-            # ET rien de visible hors <think> — même symptôme "agent
-            # silencieux" que ci-dessus, cause différente.
-            notice = closing_prefix + _format_empty_answer_notice()
-            yield _sse_chunk(completion_id, model, {"role": "assistant", "content": notice})
+            last_message = snapshot.values["messages"][-1]
+            if getattr(last_message, "tool_calls", None):
+                # Le graphe s'est arrêté sur MAX_TOOL_ITERATIONS avec un
+                # tool_call encore en attente côté modèle : sans ce message,
+                # l'agent semble juste "s'arrêter" en plein milieu d'une tâche,
+                # sans qu'aucune erreur ni pause d'approbation ne l'explique
+                # (voir MAX_TOOL_ITERATIONS, app/graph.py).
+                notice = closing_prefix + _format_iteration_limit_notice(last_message.tool_calls)
+                yield _sse_chunk(completion_id, model, {"role": "assistant", "content": notice})
+            elif not has_visible_answer(full_streamed + closing_prefix):
+                # Voir _format_empty_answer_notice : aucun tool_calls en attente
+                # ET rien de visible hors <think> — même symptôme "agent
+                # silencieux" que ci-dessus, cause différente.
+                notice = closing_prefix + _format_empty_answer_notice()
+                yield _sse_chunk(completion_id, model, {"role": "assistant", "content": notice})
+    except Exception:
+        # Sans ce filet, une erreur ici (llama-server qui coupe la connexion
+        # en plein streaming, checkpointer indisponible...) fait mourir ce
+        # générateur en plein milieu d'une réponse "Transfer-Encoding:
+        # chunked" déjà entamée : uvicorn ferme alors la connexion sans
+        # jamais envoyer le chunk terminal, et le client (ex. aiohttp côté
+        # Open WebUI) échoue avec "TransferEncodingError: Not enough data to
+        # satisfy transfer length header" — un symptôme côté client d'un
+        # crash côté serveur, pas un bug client. On répond plutôt une notice
+        # visible et on termine proprement le flux SSE ci-dessous.
+        logger.exception(
+            "Erreur pendant le streaming SSE (thread_id=%s)", config["configurable"]["thread_id"]
+        )
+        yield _sse_chunk(
+            completion_id,
+            model,
+            {"role": "assistant", "content": "⚠️ Erreur interne pendant la génération, réessayez."},
+        )
 
     yield _sse_chunk(completion_id, model, {}, finish_reason="stop")
     yield "data: [DONE]\n\n"

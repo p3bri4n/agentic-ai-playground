@@ -192,6 +192,46 @@ async def test_streaming_endpoint_merges_think_across_auto_approved_tool_loop(mo
 
 
 @pytest.mark.asyncio
+async def test_streaming_endpoint_recovers_from_llm_connection_error(mock_side_services):
+    """
+    Non-régression : si l'appel streamé vers le LLM échoue en cours de route
+    (ex. llama-server qui coupe la connexion), _stream_response ne doit pas
+    mourir en plein milieu du flux "Transfer-Encoding: chunked" sans jamais
+    envoyer le chunk terminal — côté client (aiohttp, via Open WebUI), ça se
+    manifeste par "TransferEncodingError: Not enough data to satisfy
+    transfer length header", symptôme d'un crash serveur non géré plutôt
+    qu'une vraie erreur réseau côté client. Le flux SSE doit se terminer
+    proprement (notice d'erreur visible + finish_reason + [DONE]) même dans
+    ce cas.
+    """
+    import app.graph as g
+    import app.main as main_mod
+
+    mock_side_services.post("http://fake-vllm/v1/chat/completions").mock(
+        side_effect=httpx.ConnectError("boom")
+    )
+    g.agent_graph = g.build_graph()
+    main_mod.agent_graph = g.agent_graph
+
+    transport = httpx.ASGITransport(app=main_mod.app)
+    lines = []
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        async with client.stream(
+            "POST",
+            "/v1/chat/completions",
+            json={"model": "agent-llm", "messages": [{"role": "user", "content": "Salut"}], "stream": True},
+        ) as resp:
+            assert resp.status_code == 200
+            async for line in resp.aiter_lines():
+                if line:
+                    lines.append(line)
+
+    assert lines[-1] == "data: [DONE]"
+    assert any('"finish_reason": "stop"' in l for l in lines)
+    assert any("Erreur interne" in l for l in lines)
+
+
+@pytest.mark.asyncio
 async def test_non_streaming_endpoint_pauses_for_approval(mock_side_services):
     import app.graph as g
     import app.main as main_mod
