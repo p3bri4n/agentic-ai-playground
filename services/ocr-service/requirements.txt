@@ -1,0 +1,10 @@
+uvicorn[standard]==0.30.6
+mcp==1.9.4
+Pillow==10.4.0
+# PaddleOCR CPU (pas de paquet GPU : les deux cartes sont saturées par
+# llama-server, voir README). Non nécessaire pour la suite de tests
+# (OCR_ENGINE=fake, voir app/ocr_engine.py et tests/conftest.py) : à exclure
+# explicitement de l'installation de test comme pour sentence-transformers
+# côté context-manager (voir README, section Tests).
+paddlepaddle==2.6.2
+paddleocr==2.9.1
