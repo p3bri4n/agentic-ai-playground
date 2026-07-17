@@ -53,6 +53,11 @@ services/
   llama-server/        build du fork llama.cpp servant le modèle (voir
                        section Backend d'inférence) — pas de code Python ici,
                        Dockerfile + entrypoint.sh de vérification du modèle
+  ocr-service/         OCR d'appoint pour le grounding du VLM (PaddleOCR CPU,
+                       find_text/read_screen), serveur MCP HTTP persistant
+                       comme ghostdesk (voir section OCR d'appoint)
+    app/
+    tests/
 skills/     à remplir (un sous-dossier par skill, avec un SKILL.md)
 workspace/  partagé avec les serveurs MCP filesystem/git/terminal, ainsi
             qu'avec langgraph-agent pour le journal d'audit (.audit/, voir
@@ -72,7 +77,7 @@ type de cache KV `turbo3` (compression propriétaire à ce fork).
 
 Le build, le démarrage ET l'inférence ont été exécutés réellement (GPU +
 accès réseau disponibles), modèle cible chargé (`Qwen3.6-35B-A3B` quant
-`UD-Q4_K_XL` + `mmproj-F16`, réparti sur les deux GPU via `--tensor-split`)
+`Q5_K_M` + `mmproj-F16`, réparti sur les deux GPU via `--tensor-split`)
 et une conversation complète menée de bout en bout à travers toute la
 stack (`langgraph-agent` → `llama-server`, streaming SSE, balises
 `<think>` correctement ouvertes/fermées, réponse finale correcte) — cinq
@@ -142,6 +147,58 @@ tâche (aucun tool_calls précédent à évaluer) ni dès qu'un outil sensible
 était en jeu dans ce tour précédent : le raisonnement complet y garde toute
 sa valeur.
 
+## OCR d'appoint (`services/ocr-service`)
+
+**Pourquoi** : le VLM servi par défaut (Qwen3.6 MoE) raisonne bien mais
+localise mal — son grounding visuel (viser le bon pixel d'un élément à
+l'écran) reste imprécis, sans OCR ni détection d'éléments UI dédiée (voir
+Limites connues assumées plus bas). `ocr-service` compense en donnant à
+l'agent des coordonnées de texte EXACTES via deux tools MCP : `find_text
+(query, fuzzy=true)` (correspondances triées par confiance, liste vide si
+aucune — jamais d'erreur) et `read_screen()` (tout le texte détecté,
+plafonné à 80 éléments). Consigne de grounding injectée au system prompt de
+langgraph-agent (`GROUNDING_DIRECTIVE`, `app/graph.py`) : privilégier
+`find_text` à l'estimation visuelle pour cliquer sur du texte, réserver
+cette dernière aux éléments sans texte (icônes).
+
+Serveur MCP HTTP persistant (Streamable HTTP, bearer `OCR_AUTH_TOKEN`), sur
+le même modèle que `desktop`/GhostDesk côté `mcp-client` — pas un conteneur
+spawné à la demande. `find_text`/`read_screen` sont tier lecture
+(`approval_policy.py`) : lecture pure, aucun effet de bord, auto-approuvés
+et silencieux.
+
+**Capture** : `ocr-service` se connecte lui-même en Streamable HTTP à
+GhostDesk (réseau interne `agent-net`, bearer `GHOSTDESK_AUTH_TOKEN`,
+`format="png"` explicite — aucune dépendance au décodage WebP natif de
+llama-server, non pertinent ici) pour appeler `screen_shot` à chaque
+`find_text`/`read_screen`. Aucune image ne transite par `mcp-client` ni par
+le LLM pour ce flux, entièrement interne à `ocr-service`.
+
+**Mapping de coordonnées — source classique de clics décalés** : PaddleOCR
+travaille en pixels réels de la capture, alors que `mouse_click` côté
+GhostDesk attend le repère normalisé 0-1000 (même repère que
+`GHOSTDESK_MODEL_SPACE` côté `mcp-client`, voir Supervision humaine plus
+bas). `ocr-service` convertit donc systématiquement ses coordonnées avant de
+répondre (`x_norm = round(x_px * 1000 / largeur_image)`, voir
+`app/coords.py`) — sans cette conversion, les coordonnées renvoyées par
+`find_text` seraient en pixels alors que le modèle (et GhostDesk) les
+interprètent en 0-1000, garantissant des clics à côté de leur cible.
+`OCR_COORD_SPACE` (défaut `"1000"`) désactive cette conversion (`"pixels"`)
+si l'appelant travaille lui-même en pixels.
+
+**PaddleOCR en CPU uniquement** : les deux GPU sont déjà saturés par
+llama-server (voir Backend d'inférence). Langue `fr` (configurable via
+`OCR_LANGS`) : PaddleOCR regroupe le français et l'anglais sous un seul
+modèle de reconnaissance (alphabet latin partagé), inutile de faire tourner
+deux passes OCR séparées pour ce projet. Modèles téléchargés **au build** de
+l'image Docker (`ARG OCR_LANGS`, voir `services/ocr-service/Dockerfile`),
+jamais au premier appel — évite un accès réseau et plusieurs secondes de
+latence en production.
+
+Hors périmètre explicite (itération future) : détection d'icônes/éléments UI
+sans texte (type OmniParser), annotation Set-of-Marks des screenshots, OCR
+GPU, cache des résultats entre appels.
+
 ## Tests
 
 Chaque service a sa propre suite pytest, isolée des autres (aucune dépendance
@@ -188,9 +245,10 @@ Résumé des suites, à date de la dernière vérification :
 |---|---|---|
 | `skill-manager` | 5 | chargement des skills, matching mot-clé, endpoints HTTP |
 | `context-manager` | 4 | ingestion/retrieval Qdrant, mémoire par utilisateur, collection vide |
-| `mcp-client` | 9 | registre d'outils, schéma function-calling (description/inputSchema) exposé pour le LLM, appel réel via stdio, erreur 404 sur outil inconnu, appel réel via Streamable HTTP (serveur "desktop"/GhostDesk) avec vérification du bearer token et de l'en-tête `GhostDesk-Model-Space` (présent avec la valeur configurée ET absent quand `GHOSTDESK_MODEL_SPACE=""`) |
+| `mcp-client` | 11 | registre d'outils, schéma function-calling (description/inputSchema) exposé pour le LLM, appel réel via stdio, erreur 404 sur outil inconnu, appel réel via Streamable HTTP (serveur "desktop"/GhostDesk) avec vérification du bearer token et de l'en-tête `GhostDesk-Model-Space` (présent avec la valeur configurée ET absent quand `GHOSTDESK_MODEL_SPACE=""`), serveur "ocr" (services/ocr-service) enregistré/appelable via Streamable HTTP et bearer invalide rejeté |
 | `mcp-terminal` | 6 | liste blanche de commandes, lecture de fichier (y compris nom avec espace), blocage du path traversal |
-| `langgraph-agent` | 90 (+1 test d'intégration live, ignoré par défaut) | boucle d'appel d'outil, non-duplication des messages, endpoint streaming et non-streaming, pause/reprise d'approbation humaine (approuvé, refusé, streaming inclus), non-duplication de l'historique sur plusieurs tours de conversation, repli du raisonnement en balises `<think>` (champ `reasoning` Ollama OU `reasoning_content` llama-server), **récupération de réponse vide** (`test_empty_answer_recovery.py` : extraction d'un tool_call `<tool_call><function=...>` piégé en prose et reconstruction en tool_calls structuré, tour normalement soumis à approbation après récupération si l'outil est sensible, retry automatique jusqu'à `MAX_EMPTY_ANSWER_RETRIES` puis succès, reset de l'état `<think>` au retry, abandon propre une fois le budget épuisé, flux normal inchangé) + **notice de réponse vide** (`test_non_streaming_endpoint_reports_empty_answer_notice`/`test_streaming_endpoint_reports_empty_answer_notice` : dernier filet si les deux mitigations précédentes échouent), liaison du schéma d'outils mcp-client au LLM (bind_tools), repli des résultats d'outil image en message multimodal, **rétention d'images et thinking adaptatif** (`test_image_retention_and_thinking.py` : ne garde que les `MAX_IMAGES_IN_CONTEXT` dernières captures dans la requête envoyée au LLM sans jamais toucher au checkpointer, passthrough WebP vs conversion PNG par défaut selon `IMAGE_FORMAT_PASSTHROUGH`, injection `/no_think` après un tour entièrement auto-approuvé si `ADAPTIVE_THINKING` est actif, absence d'injection sur le premier tour ou après un outil sensible), **politique d'approbation par tiers de réversibilité** (`approval_policy.py` : tiers lecture/réversible/sensible par défaut, override `TIER_READ_TOOLS`/`TIER_REVERSIBLE_TOOLS`/`AUTO_APPROVED_TOOLS` rétrocompatible, outil inconnu toujours sensible, tour 100% tiers auto-approuvés vs tour mixte), **règles sur arguments** (`test_approval_rules.py` : `key_type` court/mono-ligne auto-approuvé vs long ou multi-lignes soumis à approbation (au niveau unitaire ET routage réel dans le graphe), règle absente retombe sur le tier statique, ambiguïté entre règles résolue par le plus restrictif, une règle peut durcir un tier autant que l'assouplir, grant de session appliqué après résolution de règle, chargement `APPROVAL_RULES_PATH`/YAML), **grants de session** (`test_session_grants.py` : premier appel toujours soumis à approbation même avec intention de grant, "approuver pour la session" auto-approuve les appels suivants du même outil, portée strictement par outil, grants perdus après reconstruction simulée du checkpointer, champ `grant_session` de `POST /approve`), **journal d'audit** (`test_audit_log.py` : tool_call tiers réversible auto-approuvé tracé, tiers lecture jamais tracé, seul l'appel auto-approuvé via un grant de session apparaît — pas le premier passé par approbation humaine, filtrage `GET /audit?thread_id=`), endpoints `/pending` et `/approve` pour une approbation par bouton d'UI, fermeture de la balise `<think>` restée ouverte en streaming avant le texte d'approbation, fusion d'un seul bloc `<think>` continu sur plusieurs itérations de la boucle d'outils auto-approuvés, notice explicite quand MAX_TOOL_ITERATIONS coupe un run avec un tool_call encore en attente, garde-fou `AUTO_APPROVAL_STREAK_LIMIT` forçant un passage humain après N tours auto-approuvés consécutifs (avec réarmement du compteur après approbation). `tests_integration/` (séparé, non mocké, opt-in via `RUN_LIVE_LLM_TESTS=1`) : non-régression de la dérive du LLM réel sur "va sur google.fr" (longueur de réponse, répétition de trigrammes), vérifiée aussi bien en échouant sur l'ancien Modelfile trop agressif qu'en passant sur le Modelfile corrigé |
+| `ocr-service` | 14 | matching `find_text` exact/fuzzy/désactivé/sans résultat (insensible à la casse, distance de Levenshtein légère mot par mot en secours), conversion de coordonnées pixels -> repère normalisé 0-1000 sur une image 1280x1024 connue (`OCR_COORD_SPACE`) et désactivation (`coord_space="pixels"`), `find_text`/`read_screen` de bout en bout contre un faux serveur MCP GhostDesk réel (Streamable HTTP, image PNG de taille connue), plafond de `read_screen` à 80 éléments triés par confiance, `OCR_ENGINE=fake` (aucune dépendance à PaddleOCR dans les tests) |
+| `langgraph-agent` | 92 (+1 test d'intégration live, ignoré par défaut) | boucle d'appel d'outil, non-duplication des messages, endpoint streaming et non-streaming, pause/reprise d'approbation humaine (approuvé, refusé, streaming inclus), non-duplication de l'historique sur plusieurs tours de conversation, repli du raisonnement en balises `<think>` (champ `reasoning` Ollama OU `reasoning_content` llama-server), **récupération de réponse vide** (`test_empty_answer_recovery.py` : extraction d'un tool_call `<tool_call><function=...>` piégé en prose et reconstruction en tool_calls structuré, tour normalement soumis à approbation après récupération si l'outil est sensible, retry automatique jusqu'à `MAX_EMPTY_ANSWER_RETRIES` puis succès, reset de l'état `<think>` au retry, abandon propre une fois le budget épuisé, flux normal inchangé) + **notice de réponse vide** (`test_non_streaming_endpoint_reports_empty_answer_notice`/`test_streaming_endpoint_reports_empty_answer_notice` : dernier filet si les deux mitigations précédentes échouent), liaison du schéma d'outils mcp-client au LLM (bind_tools), repli des résultats d'outil image en message multimodal, **rétention d'images et thinking adaptatif** (`test_image_retention_and_thinking.py` : ne garde que les `MAX_IMAGES_IN_CONTEXT` dernières captures dans la requête envoyée au LLM sans jamais toucher au checkpointer, passthrough WebP vs conversion PNG par défaut selon `IMAGE_FORMAT_PASSTHROUGH`, injection `/no_think` après un tour entièrement auto-approuvé si `ADAPTIVE_THINKING` est actif, absence d'injection sur le premier tour ou après un outil sensible), **politique d'approbation par tiers de réversibilité** (`approval_policy.py` : tiers lecture/réversible/sensible par défaut, override `TIER_READ_TOOLS`/`TIER_REVERSIBLE_TOOLS`/`AUTO_APPROVED_TOOLS` rétrocompatible, outil inconnu toujours sensible, tour 100% tiers auto-approuvés vs tour mixte, `find_text`/`read_screen` en tier lecture — voir OCR d'appoint plus bas, aussi bien au niveau unitaire que routage réel dans le graphe via `test_find_text_skips_approval_silently`), **règles sur arguments** (`test_approval_rules.py` : `key_type` court/mono-ligne auto-approuvé vs long ou multi-lignes soumis à approbation (au niveau unitaire ET routage réel dans le graphe), règle absente retombe sur le tier statique, ambiguïté entre règles résolue par le plus restrictif, une règle peut durcir un tier autant que l'assouplir, grant de session appliqué après résolution de règle, chargement `APPROVAL_RULES_PATH`/YAML), **grants de session** (`test_session_grants.py` : premier appel toujours soumis à approbation même avec intention de grant, "approuver pour la session" auto-approuve les appels suivants du même outil, portée strictement par outil, grants perdus après reconstruction simulée du checkpointer, champ `grant_session` de `POST /approve`), **journal d'audit** (`test_audit_log.py` : tool_call tiers réversible auto-approuvé tracé, tiers lecture jamais tracé, seul l'appel auto-approuvé via un grant de session apparaît — pas le premier passé par approbation humaine, filtrage `GET /audit?thread_id=`), endpoints `/pending` et `/approve` pour une approbation par bouton d'UI, fermeture de la balise `<think>` restée ouverte en streaming avant le texte d'approbation, fusion d'un seul bloc `<think>` continu sur plusieurs itérations de la boucle d'outils auto-approuvés, notice explicite quand MAX_TOOL_ITERATIONS coupe un run avec un tool_call encore en attente, garde-fou `AUTO_APPROVAL_STREAK_LIMIT` forçant un passage humain après N tours auto-approuvés consécutifs (avec réarmement du compteur après approbation). `tests_integration/` (séparé, non mocké, opt-in via `RUN_LIVE_LLM_TESTS=1`) : non-régression de la dérive du LLM réel sur "va sur google.fr" (longueur de réponse, répétition de trigrammes), vérifiée aussi bien en échouant sur l'ancien Modelfile trop agressif qu'en passant sur le Modelfile corrigé |
 
 ## Bugs trouvés et corrigés pendant le développement
 
@@ -485,7 +543,7 @@ documentée plus haut pour le streaming n'a donc pas été touchée.
   serveur MCP lancé en process Python direct (même protocole que les vrais
   serveurs), mais pas avec le socket Docker ni les images `mcp/*` réelles.
 - **`llama-server` : build, démarrage et inférence texte vérifiés
-  réellement** (modèle `Qwen3.6-35B-A3B` quant `UD-Q4_K_XL` + `mmproj-F16`,
+  réellement** (modèle `Qwen3.6-35B-A3B` quant `Q5_K_M` + `mmproj-F16`,
   conversation complète de bout en bout à travers `langgraph-agent`, voir
   section Backend d'inférence et tableau des bugs). **Non vérifié : function
   calling réel avec un tool_call effectif** (les tests d'intégration
@@ -522,9 +580,14 @@ documentée plus haut pour le streaming n'a donc pas été touchée.
   défaut est désormais `llama-server` (voir section Backend d'inférence),
   servant Qwen3.6-35B-A3B avec un projecteur multimodal (`--mmproj`) —
   l'agent peut donc désormais recevoir et interpréter les captures d'écran
-  GhostDesk. Reste néanmoins une limite distincte, non résolue : la
-  précision du grounding (viser le bon élément à l'écran) d'un modèle de
-  vision généraliste sans OCR/détection d'éléments UI dédiée.
+  GhostDesk. Reste néanmoins une limite distincte, désormais atténuée mais
+  pas résolue : la précision du grounding (viser le bon élément à l'écran)
+  d'un modèle de vision généraliste. `ocr-service` (voir section OCR
+  d'appoint plus haut) compense pour les éléments TEXTUELS via
+  `find_text`/`read_screen` (coordonnées OCR exactes plutôt qu'une
+  estimation visuelle) ; les éléments sans texte (icônes) restent estimés
+  visuellement par le VLM, sans détection d'éléments UI dédiée (type
+  OmniParser, explicitement hors périmètre pour l'instant).
 - **`ghostdesk` est un serveur MCP HTTP persistant avec état** (bureau/session
   VNC), contrairement aux autres serveurs MCP du projet qui sont spawnés en
   STDIO éphémère par `mcp-client` (`docker run -i --rm` par appel). Il tourne

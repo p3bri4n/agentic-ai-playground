@@ -189,10 +189,49 @@ services:
       - ghostdesk-home:/home/agent   # persiste le bureau/apps entre redémarrages
     ports:
       - "6080:6080"   # noVNC — exposé par défaut pour observer l'agent piloter le bureau
+    healthcheck:
+      # Port MCP (3000, voir plus bas) : ocr-service en dépend (condition
+      # service_healthy) pour ne capturer qu'une fois GhostDesk réellement prêt
+      # à répondre, pas seulement démarré (depends_on seul ne garantit que
+      # l'ordre de démarrage des conteneurs, voir README tableau des bugs pour
+      # un précédent similaire avec Qdrant).
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/localhost/3000' || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
     networks:
       - agent-net
-    # Port MCP (3000) volontairement non publié sur l'hôte : seul mcp-client
-    # doit l'atteindre, via le réseau interne agent-net.
+    # Port MCP (3000) volontairement non publié sur l'hôte : seuls mcp-client
+    # et ocr-service doivent l'atteindre, via le réseau interne agent-net.
+
+  # --- OCR d'appoint : PaddleOCR CPU (find_text/read_screen) ------
+  # Grounding du VLM (Qwen3.6 MoE) : raisonne bien mais localise mal un
+  # élément à l'écran (sans OCR/détection d'éléments UI dédiée, voir README
+  # section OCR d'appoint et Limites connues assumées). Serveur MCP HTTP
+  # persistant comme GhostDesk ci-dessus (pas un conteneur spawné à la
+  # demande par mcp-client) : il se connecte lui-même à GhostDesk pour
+  # capturer l'écran, indépendamment de mcp-client/langgraph-agent.
+  ocr-service:
+    build: ./services/ocr-service
+    container_name: ocr-service
+    restart: unless-stopped
+    environment:
+      - MCP_GHOSTDESK_URL=http://ghostdesk:3000/mcp
+      - GHOSTDESK_AUTH_TOKEN=${GHOSTDESK_AUTH_TOKEN}
+      - OCR_AUTH_TOKEN=${OCR_AUTH_TOKEN}
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://localhost:8004/health', timeout=3)\" || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    depends_on:
+      ghostdesk:
+        condition: service_healthy
+    networks:
+      - agent-net
+    # pas de port publié : uniquement accessible via le réseau interne (mcp-client)
 
   # ──────────────────────────────────────────────────────────────
   # Inférence
