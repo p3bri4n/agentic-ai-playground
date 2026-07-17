@@ -1,5 +1,435 @@
 <!doctype html>
 <html lang="fr">
-<head><meta charset="utf-8"><title>Cockpit</title></head>
-<body>Placeholder — remplacé en Phase 2 (page).</body>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Cockpit d'observabilité — agentic-ai-playground</title>
+<style>
+  :root {
+    color-scheme: light;
+    --surface-1:      #fcfcfb;
+    --page-plane:     #f9f9f7;
+    --text-primary:   #0b0b0b;
+    --text-secondary: #52514e;
+    --text-muted:     #898781;
+    --gridline:       #e1e0d9;
+    --baseline:       #c3c2b7;
+    --border:         rgba(11,11,11,0.10);
+    --good:           #0ca30c;
+    --warning:        #fab219;
+    --critical:       #d03b3b;
+    --seq-300: #6da7ec;
+    --seq-450: #2a78d6;
+    --seq-600: #184f95;
+    /* Palette catégorielle fixe (ordre jamais permuté, voir dataviz skill) */
+    --series-1: #2a78d6; /* system */
+    --series-2: #008300; /* history_text */
+    --series-3: #e87ba4; /* tools_schema */
+    --series-4: #eda100; /* pending */
+    --series-5: #1baf7a; /* skills */
+    --series-6: #eb6834; /* images */
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      color-scheme: dark;
+      --surface-1:      #1a1a19;
+      --page-plane:     #0d0d0d;
+      --text-primary:   #ffffff;
+      --text-secondary: #c3c2b7;
+      --text-muted:     #898781;
+      --gridline:       #2c2c2a;
+      --baseline:       #383835;
+      --border:         rgba(255,255,255,0.10);
+      --good:           #0ca30c;
+      --warning:        #fab219;
+      --critical:       #e66767;
+      --seq-300: #6da7ec;
+      --seq-450: #2a78d6;
+      --seq-600: #184f95;
+      --series-1: #3987e5;
+      --series-2: #008300;
+      --series-3: #d55181;
+      --series-4: #c98500;
+      --series-5: #199e70;
+      --series-6: #d95926;
+    }
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+    background: var(--page-plane);
+    color: var(--text-primary);
+  }
+  header {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 12px;
+    padding: 16px 20px;
+    border-bottom: 1px solid var(--border);
+  }
+  header h1 { font-size: 18px; margin: 0; font-weight: 600; }
+  #generated-at { color: var(--text-muted); font-size: 12px; }
+
+  .status-row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+  .status-pill {
+    display: inline-flex; align-items: center; gap: 6px;
+    font-size: 12px; color: var(--text-secondary);
+    padding: 3px 10px; border-radius: 999px; border: 1px solid var(--border);
+  }
+  .status-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--text-muted); }
+  .status-dot.ok { background: var(--good); }
+  .status-dot.down { background: var(--critical); }
+
+  main { padding: 16px 20px 40px; max-width: 1200px; margin: 0 auto; display: flex; flex-direction: column; gap: 20px; }
+
+  .card {
+    background: var(--surface-1);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 16px;
+  }
+  .card h2 {
+    font-size: 13px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.03em;
+    color: var(--text-secondary); margin: 0 0 12px;
+  }
+
+  .stat-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 12px; }
+  .stat-tile {
+    background: var(--surface-1); border: 1px solid var(--border); border-radius: 10px;
+    padding: 14px 16px;
+  }
+  .stat-tile .label { font-size: 12px; color: var(--text-secondary); margin-bottom: 6px; }
+  .stat-tile .value { font-size: 26px; font-weight: 600; line-height: 1.1; }
+  .stat-tile .value .unit { font-size: 13px; font-weight: 500; color: var(--text-muted); margin-left: 4px; }
+  .stat-tile .meter-track {
+    margin-top: 10px; height: 6px; border-radius: 3px; background: var(--seq-300);
+    opacity: 0.35; overflow: hidden;
+  }
+  .stat-tile .meter-fill { height: 100%; background: var(--seq-450); border-radius: 3px; }
+
+  .context-bar-wrap { display: flex; height: 28px; border-radius: 6px; overflow: hidden; background: var(--gridline); }
+  .context-bar-seg { height: 100%; }
+  .context-bar-empty { padding: 6px 0; font-size: 13px; color: var(--text-muted); }
+  .legend { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 12px; }
+  .legend-item { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--text-secondary); }
+  .legend-swatch { width: 10px; height: 10px; border-radius: 2px; flex: none; }
+  .legend-item .count { color: var(--text-muted); }
+
+  .thread-select-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  select#thread-select {
+    font: inherit; padding: 6px 10px; border-radius: 6px; border: 1px solid var(--border);
+    background: var(--surface-1); color: var(--text-primary);
+  }
+  #context-total { color: var(--text-muted); font-size: 12px; }
+
+  .sparkline-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 16px; }
+  .sparkline-card canvas { width: 100%; height: 80px; display: block; }
+  .sparkline-legend { display: flex; gap: 14px; margin-top: 8px; font-size: 12px; color: var(--text-secondary); }
+
+  .empty-note { color: var(--text-muted); font-size: 13px; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Cockpit d'observabilité — agentic-ai-playground</h1>
+  <div class="status-row" id="status-row">
+    <span class="status-pill"><span class="status-dot" id="dot-llama"></span>llama-server</span>
+    <span class="status-pill"><span class="status-dot" id="dot-agent"></span>langgraph-agent</span>
+    <span class="status-pill" id="pill-gpu" hidden><span class="status-dot" id="dot-gpu"></span>GPU</span>
+    <span id="generated-at">—</span>
+  </div>
+</header>
+
+<main>
+
+  <section class="stat-row" id="stat-row" aria-label="Métriques d'inférence"></section>
+
+  <section class="card">
+    <div class="thread-select-row">
+      <h2 style="margin:0;">Composition du contexte</h2>
+      <label for="thread-select" style="font-size:12px;color:var(--text-secondary);">Thread :</label>
+      <select id="thread-select"></select>
+      <span id="context-total"></span>
+    </div>
+    <div style="margin-top: 14px;">
+      <div class="context-bar-wrap" id="context-bar"></div>
+      <div class="legend" id="context-legend"></div>
+    </div>
+  </section>
+
+  <section class="sparkline-grid">
+    <div class="card sparkline-card">
+      <h2>Débit (tok/s) — 60 derniers relevés</h2>
+      <canvas id="spark-throughput"></canvas>
+      <div class="sparkline-legend">
+        <span><span class="legend-swatch" style="background:var(--series-1);display:inline-block;"></span> decode</span>
+        <span><span class="legend-swatch" style="background:var(--series-6);display:inline-block;"></span> prefill</span>
+      </div>
+    </div>
+    <div class="card sparkline-card">
+      <h2>Contexte occupé (slot 0) — 60 derniers relevés</h2>
+      <canvas id="spark-context"></canvas>
+    </div>
+  </section>
+
+</main>
+
+<script>
+(() => {
+  const POLL_MS = 2000;
+  const HISTORY_LEN = 60;
+  const IMAGE_TOKEN_LABEL = "images";
+
+  const CONTEXT_KIND_ORDER = ["system", "skills", "tools_schema", "history_text", "images", "pending"];
+  const CONTEXT_KIND_COLOR = {
+    system: "var(--series-1)",
+    history_text: "var(--series-2)",
+    tools_schema: "var(--series-3)",
+    pending: "var(--series-4)",
+    skills: "var(--series-5)",
+    images: "var(--series-6)",
+  };
+  const CONTEXT_KIND_LABEL = {
+    system: "System",
+    skills: "Skills",
+    tools_schema: "Outils",
+    history_text: "Historique",
+    images: "Images",
+    pending: "En attente",
+  };
+
+  const history = { decode: [], prefill: [], contextUsed: [] };
+  let selectedThreadId = null;
+  let userPickedThread = false;
+
+  const el = (id) => document.getElementById(id);
+
+  function fmtNum(n, digits = 1) {
+    if (n === null || n === undefined || Number.isNaN(n)) return "—";
+    return Number(n).toFixed(digits);
+  }
+
+  function setStatusDot(id, ok) {
+    const dot = el(id);
+    dot.classList.remove("ok", "down");
+    dot.classList.add(ok ? "ok" : "down");
+  }
+
+  function renderStatTiles(snapshot) {
+    const metrics = snapshot.llama && snapshot.llama.metrics;
+    const slots = (snapshot.llama && snapshot.llama.slots) || [];
+    const slot0 = slots[0];
+    const gpus = snapshot.gpu || [];
+
+    const tiles = [];
+    tiles.push({
+      label: "Décodage",
+      value: metrics && metrics.decode_tokens_per_sec != null ? fmtNum(metrics.decode_tokens_per_sec) : "—",
+      unit: "tok/s",
+    });
+    tiles.push({
+      label: "Prefill",
+      value: metrics && metrics.prefill_tokens_per_sec != null ? fmtNum(metrics.prefill_tokens_per_sec) : "—",
+      unit: "tok/s",
+    });
+    if (slot0 && slot0.n_ctx) {
+      const used = slot0.used_tokens ?? 0;
+      const pct = Math.min(100, Math.round((used / slot0.n_ctx) * 100));
+      tiles.push({
+        label: "Contexte slot 0",
+        value: `${used}`,
+        unit: `/ ${slot0.n_ctx} (${pct}%)`,
+        meterPct: pct,
+      });
+    } else {
+      tiles.push({ label: "Contexte slot 0", value: "—", unit: "" });
+    }
+    if (gpus.length) {
+      gpus.forEach((gpu) => {
+        const pct = gpu.memory_total_mib ? Math.round((gpu.memory_used_mib / gpu.memory_total_mib) * 100) : 0;
+        tiles.push({
+          label: `VRAM GPU ${gpu.index}`,
+          value: `${(gpu.memory_used_mib / 1024).toFixed(1)}`,
+          unit: `/ ${(gpu.memory_total_mib / 1024).toFixed(1)} Go (${pct}%)`,
+          meterPct: pct,
+        });
+      });
+    }
+
+    el("stat-row").innerHTML = tiles.map((t) => `
+      <div class="stat-tile">
+        <div class="label">${t.label}</div>
+        <div class="value">${t.value}<span class="unit">${t.unit}</span></div>
+        ${t.meterPct != null ? `<div class="meter-track"><div class="meter-fill" style="width:${t.meterPct}%"></div></div>` : ""}
+      </div>
+    `).join("");
+  }
+
+  function renderContextComposition(context) {
+    const bar = el("context-bar");
+    const legend = el("context-legend");
+    const total = el("context-total");
+
+    if (!context || !context.blocks || !context.blocks.some((b) => b.est_tokens > 0)) {
+      bar.innerHTML = `<div class="context-bar-empty">Aucun contexte disponible pour ce thread.</div>`;
+      legend.innerHTML = "";
+      total.textContent = "";
+      return;
+    }
+
+    const blocksByKind = {};
+    context.blocks.forEach((b) => { blocksByKind[b.kind] = b; });
+    const ordered = CONTEXT_KIND_ORDER.map((k) => blocksByKind[k]).filter(Boolean);
+    const sumTokens = ordered.reduce((acc, b) => acc + b.est_tokens, 0) || 1;
+
+    bar.innerHTML = ordered
+      .filter((b) => b.est_tokens > 0)
+      .map((b) => {
+        const pct = (b.est_tokens / sumTokens) * 100;
+        return `<div class="context-bar-seg" style="width:${pct}%;background:${CONTEXT_KIND_COLOR[b.kind]};margin-right:2px;" title="${CONTEXT_KIND_LABEL[b.kind]} — ${b.est_tokens} tok"></div>`;
+      })
+      .join("");
+
+    legend.innerHTML = ordered
+      .map((b) => `
+        <span class="legend-item">
+          <span class="legend-swatch" style="background:${CONTEXT_KIND_COLOR[b.kind]}"></span>
+          ${CONTEXT_KIND_LABEL[b.kind]} <span class="count">${b.est_tokens} tok (${b.count})</span>
+        </span>
+      `)
+      .join("");
+
+    total.textContent = `≈ ${context.total_est_tokens} tokens · ${context.message_count} messages`;
+  }
+
+  function renderThreadSelect(threads) {
+    const select = el("thread-select");
+    if (!threads || !threads.length) {
+      select.innerHTML = `<option value="">Aucun thread récent</option>`;
+      select.disabled = true;
+      return;
+    }
+    select.disabled = false;
+    const current = select.value;
+    select.innerHTML = threads
+      .map((t) => `<option value="${t.thread_id}">${t.thread_id} — ${new Date(t.last_seen).toLocaleTimeString("fr-FR")}</option>`)
+      .join("");
+    if (!userPickedThread) {
+      select.value = threads[0].thread_id;
+    } else if (threads.some((t) => t.thread_id === current)) {
+      select.value = current;
+    }
+  }
+
+  function pushHistory(arr, value) {
+    arr.push(value);
+    if (arr.length > HISTORY_LEN) arr.shift();
+  }
+
+  function drawSparkline(canvas, series) {
+    const ctx = canvas.getContext("2d");
+    const dpr = window.devicePixelRatio || 1;
+    const w = canvas.clientWidth || 320;
+    const h = canvas.clientHeight || 80;
+    canvas.width = w * dpr;
+    canvas.height = h * dpr;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, w, h);
+
+    const allValues = series.flatMap((s) => s.data).filter((v) => v != null && !Number.isNaN(v));
+    if (!allValues.length) return;
+    const min = Math.min(0, ...allValues);
+    const max = Math.max(...allValues) || 1;
+
+    series.forEach((s) => {
+      const points = s.data.filter((v) => v != null);
+      if (points.length < 2) return;
+      ctx.beginPath();
+      ctx.strokeStyle = s.color;
+      ctx.lineWidth = 2;
+      ctx.lineJoin = "round";
+      ctx.lineCap = "round";
+      s.data.forEach((v, i) => {
+        if (v == null) return;
+        const x = (i / (HISTORY_LEN - 1)) * w;
+        const y = h - ((v - min) / (max - min || 1)) * (h - 6) - 3;
+        if (i === 0 || s.data[i - 1] == null) ctx.moveTo(x, y);
+        else ctx.lineTo(x, y);
+      });
+      ctx.stroke();
+    });
+  }
+
+  function renderSparklines() {
+    drawSparkline(el("spark-throughput"), [
+      { data: history.decode, color: getCss("--series-1") },
+      { data: history.prefill, color: getCss("--series-6") },
+    ]);
+    drawSparkline(el("spark-context"), [
+      { data: history.contextUsed, color: getCss("--series-2") },
+    ]);
+  }
+
+  function getCss(varName) {
+    return getComputedStyle(document.documentElement).getPropertyValue(varName).trim();
+  }
+
+  async function poll() {
+    try {
+      const qs = selectedThreadId ? `?thread_id=${encodeURIComponent(selectedThreadId)}` : "";
+      const resp = await fetch(`/api/snapshot${qs}`, { cache: "no-store" });
+      const snapshot = await resp.json();
+
+      el("generated-at").textContent = "màj " + new Date(snapshot.generated_at).toLocaleTimeString("fr-FR");
+      // Signal fiable de joignabilité : /metrics est toujours tenté, qu'un
+      // thread existe ou non. Pour langgraph-agent, `threads` vaut toujours
+      // [] en best-effort (voir app/main.py) que l'agent soit down ou juste
+      // sans historique — seul un thread résolu ET son contexte présent est
+      // un signal positif fiable ; en l'absence de thread, on laisse le
+      // point neutre plutôt que d'afficher un faux "down".
+      setStatusDot("dot-llama", !!(snapshot.llama && snapshot.llama.metrics));
+      if (snapshot.selected_thread_id) {
+        setStatusDot("dot-agent", snapshot.context !== null);
+      }
+      if (snapshot.gpu !== null) {
+        el("pill-gpu").hidden = false;
+        setStatusDot("dot-gpu", true);
+      }
+
+      renderStatTiles(snapshot);
+      renderContextComposition(snapshot.context);
+      renderThreadSelect(snapshot.threads);
+      if (snapshot.selected_thread_id && !userPickedThread) {
+        selectedThreadId = snapshot.selected_thread_id;
+      }
+
+      const metrics = snapshot.llama && snapshot.llama.metrics;
+      pushHistory(history.decode, metrics ? metrics.decode_tokens_per_sec : null);
+      pushHistory(history.prefill, metrics ? metrics.prefill_tokens_per_sec : null);
+      const slot0 = snapshot.llama && snapshot.llama.slots && snapshot.llama.slots[0];
+      pushHistory(history.contextUsed, slot0 ? slot0.used_tokens : null);
+      renderSparklines();
+    } catch (err) {
+      setStatusDot("dot-llama", false);
+      setStatusDot("dot-agent", false);
+    }
+  }
+
+  el("thread-select").addEventListener("change", (e) => {
+    userPickedThread = true;
+    selectedThreadId = e.target.value || null;
+    poll();
+  });
+
+  poll();
+  setInterval(poll, POLL_MS);
+})();
+</script>
+
+</body>
 </html>
