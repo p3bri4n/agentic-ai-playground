@@ -58,6 +58,12 @@ services/
                        comme ghostdesk (voir section OCR d'appoint)
     app/
     tests/
+  dashboard/           Cockpit d'observabilité local : page unique + API
+                       d'agrégation best-effort (llama-server, langgraph-agent,
+                       nvidia-smi) — voir section Observabilité
+    app/
+      static/          page HTML/JS vanille servie telle quelle (pas de build)
+    tests/
 skills/     à remplir (un sous-dossier par skill, avec un SKILL.md)
 workspace/  partagé avec les serveurs MCP filesystem/git/terminal, ainsi
             qu'avec langgraph-agent pour le journal d'audit (.audit/, voir
@@ -199,6 +205,60 @@ Hors périmètre explicite (itération future) : détection d'icônes/éléments
 sans texte (type OmniParser), annotation Set-of-Marks des screenshots, OCR
 GPU, cache des résultats entre appels.
 
+## Observabilité (`services/dashboard`)
+
+Cockpit web local en une page (http://localhost:8090 par défaut,
+`DASHBOARD_PORT`) : métriques d'inférence llama-server (débit decode/prefill
+en tok/s, contexte occupé par slot), composition détaillée du contexte
+construit par langgraph-agent (system prompt, skills, schéma d'outils,
+historique, images — voir `POST /context` plus bas) et VRAM des GPU.
+
+**Architecture** : `GET /api/snapshot` agrège en parallèle, chaque source en
+best-effort (une source en panne renvoie sa section à `null`, jamais une 500
+globale, statut 200 systématique — le dashboard poll ce endpoint toutes les
+2s) : `llama-server` (`/metrics`, format Prometheus parsé par un parser
+minimal maison, `app/prometheus.py` ; `/slots`), `langgraph-agent`
+(`/threads/recent` puis `POST /context` pour le thread résolu) et
+`nvidia-smi` en subprocess (VRAM, `app/gpu.py`). La page (`GET /`, HTML/JS
+vanille, aucune dépendance externe) ne parle jamais directement à
+llama-server/langgraph-agent : seuls Open WebUI et le dashboard ont un port
+publié sur l'hôte, tout le reste n'est joignable que via le réseau interne
+`agent-net` — d'où l'agrégation côté backend du dashboard plutôt que des
+appels depuis le navigateur.
+
+**`POST /context` (langgraph-agent, `app/graph.py:describe_context`)** :
+décompose le contexte persisté d'un thread en blocs approximatifs
+(`system`/`skills`/`tools_schema`/`history_text`/`images`/`pending`), chacun
+avec un compte de tokens estimé (`estimate_tokens`, ~3.5 caractères/token —
+pas un tokenizer exact, volontairement hors périmètre, voir plus bas) et un
+forfait fixe par image (`IMAGE_TOKEN_ESTIMATE`, défaut `1500`, un compte
+exact dépendrait du tokenizer visuel du modèle servi). Le schéma d'outils est
+mesuré depuis le cache déjà rempli par `_get_bound_llm` (jamais recalculé :
+`/context` reste strictement lecture seule, comme `/pending`). Thread inconnu
+du checkpointer -> 200 avec des blocs vides plutôt qu'une 404, pour ne pas
+transformer le polling continu du dashboard en bruit d'erreurs côté client.
+
+**Sélection de thread (`GET /threads/recent`)** : langgraph-agent n'a jamais
+d'identifiant de conversation stable côté Open WebUI (voir plus bas,
+`_derive_thread_id`) ; un registre en mémoire process, jamais persisté
+(cohérent avec le checkpointer `MemorySaver` lui-même en mémoire), retient
+les 5 threads vus le plus récemment (alimenté par `/v1/chat/completions` et
+`/approve`, jamais par les endpoints purement lecture seule `/pending` ou
+`/context` eux-mêmes). La page sélectionne le plus récent par défaut, avec un
+menu déroulant pour en choisir un autre.
+
+**VRAM (`ENABLE_GPU_STATS`, défaut `false`)** : `nvidia-smi --query-gpu=...
+--format=csv,noheader,nounits` en subprocess, désactivé par défaut — nécessite
+le runtime nvidia (bloc `deploy` commenté dans `docker-compose.yml`, à
+décommenter avec cette variable) pour que le binaire `nvidia-smi` soit
+présent dans le conteneur `python:3.12-slim` du dashboard, qui n'a sinon
+aucun besoin d'accès GPU.
+
+Hors périmètre explicite (voir demande initiale) : Prometheus/Grafana,
+Langfuse, persistance des métriques (tout est en mémoire, perdu au
+redémarrage), alerting, auth (réseau local), WebSocket/SSE (le polling 2s
+suffit), télémétrie de tâches (taux de succès), tokenizer exact.
+
 ## Tests
 
 Chaque service a sa propre suite pytest, isolée des autres (aucune dépendance
@@ -248,7 +308,8 @@ Résumé des suites, à date de la dernière vérification :
 | `mcp-client` | 11 | registre d'outils, schéma function-calling (description/inputSchema) exposé pour le LLM, appel réel via stdio, erreur 404 sur outil inconnu, appel réel via Streamable HTTP (serveur "desktop"/GhostDesk) avec vérification du bearer token et de l'en-tête `GhostDesk-Model-Space` (présent avec la valeur configurée ET absent quand `GHOSTDESK_MODEL_SPACE=""`), serveur "ocr" (services/ocr-service) enregistré/appelable via Streamable HTTP et bearer invalide rejeté |
 | `mcp-terminal` | 6 | liste blanche de commandes, lecture de fichier (y compris nom avec espace), blocage du path traversal |
 | `ocr-service` | 14 | matching `find_text` exact/fuzzy/désactivé/sans résultat (insensible à la casse, distance de Levenshtein légère mot par mot en secours), conversion de coordonnées pixels -> repère normalisé 0-1000 sur une image 1280x1024 connue (`OCR_COORD_SPACE`) et désactivation (`coord_space="pixels"`), `find_text`/`read_screen` de bout en bout contre un faux serveur MCP GhostDesk réel (Streamable HTTP, image PNG de taille connue), plafond de `read_screen` à 80 éléments triés par confiance, `OCR_ENGINE=fake` (aucune dépendance à PaddleOCR dans les tests) |
-| `langgraph-agent` | 92 (+1 test d'intégration live, ignoré par défaut) | boucle d'appel d'outil, non-duplication des messages, endpoint streaming et non-streaming, pause/reprise d'approbation humaine (approuvé, refusé, streaming inclus), non-duplication de l'historique sur plusieurs tours de conversation, repli du raisonnement en balises `<think>` (champ `reasoning` Ollama OU `reasoning_content` llama-server), **récupération de réponse vide** (`test_empty_answer_recovery.py` : extraction d'un tool_call `<tool_call><function=...>` piégé en prose et reconstruction en tool_calls structuré, tour normalement soumis à approbation après récupération si l'outil est sensible, retry automatique jusqu'à `MAX_EMPTY_ANSWER_RETRIES` puis succès, reset de l'état `<think>` au retry, abandon propre une fois le budget épuisé, flux normal inchangé) + **notice de réponse vide** (`test_non_streaming_endpoint_reports_empty_answer_notice`/`test_streaming_endpoint_reports_empty_answer_notice` : dernier filet si les deux mitigations précédentes échouent), liaison du schéma d'outils mcp-client au LLM (bind_tools), repli des résultats d'outil image en message multimodal, **rétention d'images et thinking adaptatif** (`test_image_retention_and_thinking.py` : ne garde que les `MAX_IMAGES_IN_CONTEXT` dernières captures dans la requête envoyée au LLM sans jamais toucher au checkpointer, passthrough WebP vs conversion PNG par défaut selon `IMAGE_FORMAT_PASSTHROUGH`, injection `/no_think` après un tour entièrement auto-approuvé si `ADAPTIVE_THINKING` est actif, absence d'injection sur le premier tour ou après un outil sensible), **politique d'approbation par tiers de réversibilité** (`approval_policy.py` : tiers lecture/réversible/sensible par défaut, override `TIER_READ_TOOLS`/`TIER_REVERSIBLE_TOOLS`/`AUTO_APPROVED_TOOLS` rétrocompatible, outil inconnu toujours sensible, tour 100% tiers auto-approuvés vs tour mixte, `find_text`/`read_screen` en tier lecture — voir OCR d'appoint plus bas, aussi bien au niveau unitaire que routage réel dans le graphe via `test_find_text_skips_approval_silently`), **règles sur arguments** (`test_approval_rules.py` : `key_type` court/mono-ligne auto-approuvé vs long ou multi-lignes soumis à approbation (au niveau unitaire ET routage réel dans le graphe), règle absente retombe sur le tier statique, ambiguïté entre règles résolue par le plus restrictif, une règle peut durcir un tier autant que l'assouplir, grant de session appliqué après résolution de règle, chargement `APPROVAL_RULES_PATH`/YAML), **grants de session** (`test_session_grants.py` : premier appel toujours soumis à approbation même avec intention de grant, "approuver pour la session" auto-approuve les appels suivants du même outil, portée strictement par outil, grants perdus après reconstruction simulée du checkpointer, champ `grant_session` de `POST /approve`), **journal d'audit** (`test_audit_log.py` : tool_call tiers réversible auto-approuvé tracé, tiers lecture jamais tracé, seul l'appel auto-approuvé via un grant de session apparaît — pas le premier passé par approbation humaine, filtrage `GET /audit?thread_id=`), endpoints `/pending` et `/approve` pour une approbation par bouton d'UI, fermeture de la balise `<think>` restée ouverte en streaming avant le texte d'approbation, fusion d'un seul bloc `<think>` continu sur plusieurs itérations de la boucle d'outils auto-approuvés, notice explicite quand MAX_TOOL_ITERATIONS coupe un run avec un tool_call encore en attente, garde-fou `AUTO_APPROVAL_STREAK_LIMIT` forçant un passage humain après N tours auto-approuvés consécutifs (avec réarmement du compteur après approbation). `tests_integration/` (séparé, non mocké, opt-in via `RUN_LIVE_LLM_TESTS=1`) : non-régression de la dérive du LLM réel sur "va sur google.fr" (longueur de réponse, répétition de trigrammes), vérifiée aussi bien en échouant sur l'ancien Modelfile trop agressif qu'en passant sur le Modelfile corrigé |
+| `dashboard` | 16 | parser Prometheus minimal maison sur un payload `/metrics` figé réaliste (commentaires `# HELP`/`# TYPE` ignorés, lignes illisibles tolérées), normalisation des slots `/slots` (clé `used_tokens` : premier champ connu présent parmi plusieurs noms possibles selon la version), parsing CSV `nvidia-smi` (lignes malformées ignorées), `GET /api/snapshot` : agrégation des 3 sources quand tout va bien, llama-server injoignable -> section `null` + statut 200 (jamais 500), langgraph-agent injoignable -> `context` à `null`, `thread_id` explicite en query prioritaire sur le plus récent, VRAM activée (`ENABLE_GPU_STATS`, nvidia-smi mocké) vs désactivée par défaut (nvidia-smi jamais appelé, pas d'erreur), `GET /` renvoie 200 en HTML (page non testée en détail, statique) |
+| `langgraph-agent` | 96 (+1 test d'intégration live, ignoré par défaut) | `POST /context` (décomposition du contexte en blocs system/skills/tools_schema/history_text/images sur un historique texte+image réel, schéma d'outils mesuré depuis le cache `_get_bound_llm` jamais recalculé, thread inconnu -> blocs vides plutôt qu'une 404) et `GET /threads/recent` (registre en mémoire alimenté par `/v1/chat/completions`/`/approve`, ordonné par récence, plafonné à 5 — voir section Observabilité), boucle d'appel d'outil, non-duplication des messages, endpoint streaming et non-streaming, pause/reprise d'approbation humaine (approuvé, refusé, streaming inclus), non-duplication de l'historique sur plusieurs tours de conversation, repli du raisonnement en balises `<think>` (champ `reasoning` Ollama OU `reasoning_content` llama-server), **récupération de réponse vide** (`test_empty_answer_recovery.py` : extraction d'un tool_call `<tool_call><function=...>` piégé en prose et reconstruction en tool_calls structuré, tour normalement soumis à approbation après récupération si l'outil est sensible, retry automatique jusqu'à `MAX_EMPTY_ANSWER_RETRIES` puis succès, reset de l'état `<think>` au retry, abandon propre une fois le budget épuisé, flux normal inchangé) + **notice de réponse vide** (`test_non_streaming_endpoint_reports_empty_answer_notice`/`test_streaming_endpoint_reports_empty_answer_notice` : dernier filet si les deux mitigations précédentes échouent), liaison du schéma d'outils mcp-client au LLM (bind_tools), repli des résultats d'outil image en message multimodal, **rétention d'images et thinking adaptatif** (`test_image_retention_and_thinking.py` : ne garde que les `MAX_IMAGES_IN_CONTEXT` dernières captures dans la requête envoyée au LLM sans jamais toucher au checkpointer, passthrough WebP vs conversion PNG par défaut selon `IMAGE_FORMAT_PASSTHROUGH`, injection `/no_think` après un tour entièrement auto-approuvé si `ADAPTIVE_THINKING` est actif, absence d'injection sur le premier tour ou après un outil sensible), **politique d'approbation par tiers de réversibilité** (`approval_policy.py` : tiers lecture/réversible/sensible par défaut, override `TIER_READ_TOOLS`/`TIER_REVERSIBLE_TOOLS`/`AUTO_APPROVED_TOOLS` rétrocompatible, outil inconnu toujours sensible, tour 100% tiers auto-approuvés vs tour mixte, `find_text`/`read_screen` en tier lecture — voir OCR d'appoint plus bas, aussi bien au niveau unitaire que routage réel dans le graphe via `test_find_text_skips_approval_silently`), **règles sur arguments** (`test_approval_rules.py` : `key_type` court/mono-ligne auto-approuvé vs long ou multi-lignes soumis à approbation (au niveau unitaire ET routage réel dans le graphe), règle absente retombe sur le tier statique, ambiguïté entre règles résolue par le plus restrictif, une règle peut durcir un tier autant que l'assouplir, grant de session appliqué après résolution de règle, chargement `APPROVAL_RULES_PATH`/YAML), **grants de session** (`test_session_grants.py` : premier appel toujours soumis à approbation même avec intention de grant, "approuver pour la session" auto-approuve les appels suivants du même outil, portée strictement par outil, grants perdus après reconstruction simulée du checkpointer, champ `grant_session` de `POST /approve`), **journal d'audit** (`test_audit_log.py` : tool_call tiers réversible auto-approuvé tracé, tiers lecture jamais tracé, seul l'appel auto-approuvé via un grant de session apparaît — pas le premier passé par approbation humaine, filtrage `GET /audit?thread_id=`), endpoints `/pending` et `/approve` pour une approbation par bouton d'UI, fermeture de la balise `<think>` restée ouverte en streaming avant le texte d'approbation, fusion d'un seul bloc `<think>` continu sur plusieurs itérations de la boucle d'outils auto-approuvés, notice explicite quand MAX_TOOL_ITERATIONS coupe un run avec un tool_call encore en attente, garde-fou `AUTO_APPROVAL_STREAK_LIMIT` forçant un passage humain après N tours auto-approuvés consécutifs (avec réarmement du compteur après approbation). `tests_integration/` (séparé, non mocké, opt-in via `RUN_LIVE_LLM_TESTS=1`) : non-régression de la dérive du LLM réel sur "va sur google.fr" (longueur de réponse, répétition de trigrammes), vérifiée aussi bien en échouant sur l'ancien Modelfile trop agressif qu'en passant sur le Modelfile corrigé |
 
 ## Bugs trouvés et corrigés pendant le développement
 
