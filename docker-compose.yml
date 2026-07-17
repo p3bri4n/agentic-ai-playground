@@ -141,12 +141,19 @@ services:
       # cible (voir .env.example) ; ${VAR:-1000} plutôt que ${VAR} pour
       # garder ce défaut même si la variable est absente du .env.
       - GHOSTDESK_MODEL_SPACE=${GHOSTDESK_MODEL_SPACE:-1000}
+      # OCR d'appoint (services/ocr-service) : serveur HTTP persistant lui
+      # aussi, comme GhostDesk (voir plus bas). Pas de header
+      # GhostDesk-Model-Space pour ce serveur : ocr-service convertit déjà
+      # ses coordonnées vers 0-1000 lui-même avant de répondre.
+      - MCP_OCR_URL=http://ocr-service:8004/mcp
+      - OCR_AUTH_TOKEN=${OCR_AUTH_TOKEN}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock   # ⚠️ équivaut à un accès root sur l'hôte,
                                                        # voir avertissement de sécurité dans le README
       - ./workspace:/workspace
     depends_on:
       - ghostdesk
+      - ocr-service
     networks:
       - agent-net
 
