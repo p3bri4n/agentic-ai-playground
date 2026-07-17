@@ -15,6 +15,14 @@ def test_default_tier_read_tools_are_auto_approved():
         assert policy.is_auto_approved(name)
 
 
+def test_ocr_tools_are_tier_read():
+    """find_text/read_screen (services/ocr-service) : lecture pure, aucun
+    effet de bord — auto-approuvés et silencieux comme screen_shot."""
+    for name in ["find_text", "read_screen"]:
+        assert policy.tool_tier(name) == policy.TIER_READ
+        assert policy.is_auto_approved(name)
+
+
 def test_default_tier_reversible_tools_are_auto_approved():
     for name in ["mouse_click", "mouse_double_click", "key_press", "clipboard_set", "write_file", "git_commit"]:
         assert policy.tool_tier(name) == policy.TIER_REVERSIBLE

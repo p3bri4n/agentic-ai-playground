@@ -151,6 +151,34 @@ async def test_all_tier_read_tools_skip_approval_silently(mock_side_services):
 
 
 @pytest.mark.asyncio
+async def test_find_text_skips_approval_silently(mock_side_services):
+    """
+    find_text (services/ocr-service, tier lecture — voir approval_policy.py)
+    doit s'exécuter sans jamais passer par require_approval, comme
+    screen_shot/run_command : lecture pure, aucun effet de bord.
+    """
+    import app.graph as g
+
+    route = mock_side_services.post("http://fake-vllm/v1/chat/completions")
+    route.side_effect = [
+        _sse_response(tool_call_response("find_text", "call_1", '{"query": "Fichier"}')),
+        _sse_response(text_response(["Trouvé", "."])),
+    ]
+    mcp_route = mock_side_services.post("http://fake-mcp-client/call").mock(
+        return_value=httpx.Response(200, json={"content": [{"type": "text", "text": "[]"}]})
+    )
+    g.agent_graph = g.build_graph()
+
+    state = {"messages": [{"role": "user", "content": "Où est le menu Fichier ?"}], "tool_iterations": 0, "approved": None}
+    result = await g.agent_graph.ainvoke(state, CONFIG)
+
+    snapshot = await g.agent_graph.aget_state(CONFIG)
+    assert snapshot.next == ()  # pas de pause : aucun passage par require_approval
+    assert mcp_route.call_count == 1
+    assert result["messages"][-1].content == "Trouvé."
+
+
+@pytest.mark.asyncio
 async def test_unknown_tool_requires_approval(mock_side_services):
     """Défaut = le tier le plus restrictif : un outil jamais classé nulle part reste sensible."""
     import app.graph as g
