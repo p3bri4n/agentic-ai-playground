@@ -53,6 +53,17 @@ services/
   llama-server/        build du fork llama.cpp servant le modèle (voir
                        section Backend d'inférence) — pas de code Python ici,
                        Dockerfile + entrypoint.sh de vérification du modèle
+  ocr-service/         OCR d'appoint pour le grounding du VLM (PaddleOCR CPU,
+                       find_text/read_screen), serveur MCP HTTP persistant
+                       comme ghostdesk (voir section OCR d'appoint)
+    app/
+    tests/
+  dashboard/           Cockpit d'observabilité local : page unique + API
+                       d'agrégation best-effort (llama-server, langgraph-agent,
+                       nvidia-smi) — voir section Observabilité
+    app/
+      static/          page HTML/JS vanille servie telle quelle (pas de build)
+    tests/
 skills/     à remplir (un sous-dossier par skill, avec un SKILL.md)
 workspace/  partagé avec les serveurs MCP filesystem/git/terminal, ainsi
             qu'avec langgraph-agent pour le journal d'audit (.audit/, voir
@@ -72,7 +83,7 @@ type de cache KV `turbo3` (compression propriétaire à ce fork).
 
 Le build, le démarrage ET l'inférence ont été exécutés réellement (GPU +
 accès réseau disponibles), modèle cible chargé (`Qwen3.6-35B-A3B` quant
-`UD-Q4_K_XL` + `mmproj-F16`, réparti sur les deux GPU via `--tensor-split`)
+`Q5_K_M` + `mmproj-F16`, réparti sur les deux GPU via `--tensor-split`)
 et une conversation complète menée de bout en bout à travers toute la
 stack (`langgraph-agent` → `llama-server`, streaming SSE, balises
 `<think>` correctement ouvertes/fermées, réponse finale correcte) — cinq
@@ -142,6 +153,112 @@ tâche (aucun tool_calls précédent à évaluer) ni dès qu'un outil sensible
 était en jeu dans ce tour précédent : le raisonnement complet y garde toute
 sa valeur.
 
+## OCR d'appoint (`services/ocr-service`)
+
+**Pourquoi** : le VLM servi par défaut (Qwen3.6 MoE) raisonne bien mais
+localise mal — son grounding visuel (viser le bon pixel d'un élément à
+l'écran) reste imprécis, sans OCR ni détection d'éléments UI dédiée (voir
+Limites connues assumées plus bas). `ocr-service` compense en donnant à
+l'agent des coordonnées de texte EXACTES via deux tools MCP : `find_text
+(query, fuzzy=true)` (correspondances triées par confiance, liste vide si
+aucune — jamais d'erreur) et `read_screen()` (tout le texte détecté,
+plafonné à 80 éléments). Consigne de grounding injectée au system prompt de
+langgraph-agent (`GROUNDING_DIRECTIVE`, `app/graph.py`) : privilégier
+`find_text` à l'estimation visuelle pour cliquer sur du texte, réserver
+cette dernière aux éléments sans texte (icônes).
+
+Serveur MCP HTTP persistant (Streamable HTTP, bearer `OCR_AUTH_TOKEN`), sur
+le même modèle que `desktop`/GhostDesk côté `mcp-client` — pas un conteneur
+spawné à la demande. `find_text`/`read_screen` sont tier lecture
+(`approval_policy.py`) : lecture pure, aucun effet de bord, auto-approuvés
+et silencieux.
+
+**Capture** : `ocr-service` se connecte lui-même en Streamable HTTP à
+GhostDesk (réseau interne `agent-net`, bearer `GHOSTDESK_AUTH_TOKEN`,
+`format="png"` explicite — aucune dépendance au décodage WebP natif de
+llama-server, non pertinent ici) pour appeler `screen_shot` à chaque
+`find_text`/`read_screen`. Aucune image ne transite par `mcp-client` ni par
+le LLM pour ce flux, entièrement interne à `ocr-service`.
+
+**Mapping de coordonnées — source classique de clics décalés** : PaddleOCR
+travaille en pixels réels de la capture, alors que `mouse_click` côté
+GhostDesk attend le repère normalisé 0-1000 (même repère que
+`GHOSTDESK_MODEL_SPACE` côté `mcp-client`, voir Supervision humaine plus
+bas). `ocr-service` convertit donc systématiquement ses coordonnées avant de
+répondre (`x_norm = round(x_px * 1000 / largeur_image)`, voir
+`app/coords.py`) — sans cette conversion, les coordonnées renvoyées par
+`find_text` seraient en pixels alors que le modèle (et GhostDesk) les
+interprètent en 0-1000, garantissant des clics à côté de leur cible.
+`OCR_COORD_SPACE` (défaut `"1000"`) désactive cette conversion (`"pixels"`)
+si l'appelant travaille lui-même en pixels.
+
+**PaddleOCR en CPU uniquement** : les deux GPU sont déjà saturés par
+llama-server (voir Backend d'inférence). Langue `fr` (configurable via
+`OCR_LANGS`) : PaddleOCR regroupe le français et l'anglais sous un seul
+modèle de reconnaissance (alphabet latin partagé), inutile de faire tourner
+deux passes OCR séparées pour ce projet. Modèles téléchargés **au build** de
+l'image Docker (`ARG OCR_LANGS`, voir `services/ocr-service/Dockerfile`),
+jamais au premier appel — évite un accès réseau et plusieurs secondes de
+latence en production.
+
+Hors périmètre explicite (itération future) : détection d'icônes/éléments UI
+sans texte (type OmniParser), annotation Set-of-Marks des screenshots, OCR
+GPU, cache des résultats entre appels.
+
+## Observabilité (`services/dashboard`)
+
+Cockpit web local en une page (http://localhost:8090 par défaut,
+`DASHBOARD_PORT`) : métriques d'inférence llama-server (débit decode/prefill
+en tok/s, contexte occupé par slot), composition détaillée du contexte
+construit par langgraph-agent (system prompt, skills, schéma d'outils,
+historique, images — voir `POST /context` plus bas) et VRAM des GPU.
+
+**Architecture** : `GET /api/snapshot` agrège en parallèle, chaque source en
+best-effort (une source en panne renvoie sa section à `null`, jamais une 500
+globale, statut 200 systématique — le dashboard poll ce endpoint toutes les
+2s) : `llama-server` (`/metrics`, format Prometheus parsé par un parser
+minimal maison, `app/prometheus.py` ; `/slots`), `langgraph-agent`
+(`/threads/recent` puis `POST /context` pour le thread résolu) et
+`nvidia-smi` en subprocess (VRAM, `app/gpu.py`). La page (`GET /`, HTML/JS
+vanille, aucune dépendance externe) ne parle jamais directement à
+llama-server/langgraph-agent : seuls Open WebUI et le dashboard ont un port
+publié sur l'hôte, tout le reste n'est joignable que via le réseau interne
+`agent-net` — d'où l'agrégation côté backend du dashboard plutôt que des
+appels depuis le navigateur.
+
+**`POST /context` (langgraph-agent, `app/graph.py:describe_context`)** :
+décompose le contexte persisté d'un thread en blocs approximatifs
+(`system`/`skills`/`tools_schema`/`history_text`/`images`/`pending`), chacun
+avec un compte de tokens estimé (`estimate_tokens`, ~3.5 caractères/token —
+pas un tokenizer exact, volontairement hors périmètre, voir plus bas) et un
+forfait fixe par image (`IMAGE_TOKEN_ESTIMATE`, défaut `1500`, un compte
+exact dépendrait du tokenizer visuel du modèle servi). Le schéma d'outils est
+mesuré depuis le cache déjà rempli par `_get_bound_llm` (jamais recalculé :
+`/context` reste strictement lecture seule, comme `/pending`). Thread inconnu
+du checkpointer -> 200 avec des blocs vides plutôt qu'une 404, pour ne pas
+transformer le polling continu du dashboard en bruit d'erreurs côté client.
+
+**Sélection de thread (`GET /threads/recent`)** : langgraph-agent n'a jamais
+d'identifiant de conversation stable côté Open WebUI (voir plus bas,
+`_derive_thread_id`) ; un registre en mémoire process, jamais persisté
+(cohérent avec le checkpointer `MemorySaver` lui-même en mémoire), retient
+les 5 threads vus le plus récemment (alimenté par `/v1/chat/completions` et
+`/approve`, jamais par les endpoints purement lecture seule `/pending` ou
+`/context` eux-mêmes). La page sélectionne le plus récent par défaut, avec un
+menu déroulant pour en choisir un autre.
+
+**VRAM (`ENABLE_GPU_STATS`, défaut `false`)** : `nvidia-smi --query-gpu=...
+--format=csv,noheader,nounits` en subprocess, désactivé par défaut — nécessite
+le runtime nvidia (bloc `deploy` commenté dans `docker-compose.yml`, à
+décommenter avec cette variable) pour que le binaire `nvidia-smi` soit
+présent dans le conteneur `python:3.12-slim` du dashboard, qui n'a sinon
+aucun besoin d'accès GPU.
+
+Hors périmètre explicite (voir demande initiale) : Prometheus/Grafana,
+Langfuse, persistance des métriques (tout est en mémoire, perdu au
+redémarrage), alerting, auth (réseau local), WebSocket/SSE (le polling 2s
+suffit), télémétrie de tâches (taux de succès), tokenizer exact.
+
 ## Tests
 
 Chaque service a sa propre suite pytest, isolée des autres (aucune dépendance
@@ -188,9 +305,11 @@ Résumé des suites, à date de la dernière vérification :
 |---|---|---|
 | `skill-manager` | 5 | chargement des skills, matching mot-clé, endpoints HTTP |
 | `context-manager` | 4 | ingestion/retrieval Qdrant, mémoire par utilisateur, collection vide |
-| `mcp-client` | 9 | registre d'outils, schéma function-calling (description/inputSchema) exposé pour le LLM, appel réel via stdio, erreur 404 sur outil inconnu, appel réel via Streamable HTTP (serveur "desktop"/GhostDesk) avec vérification du bearer token et de l'en-tête `GhostDesk-Model-Space` (présent avec la valeur configurée ET absent quand `GHOSTDESK_MODEL_SPACE=""`) |
+| `mcp-client` | 11 | registre d'outils, schéma function-calling (description/inputSchema) exposé pour le LLM, appel réel via stdio, erreur 404 sur outil inconnu, appel réel via Streamable HTTP (serveur "desktop"/GhostDesk) avec vérification du bearer token et de l'en-tête `GhostDesk-Model-Space` (présent avec la valeur configurée ET absent quand `GHOSTDESK_MODEL_SPACE=""`), serveur "ocr" (services/ocr-service) enregistré/appelable via Streamable HTTP et bearer invalide rejeté |
 | `mcp-terminal` | 6 | liste blanche de commandes, lecture de fichier (y compris nom avec espace), blocage du path traversal |
-| `langgraph-agent` | 90 (+1 test d'intégration live, ignoré par défaut) | boucle d'appel d'outil, non-duplication des messages, endpoint streaming et non-streaming, pause/reprise d'approbation humaine (approuvé, refusé, streaming inclus), non-duplication de l'historique sur plusieurs tours de conversation, repli du raisonnement en balises `<think>` (champ `reasoning` Ollama OU `reasoning_content` llama-server), **récupération de réponse vide** (`test_empty_answer_recovery.py` : extraction d'un tool_call `<tool_call><function=...>` piégé en prose et reconstruction en tool_calls structuré, tour normalement soumis à approbation après récupération si l'outil est sensible, retry automatique jusqu'à `MAX_EMPTY_ANSWER_RETRIES` puis succès, reset de l'état `<think>` au retry, abandon propre une fois le budget épuisé, flux normal inchangé) + **notice de réponse vide** (`test_non_streaming_endpoint_reports_empty_answer_notice`/`test_streaming_endpoint_reports_empty_answer_notice` : dernier filet si les deux mitigations précédentes échouent), liaison du schéma d'outils mcp-client au LLM (bind_tools), repli des résultats d'outil image en message multimodal, **rétention d'images et thinking adaptatif** (`test_image_retention_and_thinking.py` : ne garde que les `MAX_IMAGES_IN_CONTEXT` dernières captures dans la requête envoyée au LLM sans jamais toucher au checkpointer, passthrough WebP vs conversion PNG par défaut selon `IMAGE_FORMAT_PASSTHROUGH`, injection `/no_think` après un tour entièrement auto-approuvé si `ADAPTIVE_THINKING` est actif, absence d'injection sur le premier tour ou après un outil sensible), **politique d'approbation par tiers de réversibilité** (`approval_policy.py` : tiers lecture/réversible/sensible par défaut, override `TIER_READ_TOOLS`/`TIER_REVERSIBLE_TOOLS`/`AUTO_APPROVED_TOOLS` rétrocompatible, outil inconnu toujours sensible, tour 100% tiers auto-approuvés vs tour mixte), **règles sur arguments** (`test_approval_rules.py` : `key_type` court/mono-ligne auto-approuvé vs long ou multi-lignes soumis à approbation (au niveau unitaire ET routage réel dans le graphe), règle absente retombe sur le tier statique, ambiguïté entre règles résolue par le plus restrictif, une règle peut durcir un tier autant que l'assouplir, grant de session appliqué après résolution de règle, chargement `APPROVAL_RULES_PATH`/YAML), **grants de session** (`test_session_grants.py` : premier appel toujours soumis à approbation même avec intention de grant, "approuver pour la session" auto-approuve les appels suivants du même outil, portée strictement par outil, grants perdus après reconstruction simulée du checkpointer, champ `grant_session` de `POST /approve`), **journal d'audit** (`test_audit_log.py` : tool_call tiers réversible auto-approuvé tracé, tiers lecture jamais tracé, seul l'appel auto-approuvé via un grant de session apparaît — pas le premier passé par approbation humaine, filtrage `GET /audit?thread_id=`), endpoints `/pending` et `/approve` pour une approbation par bouton d'UI, fermeture de la balise `<think>` restée ouverte en streaming avant le texte d'approbation, fusion d'un seul bloc `<think>` continu sur plusieurs itérations de la boucle d'outils auto-approuvés, notice explicite quand MAX_TOOL_ITERATIONS coupe un run avec un tool_call encore en attente, garde-fou `AUTO_APPROVAL_STREAK_LIMIT` forçant un passage humain après N tours auto-approuvés consécutifs (avec réarmement du compteur après approbation). `tests_integration/` (séparé, non mocké, opt-in via `RUN_LIVE_LLM_TESTS=1`) : non-régression de la dérive du LLM réel sur "va sur google.fr" (longueur de réponse, répétition de trigrammes), vérifiée aussi bien en échouant sur l'ancien Modelfile trop agressif qu'en passant sur le Modelfile corrigé |
+| `ocr-service` | 14 | matching `find_text` exact/fuzzy/désactivé/sans résultat (insensible à la casse, distance de Levenshtein légère mot par mot en secours), conversion de coordonnées pixels -> repère normalisé 0-1000 sur une image 1280x1024 connue (`OCR_COORD_SPACE`) et désactivation (`coord_space="pixels"`), `find_text`/`read_screen` de bout en bout contre un faux serveur MCP GhostDesk réel (Streamable HTTP, image PNG de taille connue), plafond de `read_screen` à 80 éléments triés par confiance, `OCR_ENGINE=fake` (aucune dépendance à PaddleOCR dans les tests) |
+| `dashboard` | 16 | parser Prometheus minimal maison sur un payload `/metrics` figé réaliste (commentaires `# HELP`/`# TYPE` ignorés, lignes illisibles tolérées), normalisation des slots `/slots` (clé `used_tokens` : premier champ connu présent parmi plusieurs noms possibles selon la version), parsing CSV `nvidia-smi` (lignes malformées ignorées), `GET /api/snapshot` : agrégation des 3 sources quand tout va bien, llama-server injoignable -> section `null` + statut 200 (jamais 500), langgraph-agent injoignable -> `context` à `null`, `thread_id` explicite en query prioritaire sur le plus récent, VRAM activée (`ENABLE_GPU_STATS`, nvidia-smi mocké) vs désactivée par défaut (nvidia-smi jamais appelé, pas d'erreur), `GET /` renvoie 200 en HTML (page non testée en détail, statique) |
+| `langgraph-agent` | 96 (+1 test d'intégration live, ignoré par défaut) | `POST /context` (décomposition du contexte en blocs system/skills/tools_schema/history_text/images sur un historique texte+image réel, schéma d'outils mesuré depuis le cache `_get_bound_llm` jamais recalculé, thread inconnu -> blocs vides plutôt qu'une 404) et `GET /threads/recent` (registre en mémoire alimenté par `/v1/chat/completions`/`/approve`, ordonné par récence, plafonné à 5 — voir section Observabilité), boucle d'appel d'outil, non-duplication des messages, endpoint streaming et non-streaming, pause/reprise d'approbation humaine (approuvé, refusé, streaming inclus), non-duplication de l'historique sur plusieurs tours de conversation, repli du raisonnement en balises `<think>` (champ `reasoning` Ollama OU `reasoning_content` llama-server), **récupération de réponse vide** (`test_empty_answer_recovery.py` : extraction d'un tool_call `<tool_call><function=...>` piégé en prose et reconstruction en tool_calls structuré, tour normalement soumis à approbation après récupération si l'outil est sensible, retry automatique jusqu'à `MAX_EMPTY_ANSWER_RETRIES` puis succès, reset de l'état `<think>` au retry, abandon propre une fois le budget épuisé, flux normal inchangé) + **notice de réponse vide** (`test_non_streaming_endpoint_reports_empty_answer_notice`/`test_streaming_endpoint_reports_empty_answer_notice` : dernier filet si les deux mitigations précédentes échouent), liaison du schéma d'outils mcp-client au LLM (bind_tools), repli des résultats d'outil image en message multimodal, **rétention d'images et thinking adaptatif** (`test_image_retention_and_thinking.py` : ne garde que les `MAX_IMAGES_IN_CONTEXT` dernières captures dans la requête envoyée au LLM sans jamais toucher au checkpointer, passthrough WebP vs conversion PNG par défaut selon `IMAGE_FORMAT_PASSTHROUGH`, injection `/no_think` après un tour entièrement auto-approuvé si `ADAPTIVE_THINKING` est actif, absence d'injection sur le premier tour ou après un outil sensible), **politique d'approbation par tiers de réversibilité** (`approval_policy.py` : tiers lecture/réversible/sensible par défaut, override `TIER_READ_TOOLS`/`TIER_REVERSIBLE_TOOLS`/`AUTO_APPROVED_TOOLS` rétrocompatible, outil inconnu toujours sensible, tour 100% tiers auto-approuvés vs tour mixte, `find_text`/`read_screen` en tier lecture — voir OCR d'appoint plus bas, aussi bien au niveau unitaire que routage réel dans le graphe via `test_find_text_skips_approval_silently`), **règles sur arguments** (`test_approval_rules.py` : `key_type` court/mono-ligne auto-approuvé vs long ou multi-lignes soumis à approbation (au niveau unitaire ET routage réel dans le graphe), règle absente retombe sur le tier statique, ambiguïté entre règles résolue par le plus restrictif, une règle peut durcir un tier autant que l'assouplir, grant de session appliqué après résolution de règle, chargement `APPROVAL_RULES_PATH`/YAML), **grants de session** (`test_session_grants.py` : premier appel toujours soumis à approbation même avec intention de grant, "approuver pour la session" auto-approuve les appels suivants du même outil, portée strictement par outil, grants perdus après reconstruction simulée du checkpointer, champ `grant_session` de `POST /approve`), **journal d'audit** (`test_audit_log.py` : tool_call tiers réversible auto-approuvé tracé, tiers lecture jamais tracé, seul l'appel auto-approuvé via un grant de session apparaît — pas le premier passé par approbation humaine, filtrage `GET /audit?thread_id=`), endpoints `/pending` et `/approve` pour une approbation par bouton d'UI, fermeture de la balise `<think>` restée ouverte en streaming avant le texte d'approbation, fusion d'un seul bloc `<think>` continu sur plusieurs itérations de la boucle d'outils auto-approuvés, notice explicite quand MAX_TOOL_ITERATIONS coupe un run avec un tool_call encore en attente, garde-fou `AUTO_APPROVAL_STREAK_LIMIT` forçant un passage humain après N tours auto-approuvés consécutifs (avec réarmement du compteur après approbation). `tests_integration/` (séparé, non mocké, opt-in via `RUN_LIVE_LLM_TESTS=1`) : non-régression de la dérive du LLM réel sur "va sur google.fr" (longueur de réponse, répétition de trigrammes), vérifiée aussi bien en échouant sur l'ancien Modelfile trop agressif qu'en passant sur le Modelfile corrigé |
 
 ## Bugs trouvés et corrigés pendant le développement
 
@@ -222,6 +341,8 @@ Cette démarche a permis de trouver et corriger les bugs suivants :
 | `llama-server` | conteneur en boucle de redémarrage au premier lancement réel : `--flash-attn` (passé sans valeur dans `entrypoint.sh`, comme un simple flag booléen) avalait l'argument suivant (`--jinja`) comme sa propre valeur — `error: unknown value for --flash-attn: '--jinja'`. Ce fork a changé `-fa`/`--flash-attn` d'un flag booléen vers une option à valeur obligatoire (`on`/`off`/`auto`), confirmé via `llama-server --help` | `--flash-attn on` explicite dans `entrypoint.sh` — revérifié en relançant le conteneur, plus de boucle de redémarrage, modèle chargé jusqu'au bout |
 | `langgraph-agent` | avec llama-server (fork turboquant-webp) comme backend, le raisonnement du modèle disparaissait silencieusement du flux streamé (aucune erreur, juste absent) — le patch `_convert_delta_with_reasoning` (`app/graph.py`) ne lisait que le champ `reasoning` (convention Ollama, sur laquelle il avait été écrit et testé), alors que llama-server streame le raisonnement dans un champ `reasoning_content` (convention DeepSeek-R1/OpenAI o1). Confirmé en inspectant les deltas SSE bruts d'un vrai appel streamé contre le vrai binaire : jamais de clé `reasoning`, toujours `reasoning_content` | le patch lit désormais `reasoning` OU `reasoning_content` (`_dict.get("reasoning") or _dict.get("reasoning_content")`) — revérifié de bout en bout via `langgraph-agent` réel : `<think>` s'ouvre, le raisonnement s'affiche, `</think>` se ferme avant la réponse finale, comme avec Ollama |
 | `langgraph-agent` | observé en usage réel (conversation "va sur wikipedia.org et cherche l'article sur la ville de toulouse, en français", pilotage GhostDesk) : le modèle finissait parfois un tour SANS aucun `tool_calls` structuré ET sans texte de réponse visible — sa tentative d'appel d'outil restait écrite en prose façon Qwen (`<tool_call><function=NOM><parameter=...>`) noyée dans le raisonnement (`reasoning_content`), jamais reconnue comme un vrai tool_calls OpenAI. **Cause racine confirmée** en lisant le parseur du fork (`common/chat-auto-parser-generator.cpp`) : le raisonnement (`<think>...`) est capturé comme texte LIBRE, non contraint par la grammaire, jusqu'à rencontrer `</think>` — la grammaire stricte du tool-calling n'est appliquée qu'APRÈS cette balise. Si le modèle "tente" un appel avant d'avoir fermé `</think>` (observé après un raisonnement anormalement long/répétitif, à rapprocher de la dérive sémantique déjà documentée pour Ollama), la tentative reste piégée dans la zone non contrainte. Confirmé non-déterministe (rejouer le même prompt donne tantôt un `tool_calls` correct, tantôt cet échec) et confirmé résolu par `/no_think` (contourne entièrement ce chemin de code, voir Thinking adaptatif) — mais celui-ci ne s'injecte qu'à partir du tour suivant un tour auto-approuvé, pas sur le tout premier tour d'une tâche, là où le bug a justement été observé la première fois. Sans correctif, l'utilisateur ne voyait que la bulle de raisonnement se refermer sur rien, exactement le symptôme "l'agent s'arrête en plein milieu d'une tâche" déjà documenté pour `MAX_TOOL_ITERATIONS` | Trois mitigations complémentaires (aucune ne corrige la cause côté serveur/modèle, hors de portée ici) : **(1)** `_extract_fallback_tool_call` (`app/graph.py`) reconnaît la syntaxe `<tool_call><function=...>` piégée dans le texte et la reconstruit en tool_calls structuré avant même de compter le tour comme un échec (log `WARNING` à chaque récupération, pour garder la visibilité sur la fréquence réelle du problème) ; **(2)** `retry_empty_answer` reboucle automatiquement sur `call_llm` jusqu'à `MAX_EMPTY_ANSWER_RETRIES` fois (défaut `1`, budget cumulé pour toute la tâche comme `tool_iterations`) quand la reconstruction échoue aussi ; **(3)** au-delà, `has_visible_answer`/`_format_empty_answer_notice` (`app/main.py`) affiche une notice explicite plutôt qu'un message vide. **Confirmé efficace en conditions réelles** : sur 4 tâches indépendantes rejouées après déploiement du correctif, le parseur de secours s'est déclenché 5 fois (`app_launch`, `app_running` ×2, `screen_shot`) et a récupéré l'intention du modèle à chaque fois, sans qu'aucune des 4 tâches n'affiche la notice de repli |
+
+| `ocr-service` | build de l'image réellement exécuté (jusque-là seule la suite de tests, en `OCR_ENGINE=fake`, avait tourné) : trois échecs successifs. **(1)** `libgomp.so.1` introuvable — absent de `python:3.12-slim`, requis dès l'import de paddlepaddle (même classe de bug que `llama-server` ci-dessus). **(2)** une fois corrigé, `ModuleNotFoundError: No module named 'setuptools'` — `paddle.utils.cpp_extension` l'importe inconditionnellement dès `import paddle`, absent par défaut de cette image (seul `pip` y est préinstallé). **(3)** une fois les deux corrigés, crash restant (`Segmentation fault`, puis `double free or corruption`/`munmap_chunk(): invalid pointer` selon le run — symptôme différent à chaque fois selon l'ASLR, signature classique d'une corruption de tas plutôt que d'une dépendance manquante). **Cause racine confirmée par backtrace `gdb`** : `paddlepaddle==2.6.2` embarque sa propre copie de `zlib` dans `libpaddle.so`, avec des symboles globaux non isolés (`inflateReset2`) qui entrent en collision avec `libz.so.1` système dès que `Cython` (importé en cascade par `paddle.utils.cpp_extension`) décompresse quoi que ce soit via le module `zlib` de la stdlib | `libgomp1`/`libgl1`/`libglib2.0-0` (ce dernier duo requis par `cv2`, dépendance transitive de paddleocr) ajoutés au `Dockerfile` ; `setuptools==75.6.0` épinglé dans `requirements.txt` ; `ENV LD_PRELOAD=/lib/x86_64-linux-gnu/libz.so.1` force la résolution vers la bonne bibliothèque, au build ET à l'exécution (import paresseux dans `app/ocr_engine.py`) — revérifié en buildant l'image pour de vrai (téléchargement des modèles PP-OCRv3 au build) puis en déclenchant un vrai appel `read_screen` via `mcp-client` contre GhostDesk : texte réel détecté à l'écran avec coordonnées et scores de confiance |
 
 Une fausse alerte a aussi été rencontrée puis écartée : un test utilisait un
 monkeypatch global de `httpx.AsyncClient` pour simuler les appels HTTP vers
@@ -485,7 +606,7 @@ documentée plus haut pour le streaming n'a donc pas été touchée.
   serveur MCP lancé en process Python direct (même protocole que les vrais
   serveurs), mais pas avec le socket Docker ni les images `mcp/*` réelles.
 - **`llama-server` : build, démarrage et inférence texte vérifiés
-  réellement** (modèle `Qwen3.6-35B-A3B` quant `UD-Q4_K_XL` + `mmproj-F16`,
+  réellement** (modèle `Qwen3.6-35B-A3B` quant `Q5_K_M` + `mmproj-F16`,
   conversation complète de bout en bout à travers `langgraph-agent`, voir
   section Backend d'inférence et tableau des bugs). **Non vérifié : function
   calling réel avec un tool_call effectif** (les tests d'intégration
@@ -522,9 +643,14 @@ documentée plus haut pour le streaming n'a donc pas été touchée.
   défaut est désormais `llama-server` (voir section Backend d'inférence),
   servant Qwen3.6-35B-A3B avec un projecteur multimodal (`--mmproj`) —
   l'agent peut donc désormais recevoir et interpréter les captures d'écran
-  GhostDesk. Reste néanmoins une limite distincte, non résolue : la
-  précision du grounding (viser le bon élément à l'écran) d'un modèle de
-  vision généraliste sans OCR/détection d'éléments UI dédiée.
+  GhostDesk. Reste néanmoins une limite distincte, désormais atténuée mais
+  pas résolue : la précision du grounding (viser le bon élément à l'écran)
+  d'un modèle de vision généraliste. `ocr-service` (voir section OCR
+  d'appoint plus haut) compense pour les éléments TEXTUELS via
+  `find_text`/`read_screen` (coordonnées OCR exactes plutôt qu'une
+  estimation visuelle) ; les éléments sans texte (icônes) restent estimés
+  visuellement par le VLM, sans détection d'éléments UI dédiée (type
+  OmniParser, explicitement hors périmètre pour l'instant).
 - **`ghostdesk` est un serveur MCP HTTP persistant avec état** (bureau/session
   VNC), contrairement aux autres serveurs MCP du projet qui sont spawnés en
   STDIO éphémère par `mcp-client` (`docker run -i --rm` par appel). Il tourne

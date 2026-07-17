@@ -88,6 +88,17 @@ SERVERS = {
         # plutôt qu'une valeur figée, à vider si le modèle servi change.
         "model_space": os.environ.get("GHOSTDESK_MODEL_SPACE", "1000"),
     },
+    "ocr": {
+        # Comme "desktop" ci-dessus : serveur HTTP persistant (ocr-service),
+        # pas un conteneur spawné à la demande. Pas de header
+        # GhostDesk-Model-Space ici : ocr-service convertit déjà lui-même ses
+        # coordonnées vers le repère 0-1000 avant de répondre (OCR_COORD_SPACE,
+        # voir services/ocr-service/app/coords.py), ce header n'a de sens que
+        # pour les appels adressés directement à GhostDesk.
+        "transport": "http",
+        "url": os.environ.get("MCP_OCR_URL", "http://ocr-service:8004/mcp"),
+        "token": os.environ.get("OCR_AUTH_TOKEN", ""),
+    },
 }
 
 app = FastAPI(title="MCP Client")

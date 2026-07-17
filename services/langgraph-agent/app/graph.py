@@ -34,6 +34,7 @@ import base64
 import contextvars
 import io
 import logging
+import math
 import os
 import json
 import re
@@ -167,6 +168,21 @@ IMAGE_RETENTION_PLACEHOLDER = "[screenshot antérieure supprimée]"
 ADAPTIVE_THINKING = os.environ.get("ADAPTIVE_THINKING", "false").lower() == "true"
 NO_THINK_DIRECTIVE = "/no_think"
 
+# Le VLM servi (Qwen3.6 MoE) raisonne bien mais localise mal : son grounding
+# visuel (viser le bon pixel d'un élément à l'écran) reste imprécis, sans
+# OCR/détection d'éléments UI dédiée (voir README, Limites connues assumées).
+# find_text/read_screen (services/ocr-service, tier lecture — voir
+# approval_policy.py) compensent avec des coordonnées OCR exactes. Consigne
+# transitoire (jamais persistée dans l'état du graphe, même principe que
+# NO_THINK_DIRECTIVE ci-dessus) plutôt qu'une modification du prompt système
+# par tour : reste valable identiquement sur toute la conversation.
+GROUNDING_DIRECTIVE = (
+    "Pour cliquer sur un élément contenant du texte, appelle d'abord "
+    "find_text pour obtenir ses coordonnées exactes plutôt que d'estimer "
+    "visuellement leur position — réserve l'estimation visuelle aux "
+    "éléments sans texte (icônes)."
+)
+
 # Filet de sécurité (bug réel observé en usage réel avec llama-server —
 # fork turboquant-webp — sur la tâche "va sur wikipedia.org et cherche
 # l'article sur la ville de toulouse", voir README, tableau des bugs) : un
@@ -206,6 +222,27 @@ NO_THINK_DIRECTIVE = "/no_think"
 # (_format_empty_answer_notice) plutôt que de laisser la conversation
 # silencieuse.
 MAX_EMPTY_ANSWER_RETRIES = int(os.environ.get("MAX_EMPTY_ANSWER_RETRIES", "1"))
+
+# Forfait de tokens par image dans l'estimation de composition du contexte
+# (voir describe_context/POST /context, services/dashboard) : un compte exact
+# dépendrait du tokenizer visuel du modèle servi (hors de portée ici, voir
+# README, Hors périmètre) — une constante suffit pour un ordre de grandeur
+# affiché sur le dashboard d'observabilité.
+IMAGE_TOKEN_ESTIMATE = int(os.environ.get("IMAGE_TOKEN_ESTIMATE", "1500"))
+
+
+def estimate_tokens(text: str) -> int:
+    """
+    Estimation grossière (~3.5 caractères/token, ordre de grandeur pour
+    l'anglais/français mélangés), pas un tokenizer exact — utilisée
+    uniquement par POST /context pour le dashboard d'observabilité
+    (services/dashboard), qui affiche des tendances plutôt que des comptes
+    exacts (voir README, Hors périmètre : tokenizer exact explicitement
+    écarté).
+    """
+    if not text:
+        return 0
+    return math.ceil(len(text) / 3.5)
 
 # Reconnaît un appel d'outil écrit en prose au format XML-ish de Qwen
 # (<tool_call><function=NOM><parameter=CLE>VALEUR</parameter>...</function>
@@ -389,6 +426,104 @@ def _is_image_message(message) -> bool:
     )
 
 
+_CONTEXT_BLOCK_SKELETON = (
+    ("System prompt", "system"),
+    ("Skills", "skills"),
+    ("Schéma d'outils", "tools_schema"),
+    ("Historique (texte)", "history_text"),
+    ("Images", "images"),
+)
+
+
+def describe_context(messages: list, pending_text: Optional[str] = None) -> list[dict]:
+    """
+    Décomposition approximative (voir estimate_tokens) du contexte tel qu'il
+    serait construit pour un appel LLM (voir call_llm), à l'usage de POST
+    /context (app/main.py) et donc du dashboard d'observabilité
+    (services/dashboard) — jamais un vrai appel au LLM, et le schéma d'outils
+    est lu tel quel depuis _tools_schema_cache (jamais recalculé via
+    _get_bound_llm, qui ferait un appel HTTP à mcp-client : /context doit
+    rester strictement lecture seule, sans effet de bord, comme /pending).
+
+    `messages` vide (thread inconnu du checkpointer) -> tous les blocs à
+    zéro plutôt que d'inclure quand même le system prompt transitoire
+    (GROUNDING_DIRECTIVE) : rien n'a encore été composé pour ce thread.
+    """
+    if not messages:
+        return [
+            {"label": label, "kind": kind, "est_tokens": 0, "count": 0}
+            for label, kind in _CONTEXT_BLOCK_SKELETON
+        ]
+
+    system_parts = [GROUNDING_DIRECTIVE]
+    skills_parts = []
+    history_parts = []
+    image_count = 0
+
+    for message in messages:
+        content = message.content
+        if getattr(message, "type", None) == "system":
+            text = content if isinstance(content, str) else json.dumps(content, ensure_ascii=False)
+            if text.startswith("Skill activée :"):
+                skills_parts.append(text)
+            else:
+                system_parts.append(text)
+        elif _is_image_message(message):
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                if block.get("type") == "image_url":
+                    image_count += 1
+                elif block.get("type") == "text":
+                    history_parts.append(block.get("text", ""))
+        else:
+            text = content if isinstance(content, str) else json.dumps(content, ensure_ascii=False)
+            history_parts.append(text)
+
+    blocks = [
+        {
+            "label": "System prompt",
+            "kind": "system",
+            "est_tokens": estimate_tokens("\n".join(system_parts)),
+            "count": len(system_parts),
+        },
+        {
+            "label": "Skills",
+            "kind": "skills",
+            "est_tokens": estimate_tokens("\n".join(skills_parts)),
+            "count": len(skills_parts),
+        },
+        {
+            "label": "Schéma d'outils",
+            "kind": "tools_schema",
+            "est_tokens": estimate_tokens(json.dumps(_tools_schema_cache or [], ensure_ascii=False)),
+            "count": len(_tools_schema_cache or []),
+        },
+        {
+            "label": "Historique (texte)",
+            "kind": "history_text",
+            "est_tokens": estimate_tokens("\n".join(history_parts)),
+            "count": len(history_parts),
+        },
+        {
+            "label": "Images",
+            "kind": "images",
+            "est_tokens": image_count * IMAGE_TOKEN_ESTIMATE,
+            "count": image_count,
+        },
+    ]
+    if pending_text:
+        blocks.append(
+            {
+                "label": "Approbation en attente",
+                "kind": "pending",
+                "est_tokens": estimate_tokens(pending_text),
+                "count": 1,
+            }
+        )
+    return blocks
+
+
 def _apply_image_retention(messages: list) -> list:
     """
     Ne garde que les MAX_IMAGES_IN_CONTEXT derniers messages image (voir
@@ -446,7 +581,8 @@ def _apply_adaptive_thinking(messages: list, session_grants) -> list:
 
 async def call_llm(state: AgentState) -> dict:
     bound_llm = await _get_bound_llm()
-    messages_for_llm = _apply_image_retention(state["messages"])
+    messages_for_llm = [SystemMessage(content=GROUNDING_DIRECTIVE)] + state["messages"]
+    messages_for_llm = _apply_image_retention(messages_for_llm)
     messages_for_llm = _apply_adaptive_thinking(messages_for_llm, state.get("session_grants") or [])
     # Repris tel quel depuis l'appel précédent au sein de ce tour (voir
     # AgentState.think_opened/think_closed) plutôt que remis à False, pour ne

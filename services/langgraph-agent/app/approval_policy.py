@@ -51,6 +51,8 @@ _DEFAULT_TIER_READ = {
     "app_status",
     "screen_shot",
     "mouse_move",
+    "find_text",  # OCR d'appoint (ocr-service) : lecture pure, aucun effet de bord
+    "read_screen",
     "clipboard_get",  # lecture au sens outil, mais reste TIER_SENSITIVE : voir override ci-dessous
     "run_command",
     "read_file",

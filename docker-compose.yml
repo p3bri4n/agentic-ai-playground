@@ -59,6 +59,11 @@ services:
       # infructueuse. Budget cumulé pour toute la tâche, comme
       # MAX_TOOL_ITERATIONS.
       - MAX_EMPTY_ANSWER_RETRIES=${MAX_EMPTY_ANSWER_RETRIES:-1}
+      # Forfait de tokens par image dans la décomposition approximative du
+      # contexte (POST /context, voir README section Observabilité) — un
+      # compte exact dépendrait du tokenizer visuel du modèle servi, hors
+      # périmètre pour un simple ordre de grandeur affiché sur le dashboard.
+      - IMAGE_TOKEN_ESTIMATE=${IMAGE_TOKEN_ESTIMATE:-1500}
     volumes:
       - ./workspace:/workspace
     depends_on:
@@ -69,6 +74,56 @@ services:
     networks:
       - agent-net
     # pas de port publié : uniquement accessible via le réseau interne
+
+  # ──────────────────────────────────────────────────────────────
+  # Dashboard : cockpit d'observabilité local (voir README, section
+  # Observabilité) — agrège en best-effort les métriques llama-server
+  # (/metrics, /slots), la composition du contexte de langgraph-agent
+  # (POST /context, GET /threads/recent) et la VRAM des GPU (nvidia-smi,
+  # ENABLE_GPU_STATS). Seul service dont le port est publié sur l'hôte, à
+  # part Open WebUI — tout le reste (llama-server, langgraph-agent...)
+  # n'est joignable que via le réseau interne agent-net, d'où l'agrégation
+  # côté backend plutôt que des appels directs depuis le navigateur.
+  # ──────────────────────────────────────────────────────────────
+  dashboard:
+    build: ./services/dashboard
+    container_name: dashboard
+    restart: unless-stopped
+    environment:
+      # Overridable (contrairement aux autres URLs internes de ce compose,
+      # toujours en dur) : si LLM_BASE_URL bascule sur ollama (voir plus
+      # bas), le dashboard perd sa source /metrics/{slots} (llama-server
+      # spécifique) sauf à pointer explicitement LLAMA_SERVER_URL ailleurs.
+      - LLAMA_SERVER_URL=${LLAMA_SERVER_URL:-http://llama-server:8000}
+      - LANGGRAPH_AGENT_URL=http://langgraph-agent:8000
+      # VRAM par GPU (nvidia-smi) : désactivé par défaut, nécessite le
+      # runtime nvidia (voir bloc "deploy" commenté plus bas, à décommenter
+      # ensemble avec cette variable).
+      - ENABLE_GPU_STATS=${ENABLE_GPU_STATS:-false}
+    ports:
+      - "${DASHBOARD_PORT:-8090}:8090"
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://localhost:8090/health', timeout=3)\" || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+    depends_on:
+      - langgraph-agent
+    networks:
+      - agent-net
+    # Décommenter avec ENABLE_GPU_STATS=true (.env) pour exposer nvidia-smi
+    # dans ce conteneur (image python:3.12-slim, sans binaire nvidia-smi tant
+    # que le runtime nvidia n'est pas déclaré ici — même mécanisme que
+    # llama-server/ollama plus bas, mais optionnel pour ce service qui n'a
+    # sinon besoin d'aucun accès GPU).
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
 
   # ──────────────────────────────────────────────────────────────
   # Skill Manager (skills/ python, fastapi, docker, clean-code)
@@ -141,12 +196,19 @@ services:
       # cible (voir .env.example) ; ${VAR:-1000} plutôt que ${VAR} pour
       # garder ce défaut même si la variable est absente du .env.
       - GHOSTDESK_MODEL_SPACE=${GHOSTDESK_MODEL_SPACE:-1000}
+      # OCR d'appoint (services/ocr-service) : serveur HTTP persistant lui
+      # aussi, comme GhostDesk (voir plus bas). Pas de header
+      # GhostDesk-Model-Space pour ce serveur : ocr-service convertit déjà
+      # ses coordonnées vers 0-1000 lui-même avant de répondre.
+      - MCP_OCR_URL=http://ocr-service:8004/mcp
+      - OCR_AUTH_TOKEN=${OCR_AUTH_TOKEN}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock   # ⚠️ équivaut à un accès root sur l'hôte,
                                                        # voir avertissement de sécurité dans le README
       - ./workspace:/workspace
     depends_on:
       - ghostdesk
+      - ocr-service
     networks:
       - agent-net
 
@@ -182,10 +244,49 @@ services:
       - ghostdesk-home:/home/agent   # persiste le bureau/apps entre redémarrages
     ports:
       - "6080:6080"   # noVNC — exposé par défaut pour observer l'agent piloter le bureau
+    healthcheck:
+      # Port MCP (3000, voir plus bas) : ocr-service en dépend (condition
+      # service_healthy) pour ne capturer qu'une fois GhostDesk réellement prêt
+      # à répondre, pas seulement démarré (depends_on seul ne garantit que
+      # l'ordre de démarrage des conteneurs, voir README tableau des bugs pour
+      # un précédent similaire avec Qdrant).
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/localhost/3000' || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
     networks:
       - agent-net
-    # Port MCP (3000) volontairement non publié sur l'hôte : seul mcp-client
-    # doit l'atteindre, via le réseau interne agent-net.
+    # Port MCP (3000) volontairement non publié sur l'hôte : seuls mcp-client
+    # et ocr-service doivent l'atteindre, via le réseau interne agent-net.
+
+  # --- OCR d'appoint : PaddleOCR CPU (find_text/read_screen) ------
+  # Grounding du VLM (Qwen3.6 MoE) : raisonne bien mais localise mal un
+  # élément à l'écran (sans OCR/détection d'éléments UI dédiée, voir README
+  # section OCR d'appoint et Limites connues assumées). Serveur MCP HTTP
+  # persistant comme GhostDesk ci-dessus (pas un conteneur spawné à la
+  # demande par mcp-client) : il se connecte lui-même à GhostDesk pour
+  # capturer l'écran, indépendamment de mcp-client/langgraph-agent.
+  ocr-service:
+    build: ./services/ocr-service
+    container_name: ocr-service
+    restart: unless-stopped
+    environment:
+      - MCP_GHOSTDESK_URL=http://ghostdesk:3000/mcp
+      - GHOSTDESK_AUTH_TOKEN=${GHOSTDESK_AUTH_TOKEN}
+      - OCR_AUTH_TOKEN=${OCR_AUTH_TOKEN}
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://localhost:8004/health', timeout=3)\" || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    depends_on:
+      ghostdesk:
+        condition: service_healthy
+    networks:
+      - agent-net
+    # pas de port publié : uniquement accessible via le réseau interne (mcp-client)
 
   # ──────────────────────────────────────────────────────────────
   # Inférence

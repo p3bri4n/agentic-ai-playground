@@ -227,3 +227,50 @@ def test_http_server_wrong_token_fails(echo_http_server):
     resp = _client().get("/tools")
     assert resp.status_code == 200
     assert resp.json()["tools"] == {}
+
+
+def test_ocr_server_schema_exposed_and_callable(echo_http_server):
+    """
+    Le serveur "ocr" (services/ocr-service, find_text/read_screen) suit le
+    même mécanisme que "desktop"/GhostDesk : connexion HTTP persistante
+    plutôt qu'un conteneur spawné à la demande. Le faux serveur echo tient
+    lieu d'ocr-service ici : ce test vérifie le câblage générique de
+    mcp-client (registre, schéma, appel), pas la logique OCR elle-même
+    (couverte par la suite de tests d'ocr-service).
+    """
+    import app.main as main_mod
+
+    main_mod.SERVERS["ocr"] = {
+        "transport": "http",
+        "url": echo_http_server["url"],
+        "token": echo_http_server["token"],
+    }
+
+    resp = _client().get("/tools")
+    assert resp.status_code == 200
+    assert resp.json()["tools"]["echo"] == "ocr"
+
+    resp = _client().get("/tools/schema")
+    assert resp.status_code == 200
+    names = [t["function"]["name"] for t in resp.json()["tools"]]
+    assert "echo" in names
+
+    resp = _client().post("/call", json={"tool": "echo", "arguments": {"message": "bonjour"}})
+    assert resp.status_code == 200
+    assert resp.json()["content"][0]["text"] == "echo: bonjour"
+
+
+def test_ocr_server_wrong_token_fails(echo_http_server):
+    import app.main as main_mod
+
+    main_mod.SERVERS = {
+        "ocr": {
+            "transport": "http",
+            "url": echo_http_server["url"],
+            "token": "mauvais-token",
+        },
+    }
+
+    resp = _client().get("/tools")
+    assert resp.status_code == 200
+    assert resp.json()["tools"] == {}
