@@ -167,6 +167,21 @@ IMAGE_RETENTION_PLACEHOLDER = "[screenshot antérieure supprimée]"
 ADAPTIVE_THINKING = os.environ.get("ADAPTIVE_THINKING", "false").lower() == "true"
 NO_THINK_DIRECTIVE = "/no_think"
 
+# Le VLM servi (Qwen3.6 MoE) raisonne bien mais localise mal : son grounding
+# visuel (viser le bon pixel d'un élément à l'écran) reste imprécis, sans
+# OCR/détection d'éléments UI dédiée (voir README, Limites connues assumées).
+# find_text/read_screen (services/ocr-service, tier lecture — voir
+# approval_policy.py) compensent avec des coordonnées OCR exactes. Consigne
+# transitoire (jamais persistée dans l'état du graphe, même principe que
+# NO_THINK_DIRECTIVE ci-dessus) plutôt qu'une modification du prompt système
+# par tour : reste valable identiquement sur toute la conversation.
+GROUNDING_DIRECTIVE = (
+    "Pour cliquer sur un élément contenant du texte, appelle d'abord "
+    "find_text pour obtenir ses coordonnées exactes plutôt que d'estimer "
+    "visuellement leur position — réserve l'estimation visuelle aux "
+    "éléments sans texte (icônes)."
+)
+
 # Filet de sécurité (bug réel observé en usage réel avec llama-server —
 # fork turboquant-webp — sur la tâche "va sur wikipedia.org et cherche
 # l'article sur la ville de toulouse", voir README, tableau des bugs) : un
@@ -446,7 +461,8 @@ def _apply_adaptive_thinking(messages: list, session_grants) -> list:
 
 async def call_llm(state: AgentState) -> dict:
     bound_llm = await _get_bound_llm()
-    messages_for_llm = _apply_image_retention(state["messages"])
+    messages_for_llm = [SystemMessage(content=GROUNDING_DIRECTIVE)] + state["messages"]
+    messages_for_llm = _apply_image_retention(messages_for_llm)
     messages_for_llm = _apply_adaptive_thinking(messages_for_llm, state.get("session_grants") or [])
     # Repris tel quel depuis l'appel précédent au sein de ce tour (voir
     # AgentState.think_opened/think_closed) plutôt que remis à False, pour ne
