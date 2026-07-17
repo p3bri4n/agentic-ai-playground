@@ -32,6 +32,21 @@ def _reset_tools_schema_cache():
 
 
 @pytest.fixture(autouse=True)
+def _reset_recent_threads():
+    """
+    app.main._recent_threads (Phase 3, registre des threads récents pour le
+    dashboard d'observabilité, voir GET /threads/recent) est un dict module-
+    level : sans reset, un test qui vérifie l'ordre/le contenu verrait
+    aussi les threads touchés par les tests précédents.
+    """
+    import app.main as main_mod
+
+    main_mod._recent_threads.clear()
+    yield
+    main_mod._recent_threads.clear()
+
+
+@pytest.fixture(autouse=True)
 def _reset_audit_log_dir():
     """
     Vide le répertoire d'audit de test avant chaque test, pour qu'un test qui

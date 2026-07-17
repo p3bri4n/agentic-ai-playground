@@ -18,6 +18,7 @@ import hashlib
 import json
 import time
 import uuid
+from datetime import datetime, timezone
 from typing import List, Optional
 
 from fastapi import FastAPI, HTTPException
@@ -25,7 +26,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from app import audit_log
-from app.graph import MAX_TOOL_ITERATIONS, agent_graph, has_visible_answer
+from app.graph import MAX_TOOL_ITERATIONS, agent_graph, describe_context, has_visible_answer
 
 app = FastAPI(title="LangGraph Agent")
 
@@ -54,6 +55,19 @@ class PendingCheckRequest(BaseModel):
     messages: List[ChatMessage]
 
 
+class ContextRequest(BaseModel):
+    """
+    POST /context (dashboard d'observabilité, services/dashboard) : accepte
+    soit `messages` (même contrat que PendingCheckRequest, thread_id dérivé
+    via _derive_thread_id), soit directement `thread_id` (Phase 3 — le
+    dashboard le récupère via GET /threads/recent plutôt que de rejouer tout
+    l'historique Open WebUI qu'il n'a de toute façon jamais eu). `thread_id`
+    prend le pas s'il est fourni."""
+
+    messages: Optional[List[ChatMessage]] = None
+    thread_id: Optional[str] = None
+
+
 class ApprovalDecisionRequest(BaseModel):
     """Décision transmise hors bande, depuis un bouton d'UI (Open WebUI Action
     function) plutôt que par un message texte "approuver"/"refuser" — voir
@@ -73,6 +87,21 @@ class ApprovalDecisionRequest(BaseModel):
 def _derive_thread_id(messages: List[ChatMessage]) -> str:
     first_human = next((m.content for m in messages if m.role == "user"), "")
     return hashlib.sha256(first_human.encode()).hexdigest()[:16]
+
+
+# Registre en mémoire process (Phase 3, jamais persisté — cohérent avec le
+# checkpointer MemorySaver lui-même en mémoire uniquement, voir README
+# section Persistance des données) des threads vus récemment, pour que le
+# dashboard d'observabilité (services/dashboard) puisse appeler POST /context
+# sans avoir à rejouer l'historique Open WebUI complet, qu'il n'a de toute
+# façon jamais reçu. Alimenté uniquement par les endpoints qui font
+# réellement progresser une conversation (_resolve_run, /approve) — pas par
+# /pending ni /context eux-mêmes, strictement lecture seule.
+_recent_threads: dict = {}
+
+
+def _touch_thread(thread_id: str) -> None:
+    _recent_threads[thread_id] = datetime.now(timezone.utc).isoformat()
 
 
 def _format_approval_request(tool_calls: list) -> str:
@@ -151,8 +180,10 @@ async def _resolve_run(request: ChatCompletionRequest):
     # Sans cet ajustement, un run auto-approuvé assez long lève un
     # GraphRecursionError brut (500) avant même d'atteindre notre propre
     # notice de limite (voir _format_iteration_limit_notice plus haut).
+    thread_id = _derive_thread_id(request.messages)
+    _touch_thread(thread_id)
     config = {
-        "configurable": {"thread_id": _derive_thread_id(request.messages)},
+        "configurable": {"thread_id": thread_id},
         "recursion_limit": MAX_TOOL_ITERATIONS * 4 + 10,
     }
     snapshot = await agent_graph.aget_state(config)
@@ -310,6 +341,49 @@ async def pending(request: PendingCheckRequest):
     return {"pending": True, "text": _format_approval_request(snapshot.values["messages"][-1].tool_calls)}
 
 
+@app.post("/context")
+async def context(request: ContextRequest):
+    """
+    Lecture seule (même convention que /pending, jamais d'effet de bord) :
+    décomposition approximative du contexte persisté pour ce thread, à
+    l'usage du dashboard d'observabilité (services/dashboard, POST
+    /api/snapshot). Voir describe_context (app/graph.py) pour le détail des
+    blocs. thread_id explicite (Phase 3, via GET /threads/recent) ou dérivé
+    de `messages` comme /pending. Aucun état pour ce thread (thread_id
+    inconnu du checkpointer, ou jamais renseigné) -> 200 avec des blocs
+    vides plutôt qu'une 404 : le dashboard poll ce endpoint en continu, une
+    404 transitoire (ex. juste avant le tout premier message d'une
+    conversation) serait juste du bruit à gérer côté client.
+    """
+    thread_id = request.thread_id or _derive_thread_id(request.messages or [])
+    config = {"configurable": {"thread_id": thread_id}}
+    snapshot = await agent_graph.aget_state(config)
+    messages = snapshot.values.get("messages", []) if snapshot.values else []
+
+    pending_text = None
+    if snapshot.next and messages and getattr(messages[-1], "tool_calls", None):
+        pending_text = _format_approval_request(messages[-1].tool_calls)
+
+    blocks = describe_context(messages, pending_text)
+    return {
+        "blocks": blocks,
+        "total_est_tokens": sum(b["est_tokens"] for b in blocks),
+        "message_count": len(messages),
+    }
+
+
+@app.get("/threads/recent")
+async def threads_recent():
+    """
+    Threads vus récemment (Phase 3, voir _recent_threads plus haut) : les 5
+    plus récents, triés du plus récent au plus ancien — alimente le menu
+    déroulant du dashboard d'observabilité (services/dashboard), qui n'a
+    sinon aucun moyen de savoir quel thread interroger via POST /context.
+    """
+    ordered = sorted(_recent_threads.items(), key=lambda item: item[1], reverse=True)[:5]
+    return {"threads": [{"thread_id": tid, "last_seen": last_seen} for tid, last_seen in ordered]}
+
+
 @app.get("/audit")
 async def audit(thread_id: Optional[str] = None):
     """
@@ -342,8 +416,10 @@ async def approve(request: ApprovalDecisionRequest):
     # Voir la note sur recursion_limit dans _resolve_run : ce endpoint reprend
     # aussi une exécution du graphe (ainvoke plus bas), donc soumis au même
     # risque de GraphRecursionError sur une boucle auto-approuvée longue.
+    thread_id = _derive_thread_id(request.messages)
+    _touch_thread(thread_id)
     config = {
-        "configurable": {"thread_id": _derive_thread_id(request.messages)},
+        "configurable": {"thread_id": thread_id},
         "recursion_limit": MAX_TOOL_ITERATIONS * 4 + 10,
     }
     snapshot = await agent_graph.aget_state(config)
