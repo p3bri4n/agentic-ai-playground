@@ -314,6 +314,12 @@ services:
       # les .gguf réellement présents diffèrent.
       - LLAMA_MODEL_FILE=${LLAMA_MODEL_FILE:-Qwen3.6-35B-A3B-Q5_K_M.gguf}
       - LLAMA_MMPROJ_FILE=${LLAMA_MMPROJ_FILE:-mmproj-F16.gguf}
+      # Flags supplémentaires ponctuels pour llama-server (voir
+      # entrypoint.sh), ex. diagnostic (README, tableau des bugs, crash
+      # CUDA au restore de checkpoint) : LLAMA_EXTRA_ARGS=--cache-ram 0
+      # pour désactiver le cache de prompt. Vide/absent (défaut) = aucun
+      # flag supplémentaire, commande strictement identique à avant.
+      - LLAMA_EXTRA_ARGS=${LLAMA_EXTRA_ARGS:-}
     volumes:
       - ${MODELS_HOST_PATH:-./models}:/models
     deploy:

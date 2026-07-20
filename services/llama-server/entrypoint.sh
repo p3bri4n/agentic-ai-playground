@@ -36,4 +36,5 @@ exec /app/llama-server \
     --alias agent-llm \
     --metrics \
     --slots \
+    ${LLAMA_EXTRA_ARGS:-} \
     "$@"
