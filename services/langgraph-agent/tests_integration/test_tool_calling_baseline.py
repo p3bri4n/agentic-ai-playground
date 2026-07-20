@@ -55,11 +55,28 @@ Prérequis identiques à `test_semantic_drift.py` : `docker compose up` avec
 langgraph-agent/mcp-client/llama-server actifs, bureau virtuel GhostDesk sans
 application ouverte (vérifié ci-dessous, mêmes raisons : une fenêtre parasite
 fausserait le grounding visuel du prompt capture->clic).
+
+Cadence délibérément ralentie entre runs (voir `_wait_for_llama_health` et
+`BASELINE_PAUSE_SECONDS`) : une première version de ce harnais, tirant les 25
+générations réelles à la chaîne sans pause, a fait planter `llama-server`
+(observé en conditions réelles : `CUDA error: unspecified launch failure` sur
+un rig double-GPU hétérogène, `ggml-cuda.cu`) — `llama-server` s'auto-relance
+après ce crash (superviseur `cmd_child_to_router`), mais les requêtes tombant
+pendant la fenêtre de rechargement du modèle échouaient en cascade
+(`httpcore.RemoteProtocolError: Server disconnected without sending a
+response`), polluant la classification (un crash GPU n'est pas un échec de
+tool-calling). Attendre `GET http://llama-server:8000/health` en plus d'une
+pause fixe avant chaque run rapproche la cadence d'un usage conversationnel
+normal (jamais 25 générations dos-à-dos) plutôt que d'un test de charge — ce
+harnais mesure le tool-calling, pas la résilience de `llama-server` sous
+rafale, qui reste un problème d'infrastructure hors périmètre de cette
+migration.
 """
 import hashlib
 import json
 import os
 import subprocess
+import time
 from collections import defaultdict
 from datetime import datetime, timezone
 
@@ -73,6 +90,11 @@ pytestmark = pytest.mark.skipif(
 AGENT_CONTAINER = os.environ.get("LANGGRAPH_AGENT_CONTAINER", "langgraph-agent")
 MCP_CLIENT_CONTAINER = os.environ.get("MCP_CLIENT_CONTAINER", "mcp-client")
 N_REPETITIONS = int(os.environ.get("BASELINE_REPETITIONS", "5"))
+# Pause fixe avant chaque run, EN PLUS de l'attente de santé de llama-server
+# (voir docstring du module) : rapproche la cadence d'un usage conversationnel
+# normal plutôt que d'un test de charge qui a fait planter le GPU.
+PAUSE_BETWEEN_RUNS_SECONDS = float(os.environ.get("BASELINE_PAUSE_SECONDS", "5"))
+LLAMA_HEALTH_TIMEOUT_SECONDS = int(os.environ.get("BASELINE_HEALTH_TIMEOUT", "90"))
 
 # Textes exacts émis côté serveur (voir app/main.py) : sert à classifier une
 # issue depuis le texte streamé, sans dépendre du contenu variable qui suit.
@@ -80,6 +102,12 @@ _APPROVAL_PREFIX = "⚠️ Approbation requise pour"
 _ITERATION_LIMIT_PREFIX = "⚠️ Limite d'itérations d'outils atteinte"
 _EMPTY_NOTICE_PREFIX = "⚠️ Le modèle a terminé son tour sans réponse exploitable"
 _FALLBACK_LOG_MARKER = "Tool call de secours extrait"
+# Texte du repli `except Exception` de _stream_response (app/main.py) : un
+# crash côté llama-server (ex. CUDA, voir docstring du module) coupe la
+# génération en plein milieu et ce texte apparaît alors AU MILIEU du flux,
+# pas forcément en préfixe — recherché en `in`, pas en `startswith`, et
+# vérifié en priorité pour ne jamais retomber dans "ok_no_tool" par erreur.
+_INTERNAL_ERROR_TEXT = "⚠️ Erreur interne pendant la génération, réessayez."
 
 # (identifiant, prompt, tier ciblé) — les 4 premiers ciblent volontairement un
 # outil TIER_REVERSIBLE (auto-approuvé mais journalisé, voir docstring) pour
@@ -123,6 +151,40 @@ def _docker_exec_python(container: str, script: str, timeout: int = 260) -> str:
     if result.returncode != 0:
         raise RuntimeError(f"docker exec dans {container} a échoué : {result.stderr}")
     return result.stdout
+
+
+def _wait_for_llama_health(timeout: int = LLAMA_HEALTH_TIMEOUT_SECONDS) -> None:
+    """
+    Attend que llama-server réponde sain avant de lancer un nouveau run
+    (voir docstring du module : un crash CUDA suivi d'un redémarrage
+    automatique laisse une fenêtre de plusieurs secondes où le modèle
+    recharge, pendant laquelle toute requête échoue en cascade). Requête
+    faite depuis le conteneur langgraph-agent (réseau interne compose, nom
+    de service `llama-server` résolu par Docker DNS) plutôt que depuis
+    l'hôte, qui n'a pas forcément le port publié.
+    """
+    script = """
+import urllib.request
+try:
+    with urllib.request.urlopen('http://llama-server:8000/health', timeout=5) as r:
+        print(r.status)
+except Exception as e:
+    print(f"ERR:{e}")
+"""
+    deadline = time.time() + timeout
+    last = ""
+    while time.time() < deadline:
+        try:
+            last = _docker_exec_python(AGENT_CONTAINER, script, timeout=15).strip()
+        except (RuntimeError, subprocess.TimeoutExpired) as exc:
+            last = str(exc)
+        if last == "200":
+            return
+        time.sleep(2)
+    pytest.fail(
+        f"llama-server ne répond pas sain après {timeout}s (dernier statut : {last!r}) "
+        "— probable crash/redémarrage en cours, voir docker logs llama-server."
+    )
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -241,6 +303,8 @@ def _assert_think_invariants(full_text: str) -> None:
 
 
 def _classify(full_text: str, fallback_logged: bool, audit_entries: list) -> str:
+    if _INTERNAL_ERROR_TEXT in full_text:
+        return "internal_error"
     visible = full_text.split("</think>", 1)[-1].strip() if "</think>" in full_text else full_text.strip()
     if visible.startswith(_EMPTY_NOTICE_PREFIX):
         return "empty_notice"
@@ -270,7 +334,7 @@ def _write_baseline_md(results: list) -> None:
     for r in results:
         by_prompt[r["prompt_id"]][r["classification"]] += 1
 
-    categories = ["structured", "fallback_recovered", "empty_notice", "ok_no_tool"]
+    categories = ["structured", "fallback_recovered", "empty_notice", "ok_no_tool", "internal_error"]
     lines = [
         "# Baseline tool-calling — trio actuel",
         "",
@@ -278,10 +342,11 @@ def _write_baseline_md(results: list) -> None:
         "`openai==1.51.2` (voir requirements.txt et README, section Streaming SSE).",
         "",
         f"Généré automatiquement par `test_tool_calling_baseline.py` le "
-        f"{datetime.now(timezone.utc).isoformat()} — {N_REPETITIONS} répétitions par prompt.",
+        f"{datetime.now(timezone.utc).isoformat()} — {N_REPETITIONS} répétitions par prompt "
+        f"(pause {PAUSE_BETWEEN_RUNS_SECONDS}s + attente santé llama-server entre chaque run).",
         "",
-        "| Prompt | structured | fallback_recovered | empty_notice | ok_no_tool |",
-        "|---|---|---|---|---|",
+        "| Prompt | structured | fallback_recovered | empty_notice | ok_no_tool | internal_error |",
+        "|---|---|---|---|---|---|",
     ]
     for prompt_id, _ in PROMPTS:
         counts = by_prompt[prompt_id]
@@ -309,6 +374,13 @@ def test_tool_calling_run(prompt_id, prompt_text, repetition):
     tag = f"[baseline {prompt_id} rep{repetition} pid{os.getpid()}]"
     content = f"{tag} {prompt_text}"
     thread_id = hashlib.sha256(content.encode()).hexdigest()[:16]
+
+    # Cadence délibérément ralentie (voir docstring du module) : attend que
+    # llama-server soit sain (couvre le cas d'un crash CUDA pendant le run
+    # précédent, encore en train de recharger le modèle) puis marque une
+    # pause fixe, pour ne jamais tirer deux générations réelles dos-à-dos.
+    _wait_for_llama_health()
+    time.sleep(PAUSE_BETWEEN_RUNS_SECONDS)
 
     log_before = _log_line_count(AGENT_CONTAINER)
     raw = _stream_chat(content)
