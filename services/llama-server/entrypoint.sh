@@ -21,6 +21,10 @@ if [ ! -f "$MMPROJ_PATH" ]; then
     exit 1
 fi
 
+# --ubatch-size 128 (au lieu du défaut 512) : contournement permanent d'un
+# crash CUDA confirmé sous gros lot de prefill sur ce rig dual-GPU
+# hétérogène (voir tests_integration/CUDA-DIAGNOSTIC.md, tableau des bugs
+# du README).
 exec /app/llama-server \
     --model "$MODEL_PATH" \
     --mmproj "$MMPROJ_PATH" \
@@ -31,6 +35,7 @@ exec /app/llama-server \
     --flash-attn on \
     --jinja \
     --parallel 1 \
+    --ubatch-size 256 \
     --host 0.0.0.0 \
     --port 8000 \
     --alias agent-llm \

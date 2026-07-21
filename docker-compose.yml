@@ -29,7 +29,7 @@ services:
     container_name: langgraph-agent
     restart: unless-stopped
     environment:
-      - LLM_BASE_URL=${LLM_BASE_URL:-http://llama-server:8000/v1}
+      - LLM_BASE_URL=${LLM_BASE_URL:-http://tabbyapi:5000/v1}
       - SKILL_MANAGER_URL=http://skill-manager:8001
       - CONTEXT_MANAGER_URL=http://context-manager:8002
       - MCP_CLIENT_URL=http://mcp-client:8003
@@ -37,13 +37,13 @@ services:
       # section Supervision humaine) : /workspace/.audit, sur le même bind
       # mount que les autres serveurs MCP filesystem/git/terminal.
       - AUDIT_LOG_DIR=/workspace/.audit
-      # Décodage image natif du fork llama.cpp servi par llama-server (voir
-      # plus bas) : transmet le WebP brut de screen_shot GhostDesk plutôt que
-      # de le reconvertir en PNG côté agent (défaut historique, nécessaire
-      # avec Ollama dont le décodeur mtmd échoue sur le WebP — voir tableau
-      # des bugs). Repasser à "png" (ou vider) si LLM_BASE_URL pointe de
-      # nouveau vers ollama.
-      - IMAGE_FORMAT_PASSTHROUGH=${IMAGE_FORMAT_PASSTHROUGH:-webp}
+      # Conversion PNG par défaut (aucune valeur = passe par _to_png_data_uri) :
+      # le backend par défaut (TabbyAPI/ExLlamaV3) n'est pas connu pour décoder
+      # le WebP nativement (à vérifier empiriquement, voir plan d'implémentation
+      # tabbyapi). "webp" ne s'active que pour le backend alternatif
+      # llama-server, dont le fork llama.cpp décode le WebP nativement — voir
+      # tableau des bugs du README.
+      - IMAGE_FORMAT_PASSTHROUGH=${IMAGE_FORMAT_PASSTHROUGH:-}
       # Qwen3.6 raisonne par défaut sur chaque tour : coûteux pour la boucle
       # perception-action rapide capture/clic de GhostDesk. Injecte /no_think
       # dans le system prompt quand tous les tool_calls du tour précédent
@@ -70,7 +70,7 @@ services:
       - skill-manager
       - context-manager
       - mcp-client
-      - llama-server
+      - tabbyapi
     networks:
       - agent-net
     # pas de port publié : uniquement accessible via le réseau interne
@@ -91,9 +91,11 @@ services:
     restart: unless-stopped
     environment:
       # Overridable (contrairement aux autres URLs internes de ce compose,
-      # toujours en dur) : si LLM_BASE_URL bascule sur ollama (voir plus
-      # bas), le dashboard perd sa source /metrics/{slots} (llama-server
-      # spécifique) sauf à pointer explicitement LLAMA_SERVER_URL ailleurs.
+      # toujours en dur) : llama-server n'est plus démarré par défaut depuis
+      # la migration vers TabbyAPI (voir section Inférence plus bas) — cette
+      # source reste en best-effort (section `null` sans erreur, voir
+      # app/main.py) tant que llama-server n'est pas explicitement réactivé.
+      # Pas d'équivalent /metrics/{slots} pour TabbyAPI à ce jour.
       - LLAMA_SERVER_URL=${LLAMA_SERVER_URL:-http://llama-server:8000}
       - LANGGRAPH_AGENT_URL=http://langgraph-agent:8000
       # VRAM par GPU (nvidia-smi) : désactivé par défaut, nécessite le
@@ -147,7 +149,7 @@ services:
     restart: unless-stopped
     environment:
       - QDRANT_URL=http://qdrant:6333
-      - LLM_BASE_URL=${LLM_BASE_URL:-http://llama-server:8000/v1}
+      - LLM_BASE_URL=${LLM_BASE_URL:-http://tabbyapi:5000/v1}
     depends_on:
       qdrant:
         condition: service_healthy
@@ -291,18 +293,77 @@ services:
   # ──────────────────────────────────────────────────────────────
   # Inférence
   # ──────────────────────────────────────────────────────────────
-  # Backend par défaut : llama-server, buildé depuis le fork YV17labs/
-  # llama-cpp-turboquant-webp (branche feature/turboquant-webp — décodage
-  # WebP natif + cache KV "turbo3", voir services/llama-server/Dockerfile).
-  # vLLM a été retiré du projet (utilisait un format de poids HuggingFace
-  # natif incompatible avec les .gguf, et n'apportait rien que llama.cpp ne
-  # couvre pas ici) ; Ollama reste disponible comme backend alternatif
-  # (llama.cpp sous le capot lui aussi) plus bas, hors depends_on par défaut.
+  # Backend par défaut : TabbyAPI (image officielle ghcr.io/theroyallab/
+  # tabbyapi, backend ExLlamaV3) servant Qwen3.6-27B en quantisation EXL3
+  # (variante VL, vision préservée pour GhostDesk/OCR) avec MTP natif
+  # (draft_mode: mtp dans services/tabbyapi/config.yml, pas de modèle de
+  # draft séparé). Remplace llama-server comme défaut : ce dernier restait
+  # bloqué par un bug de synchronisation inter-GPU confirmé dans son fork
+  # (voir tests_integration/CUDA-DIAGNOSTIC.md), nécessitant
+  # --ubatch-size 128 (~+34% de latence) en mitigation permanente.
+  # Multi-GPU (count: all, les deux cartes) : un mono-GPU a été tenté
+  # d'abord (contournait le tensor-split hétérogène du fork llama.cpp en le
+  # rendant sans objet plutôt que de le réparer) mais ce quant VL 3.50bpw
+  # (14,29 Gio de poids seuls + tour vision) ne rentre pas avec la vision
+  # activée sur un seul GPU 16 Go, même sur la Blackwell (marge ~822 Mio
+  # sans vision). ExLlamaV3 étant un code base différent du fork llama.cpp
+  # diagnostiqué, le bug de synchronisation inter-GPU documenté n'a pas de
+  # raison de s'y appliquer. llama-server reste disponible comme backend
+  # alternatif plus bas (même statut qu'Ollama).
+  tabbyapi:
+    # Build local minimal (voir services/tabbyapi/Dockerfile) au-dessus de
+    # l'image officielle épinglée par digest (":latest" est une rolling
+    # release qui ne fige rien dans le temps ; digest résolu et versions
+    # réelles constatées dans le conteneur consignées dans RESULTS.md) —
+    # ajoute python3-dev, absent de l'image officielle et requis par la
+    # compilation JIT Triton au chargement du modèle.
+    build: ./services/tabbyapi
+    container_name: tabbyapi
+    restart: unless-stopped
+    volumes:
+      - ./services/tabbyapi/config.yml:/app/config.yml:ro
+      - ${MODELS_HOST_PATH:-./models}:/models
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              # Choix revu en cours de PoC : mono-GPU (Ada, puis Blackwell)
+              # insuffisant pour ce quant avec vision activée (14,29 Gio de
+              # poids seuls + tour vision + buffers — restait ~822 Mio de
+              # marge SANS vision même sur la Blackwell à cache_size=8192,
+              # largement insuffisant pour la tour vision). Passage en
+              # multi-GPU (les deux cartes, count: all) pour ce backend —
+              # ExLlamaV3, pas le fork llama.cpp diagnostiqué précédemment,
+              # le bug de synchronisation inter-GPU documenté dans
+              # tests_integration/CUDA-DIAGNOSTIC.md n'a pas de raison de
+              # s'appliquer ici (code base différent). gpu_split_auto
+              # (défaut TabbyAPI, voir config.yml) répartit automatiquement
+              # entre les deux GPU visibles.
+              count: all
+              capabilities: [gpu]
+    networks:
+      - agent-net
+    # décommenter pour exposer l'API OpenAI-compatible directement sur l'hôte
+    # ports:
+    #   - "5000:5000"
+
+  # --- Backend alternatif : llama-server (fork YV17labs/llama-cpp-turboquant-
+  # webp, Qwen3.6-35B-A3B GGUF, dual-GPU tensor-split) -----------------------
+  # Non utilisé par défaut depuis la migration vers TabbyAPI/ExLlamaV3 (voir
+  # section Backend d'inférence du README) : pour l'activer, définir dans .env
+  #   LLM_BASE_URL=http://llama-server:8000/v1
+  # puis démarrer ce service explicitement (il n'est plus dans les
+  # depends_on de langgraph-agent/context-manager, qui restent câblés sur
+  # tabbyapi par défaut) :
+  #   docker compose up -d llama-server
+  # Repasser aussi IMAGE_FORMAT_PASSTHROUGH=webp (voir .env) pour profiter du
+  # décodage WebP natif du fork.
   #
-  # ⚠️ Ni ce Dockerfile ni le modèle cible n'ont pu être réellement buildés
-  # / exécutés dans l'environnement de développement utilisé (pas d'accès
-  # réseau au fork, pas de GPU) — voir l'avertissement détaillé dans
-  # services/llama-server/Dockerfile, à valider avant mise en production.
+  # ⚠️ Un bug de synchronisation inter-GPU a été confirmé dans ce fork sous
+  # gros lot de prefill (voir tests_integration/CUDA-DIAGNOSTIC.md) ;
+  # --ubatch-size 128 (entrypoint.sh) est le contournement permanent en
+  # production pour qui réactive ce backend, ~+34% de latence par génération.
   llama-server:
     build: ./services/llama-server
     container_name: llama-server
@@ -311,7 +372,9 @@ services:
       # Modèle cible : Qwen3.6-35B-A3B, quantisation Q5_K_M. Fichiers
       # attendus tels quels dans ./models (jamais téléchargés par ce
       # service, voir entrypoint.sh) — adapter ces deux noms de fichier si
-      # les .gguf réellement présents diffèrent.
+      # les .gguf réellement présents diffèrent. Ce backend étant désormais
+      # alternatif (voir commentaire ci-dessus), ces variables ne
+      # s'appliquent que si llama-server est réactivé.
       - LLAMA_MODEL_FILE=${LLAMA_MODEL_FILE:-Qwen3.6-35B-A3B-Q5_K_M.gguf}
       - LLAMA_MMPROJ_FILE=${LLAMA_MMPROJ_FILE:-mmproj-F16.gguf}
       # Flags supplémentaires ponctuels pour llama-server (voir
@@ -336,11 +399,11 @@ services:
     #   - "8000:8000"
 
   # --- Backend alternatif : Ollama (GGUF, quants I-quants/K-quants inclus) --
-  # Non utilisé par défaut (voir LLM_BASE_URL, qui pointe sur llama-server par
+  # Non utilisé par défaut (voir LLM_BASE_URL, qui pointe sur tabbyapi par
   # défaut) : pour l'activer, définir dans .env
   #   LLM_BASE_URL=http://ollama:11434/v1
   # puis démarrer ce service explicitement (il n'est pas dans les depends_on
-  # de langgraph-agent/context-manager, qui restent câblés sur llama-server) :
+  # de langgraph-agent/context-manager, qui restent câblés sur tabbyapi) :
   #   docker compose up -d ollama
   # Après le pull, aliaser le modèle en "agent-llm" pour matcher le nom en
   # dur dans le code (services/langgraph-agent/app/graph.py), avec les

@@ -4,7 +4,7 @@ Graphe d'orchestration LangGraph.
 Flux :
   1. retrieve_context   -> interroge Context Manager (RAG / mémoire)
   2. select_skill        -> interroge Skill Manager pour injecter un prompt de skill pertinent
-  3. call_llm             -> appelle le backend d'inférence (llama-server par
+  3. call_llm             -> appelle le backend d'inférence (TabbyAPI par
      défaut, API OpenAI-compatible) avec function calling
   4. has_tool_calls       -> route vers require_approval, ou directement vers
      auto_call_tools si TOUS les tool_calls du tour sont auto-approuvés selon
@@ -38,6 +38,7 @@ import math
 import os
 import json
 import re
+import shlex
 import uuid
 from typing import Annotated, Optional, TypedDict
 
@@ -71,6 +72,15 @@ logger = logging.getLogger(__name__)
 # reconnue par Open WebUI pour afficher une bulle de pensée repliable), ce
 # qui le fait apparaître dans le flux de streaming existant sans toucher à
 # app/main.py.
+#
+# TabbyAPI (backend par défaut depuis la migration ExLlamaV3, voir README
+# section Backend d'inférence) a son propre toggle `reasoning: true` côté
+# config.yml, mais le NOM du champ SSE qu'il émet sur le fil n'a pas encore
+# été vérifié empiriquement (voir tests_integration/CUDA-DIAGNOSTIC.md /
+# plan d'implémentation tabbyapi, risque ouvert #3) — si ni "reasoning" ni
+# "reasoning_content" ne matchent en conditions réelles, ajouter un troisième
+# `or _dict.get(...)` ci-dessous une fois le nom réel confirmé par un appel
+# streamé réel, pas deviné.
 _think_state: contextvars.ContextVar[Optional[dict]] = contextvars.ContextVar(
     "_think_state", default=None
 )
@@ -83,10 +93,24 @@ def _convert_delta_with_reasoning(_dict, default_class):
     if state is None:
         return chunk
     reasoning = _dict.get("reasoning") or _dict.get("reasoning_content")
+    real_content = chunk.content
     if reasoning:
         prefix = "<think>" if not state["opened"] else ""
         state["opened"] = True
-        chunk.content = prefix + reasoning
+        pieces = [prefix, reasoning]
+        if real_content:
+            # Ce delta contient à la fois la fin du raisonnement ET le début
+            # de la réponse finale dans le MÊME chunk (observé avec
+            # TabbyAPI/ExLlamaV3 — llama-server/Ollama séparaient toujours
+            # les deux en chunks distincts, d'où ce bug invisible avant
+            # cette migration). Sans ce cas, chunk.content écrasé par le
+            # seul raisonnement juste en dessous jetait silencieusement la
+            # vraie réponse — le tour se terminait alors sans contenu
+            # visible, déclenchant à tort le filet de secours empty-answer.
+            state["closed"] = True
+            pieces.append("</think>\n\n")
+            pieces.append(real_content)
+        chunk.content = "".join(pieces)
     elif chunk.content and state["opened"] and not state["closed"]:
         state["closed"] = True
         chunk.content = "</think>\n\n" + chunk.content
@@ -95,19 +119,21 @@ def _convert_delta_with_reasoning(_dict, default_class):
 
 _openai_base._convert_delta_to_message_chunk = _convert_delta_with_reasoning
 
-LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "http://llama-server:8000/v1")
+LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "http://tabbyapi:5000/v1")
 CONTEXT_MANAGER_URL = os.environ.get("CONTEXT_MANAGER_URL", "http://context-manager:8002")
 SKILL_MANAGER_URL = os.environ.get("SKILL_MANAGER_URL", "http://skill-manager:8001")
 MCP_CLIENT_URL = os.environ.get("MCP_CLIENT_URL", "http://mcp-client:8003")
 
 # Format transmis au LLM pour les résultats image d'outil (screen_shot
-# GhostDesk, format WebP natif) : "webp" transmet le format brut tel quel,
-# en s'appuyant sur le décodage WebP natif du fork llama.cpp servi par
-# défaut (llama-server, voir README section Backend d'inférence). Toute
-# autre valeur (y compris vide, le défaut) reconvertit systématiquement en
-# PNG — nécessaire avec Ollama, dont le décodeur mtmd échoue explicitement
-# sur le WebP (voir _to_png_data_uri plus bas et le tableau des bugs du
-# README).
+# GhostDesk, format WebP natif) : vide (le défaut) reconvertit
+# systématiquement en PNG — le backend par défaut (TabbyAPI/ExLlamaV3,
+# voir README section Backend d'inférence) n'est pas connu pour décoder le
+# WebP nativement (à vérifier empiriquement, voir plan d'implémentation
+# tabbyapi, risque ouvert #2 ; nécessaire de toute façon avec Ollama, dont
+# le décodeur mtmd échoue explicitement sur le WebP). "webp" ne s'active
+# qu'avec le backend alternatif llama-server, dont le fork llama.cpp décode
+# le WebP nativement (voir _to_png_data_uri plus bas et le tableau des bugs
+# du README).
 IMAGE_FORMAT_PASSTHROUGH = os.environ.get("IMAGE_FORMAT_PASSTHROUGH", "").lower() == "webp"
 
 # Budget cumulé d'appels d'outils pour une même tâche : partagé sur toute la
@@ -348,8 +374,8 @@ LLM_MAX_TOKENS = int(os.environ.get("LLM_MAX_TOKENS", "2048"))
 
 llm = ChatOpenAI(
     base_url=LLM_BASE_URL,
-    api_key="not-needed",       # llama-server/Ollama ne vérifient pas la clé par défaut
-    model="agent-llm",
+    api_key="not-needed",       # tabbyapi (disable_auth: true)/llama-server/Ollama ne vérifient pas la clé par défaut
+    model="agent-llm",          # doit matcher model_name dans services/tabbyapi/config.yml
     temperature=0.2,
     max_tokens=LLM_MAX_TOKENS,
 )
@@ -362,7 +388,10 @@ llm = ChatOpenAI(
 _tools_schema_cache: Optional[list] = None
 
 
-async def _get_bound_llm() -> ChatOpenAI:
+async def _get_tools_schema() -> list:
+    """Remplit/retourne _tools_schema_cache — factorisé hors de _get_bound_llm
+    pour être aussi utilisable par _route_entry (validation du nom d'outil
+    d'une commande slash) sans requête HTTP supplémentaire une fois en cache."""
     global _tools_schema_cache
     if _tools_schema_cache is None:
         try:
@@ -374,7 +403,12 @@ async def _get_bound_llm() -> ChatOpenAI:
             # mcp-client injoignable ou réponse invalide : dégrade sans outils
             # plutôt que de faire échouer toute la conversation.
             _tools_schema_cache = []
-    return llm.bind_tools(_tools_schema_cache) if _tools_schema_cache else llm
+    return _tools_schema_cache
+
+
+async def _get_bound_llm() -> ChatOpenAI:
+    schema = await _get_tools_schema()
+    return llm.bind_tools(schema) if schema else llm
 
 
 async def retrieve_context(state: AgentState) -> dict:
@@ -576,7 +610,19 @@ def _apply_adaptive_thinking(messages: list, session_grants) -> list:
     )
     if not all_auto_approved:
         return messages
-    return messages + [SystemMessage(content=NO_THINK_DIRECTIVE)]
+    # Fusionné dans le message système de tête s'il y en a un (cas réel :
+    # GROUNDING_DIRECTIVE, ajouté par call_llm juste avant cet appel), sinon
+    # ajouté en position 0 — jamais en fin de liste : certains backends
+    # (TabbyAPI/ExLlamaV3, template Jinja strict de Qwen3.6) rejettent
+    # explicitement un second message système ou un message système non en
+    # tête ("TemplateError: System message must be at the beginning") —
+    # llama-server/Ollama tolèrent les deux formes, donc ce bug restait
+    # invisible avant la migration vers TabbyAPI.
+    if messages and isinstance(messages[0], SystemMessage):
+        head, *rest = messages
+        merged_head = SystemMessage(content=f"{head.content}\n{NO_THINK_DIRECTIVE}")
+        return [merged_head] + rest
+    return [SystemMessage(content=NO_THINK_DIRECTIVE)] + messages
 
 
 async def call_llm(state: AgentState) -> dict:
@@ -717,11 +763,11 @@ def _to_image_data_uri(data_b64: str, mime_type: str) -> str:
     """
     IMAGE_FORMAT_PASSTHROUGH=webp : transmet le WebP brut de screen_shot tel
     quel (data URI directe, aucun décodage/réencodage Pillow), en s'appuyant
-    sur le décodage WebP natif du fork llama.cpp servi par llama-server
-    (voir README, section Backend d'inférence) — évite le coût CPU de la
-    reconversion PNG à chaque capture. Défaut (variable absente/différente
-    de "webp") : conversion PNG systématique via _to_png_data_uri, seule
-    compatible avec Ollama (voir cette fonction).
+    sur le décodage WebP natif du fork llama.cpp servi par le backend
+    alternatif llama-server (voir README, section Backend d'inférence) —
+    évite le coût CPU de la reconversion PNG à chaque capture. Défaut
+    (variable absente/différente de "webp", cas de TabbyAPI comme
+    d'Ollama) : conversion PNG systématique via _to_png_data_uri.
     """
     if IMAGE_FORMAT_PASSTHROUGH:
         return f"data:{mime_type};base64,{data_b64}"
@@ -748,6 +794,25 @@ def _split_image_blocks(result: dict) -> tuple[dict, list[dict]]:
     return {**result, "content": rest or "(voir image ci-dessous)"}, images
 
 
+async def _call_mcp_tool(client: httpx.AsyncClient, tool_name: str, args: dict) -> tuple[dict, list]:
+    """
+    Appel HTTP unique à mcp-client:/call, factorisé entre _execute_tool_calls
+    (tool_calls décidés par le LLM) et run_slash_command_direct (commande
+    tapée directement par l'utilisateur) — même gestion d'erreur/découpage des
+    blocs image dans les deux cas.
+    """
+    try:
+        resp = await client.post(
+            f"{MCP_CLIENT_URL}/call",
+            json={"tool": tool_name, "arguments": args},
+        )
+        resp.raise_for_status()
+        result = resp.json()
+    except httpx.HTTPError as exc:
+        return {"error": str(exc)}, []
+    return _split_image_blocks(result)
+
+
 async def _execute_tool_calls(state: AgentState, config: dict, *, audit: bool) -> dict:
     """
     Logique partagée entre call_tools (atteint après require_approval, donc
@@ -770,18 +835,7 @@ async def _execute_tool_calls(state: AgentState, config: dict, *, audit: bool) -
                 tier = approval_policy.effective_tier(tool_call["name"], tool_call.get("args"), grants)
                 if tier == approval_policy.TIER_REVERSIBLE:
                     audit_log.log_tool_call(thread_id, tool_call["name"], tool_call["args"], tier)
-            try:
-                resp = await client.post(
-                    f"{MCP_CLIENT_URL}/call",
-                    json={"tool": tool_call["name"], "arguments": tool_call["args"]},
-                )
-                resp.raise_for_status()
-                result = resp.json()
-            except httpx.HTTPError as exc:
-                result = {"error": str(exc)}
-                images = []
-            else:
-                result, images = _split_image_blocks(result)
+            result, images = await _call_mcp_tool(client, tool_call["name"], tool_call["args"])
 
             new_messages.append(
                 {
@@ -845,6 +899,165 @@ async def reject_tools(state: AgentState) -> dict:
     }
 
 
+def _coerce_slash_arg_value(raw: str):
+    """int > float > bool ("true"/"false") > string, dans cet ordre."""
+    try:
+        return int(raw)
+    except ValueError:
+        pass
+    try:
+        return float(raw)
+    except ValueError:
+        pass
+    if raw.lower() in ("true", "false"):
+        return raw.lower() == "true"
+    return raw
+
+
+def _parse_slash_command(content: str) -> Optional[tuple]:
+    """
+    "/toolname a=1 b=texte" -> ("toolname", {"a": 1, "b": "texte"}).
+    None si le contenu ne commence pas par "/" ou est vide après le "/".
+    shlex.split gère les valeurs entre guillemets contenant des espaces. Un
+    token sans "=" (argument malformé) est simplement ignoré (log warning)
+    plutôt que de faire échouer tout le parsing d'une commande par ailleurs
+    valide.
+    """
+    if not content or not content.startswith("/"):
+        return None
+    try:
+        tokens = shlex.split(content[1:])
+    except ValueError:
+        return None
+    if not tokens:
+        return None
+    tool_name = tokens[0]
+    args = {}
+    for tok in tokens[1:]:
+        if "=" not in tok:
+            logger.warning("Argument de commande slash ignoré (pas de '=') : %r", tok)
+            continue
+        key, _, raw_value = tok.partition("=")
+        args[key] = _coerce_slash_arg_value(raw_value)
+    return tool_name, args
+
+
+def _format_tool_result_as_text(result: dict) -> str:
+    """Extrait le texte des blocs {"type": "text", ...} du résultat d'outil ;
+    à défaut (résultat vide, erreur, forme inattendue), JSON indenté brut."""
+    blocks = result.get("content", []) if isinstance(result, dict) else []
+    texts = [b.get("text", "") for b in blocks if isinstance(b, dict) and b.get("type") == "text"]
+    if texts:
+        return "\n".join(texts)
+    return json.dumps(result, ensure_ascii=False, indent=2)
+
+
+async def prepare_slash_command(state: AgentState, config: dict) -> dict:
+    """
+    Parse la commande slash et synthétise le tool_calls correspondant, sans
+    encore l'exécuter — le routage par tier (_route_slash_command_tier)
+    décide ensuite si ça part en direct (run_slash_command_direct) ou par la
+    vraie pause d'approbation (require_approval), selon le tier de l'outil.
+    """
+    tool_name, args = _parse_slash_command(state["messages"][-1].content)
+    call_id = f"slash_{uuid.uuid4().hex[:12]}"
+    return {
+        "messages": [
+            {"role": "assistant", "content": "", "tool_calls": [{"name": tool_name, "args": args, "id": call_id}]}
+        ]
+    }
+
+
+def _route_slash_command_tier(state: AgentState) -> str:
+    """
+    GARDE-FOU : une commande slash sur un outil TIER_SENSITIVE (ex. key_type
+    avec texte long, clipboard_get) ne s'exécute PAS directement — elle part
+    par require_approval, exactement comme un tool_calls décidé par le LLM.
+    Le fait de taper explicitement la commande ne vaut approbation que pour
+    TIER_READ/TIER_REVERSIBLE : le tier sensible existe précisément pour
+    imposer une confirmation séparée avant une action potentiellement
+    dangereuse (texte libre tapé dans un terminal, exfiltration du
+    presse-papier...) — un bypass total aurait annulé cette garantie pour
+    n'importe quel outil, y compris ceux jamais voulus auto-approuvés.
+    """
+    last = state["messages"][-1]
+    tool_call = last.tool_calls[0]
+    grants = state.get("session_grants") or []
+    tier = approval_policy.effective_tier(tool_call["name"], tool_call.get("args"), grants)
+    return "sensitive" if tier == approval_policy.TIER_SENSITIVE else "direct"
+
+
+async def run_slash_command_direct(state: AgentState, config: dict) -> dict:
+    """
+    Exécute directement le tool_calls synthétisé par prepare_slash_command
+    (tier lecture/réversible uniquement, voir _route_slash_command_tier) —
+    ni LLM ni pause d'approbation. Termine sur un AIMessage de forme
+    standard (pas juste le ToolMessage brut) pour rester compatible sans
+    aucune modification avec main.py, qui suppose que le dernier message
+    d'un tour terminé est un AIMessage avec du contenu visible (voir
+    _stream_response/_current_answer, qui basculeraient sinon sur la notice
+    "réponse non exploitable").
+    """
+    last = state["messages"][-1]
+    tool_call = last.tool_calls[0]
+    tool_name, args, call_id = tool_call["name"], tool_call["args"], tool_call["id"]
+
+    # Traçabilité uniquement (parité avec auto_call_tools) : n'influence
+    # jamais l'exécution — le tier sensible a déjà été écarté par
+    # _route_slash_command_tier avant d'arriver ici.
+    grants = state.get("session_grants") or []
+    tier = approval_policy.effective_tier(tool_name, args, grants)
+    thread_id = config.get("configurable", {}).get("thread_id", "")
+    if tier == approval_policy.TIER_REVERSIBLE:
+        audit_log.log_tool_call(thread_id, tool_name, args, tier)
+
+    async with httpx.AsyncClient(timeout=60) as client:
+        result, images = await _call_mcp_tool(client, tool_name, args)
+
+    new_messages = [
+        {"role": "tool", "tool_call_id": call_id, "content": json.dumps(result, ensure_ascii=False)},
+    ]
+    for image in images:
+        new_messages.append(
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": _to_image_data_uri(image["data"], image.get("mimeType", "image/png"))
+                        },
+                    }
+                ],
+            }
+        )
+    new_messages.append({"role": "assistant", "content": _format_tool_result_as_text(result)})
+
+    return {
+        "messages": new_messages,
+        "tool_iterations": state["tool_iterations"] + 1,
+    }
+
+
+async def _route_entry(state: AgentState) -> str:
+    """
+    Point d'entrée conditionnel du graphe : bascule sur prepare_slash_command
+    si le dernier message est une commande slash dont le nom d'outil est
+    CONNU (_tools_schema_cache, format OpenAI function-calling imbriqué
+    {"function": {"name": ...}}, voir mcp-client:/tools/schema) — un message
+    qui commence juste par "/" sans être une commande valide (ex. un chemin
+    de fichier) suit le flux normal plutôt que de déclencher une erreur 404
+    confuse pour un nom qui n'était jamais censé être un outil.
+    """
+    parsed = _parse_slash_command(state["messages"][-1].content)
+    if parsed is None:
+        return "normal"
+    tool_name, _ = parsed
+    schema = await _get_tools_schema()
+    known_names = {t.get("function", {}).get("name") for t in schema}
+    return "slash_command" if tool_name in known_names else "normal"
+
+
 def build_graph(checkpointer=None):
     graph = StateGraph(AgentState)
     graph.add_node("retrieve_context", retrieve_context)
@@ -855,8 +1068,18 @@ def build_graph(checkpointer=None):
     graph.add_node("auto_call_tools", auto_call_tools)
     graph.add_node("reject_tools", reject_tools)
     graph.add_node("retry_empty_answer", retry_empty_answer)
+    graph.add_node("prepare_slash_command", prepare_slash_command)
+    graph.add_node("run_slash_command_direct", run_slash_command_direct)
 
-    graph.set_entry_point("retrieve_context")
+    graph.set_conditional_entry_point(
+        _route_entry, {"slash_command": "prepare_slash_command", "normal": "retrieve_context"}
+    )
+    graph.add_conditional_edges(
+        "prepare_slash_command",
+        _route_slash_command_tier,
+        {"sensitive": "require_approval", "direct": "run_slash_command_direct"},
+    )
+    graph.add_edge("run_slash_command_direct", END)
     graph.add_edge("retrieve_context", "select_skill")
     graph.add_edge("select_skill", "call_llm")
     graph.add_conditional_edges(

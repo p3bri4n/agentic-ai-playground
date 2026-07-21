@@ -3,7 +3,7 @@
 ![Logo](logo-agentic-ai-playground.jpg)
 
 Stack Docker Compose pour un agent IA local : Open WebUI → LangGraph Agent →
-(Skill Manager / Context Manager / MCP Client) → llama-server.
+(Skill Manager / Context Manager / MCP Client) → TabbyAPI.
 
 ## Démarrage rapide
 
@@ -11,9 +11,12 @@ Stack Docker Compose pour un agent IA local : Open WebUI → LangGraph Agent →
 cp .env.example .env
 # éditer .env : WORKSPACE_HOST_PATH doit être le chemin ABSOLU de ./workspace sur l'hôte
 # (requis car mcp-client monte ce chemin dans des conteneurs qu'il spawn lui-même)
-# éditer .env : LLAMA_MODEL_FILE/LLAMA_MMPROJ_FILE doivent correspondre aux
-# .gguf réellement présents dans ./models (voir section Backend d'inférence
-# ci-dessous — jamais téléchargés automatiquement)
+# placer le quant EXL3 du modèle (safetensors + config.json + tokenizer,
+# format HuggingFace) sous ./models/agent-llm/ — backend TabbyAPI par défaut,
+# jamais téléchargé automatiquement (voir section Backend d'inférence
+# ci-dessous). Pour le backend alternatif llama-server (.gguf), éditer .env :
+# LLAMA_MODEL_FILE/LLAMA_MMPROJ_FILE doivent correspondre aux fichiers
+# réellement présents dans ./models
 
 docker pull mcp/filesystem:latest
 docker pull mcp/git:latest
@@ -75,42 +78,101 @@ models/     poids (.gguf) du modèle et du projecteur multimodal servis par
 
 ## Backend d'inférence
 
-Le backend par défaut est `llama-server`, buildé depuis le fork
+Le backend par défaut est **TabbyAPI** (image officielle
+[`ghcr.io/theroyallab/tabbyapi`](https://github.com/theroyallab/tabbyAPI),
+backend ExLlamaV3), servant **Qwen3.6-27B en quantisation EXL3** (variante
+VL, vision préservée pour GhostDesk/OCR — voir Images et thinking adaptatif
+et OCR d'appoint plus bas), avec **MTP natif** (`draft_mode: mtp` dans
+`services/tabbyapi/config.yml`, tête de prédiction multi-token du modèle
+lui-même, pas de modèle de draft séparé à charger).
+
+**Pourquoi ce choix plutôt que `llama-server` (voir plus bas)** : plutôt que
+de continuer à vivre avec le contournement `--ubatch-size 128` du fork
+llama.cpp (~+34% de latence par génération, voir tableau des bugs plus bas et
+`tests_integration/CUDA-DIAGNOSTIC.md` pour le diagnostic complet), ExLlamaV3
+est un code base entièrement différent, sans le bug de synchronisation
+inter-GPU diagnostiqué sur ce fork. Un déploiement **mono-GPU** a été tenté
+en premier (rendant le tensor-split hétérogène Ada/Blackwell sans objet
+plutôt que de le réparer), mais ce quant VL 3.50bpw (14,29 Gio de poids
+seuls + tour vision) ne rentre pas avec la vision activée sur un seul GPU
+16 Go — déployé en **multi-GPU** (`count: all` dans `docker-compose.yml`,
+`gpu_split_auto` répartit automatiquement les deux cartes).
+
+Config `services/tabbyapi/config.yml` (montée en lecture seule) : champs clés
+`model_dir`/`model_name` (répertoire HuggingFace-style du quant EXL3 sous
+`./models`, **pas** un `.gguf` — voir plus bas), `backend: exllamav3`,
+`cache_mode`/`cache_size`/`max_seq_len` (à affiner selon la VRAM disponible
+cumulée sur les deux GPU), `draft_model.draft_mode: mtp`, `tool_format`, et
+trois déviations volontaires par rapport aux défauts TabbyAPI :
+`disable_auth: true` (réseau interne `agent-net` uniquement, même modèle de
+confiance que `llama-server`/Ollama), `vision: true` (désactivé par défaut
+même si le modèle a des capacités vision) et
+`reasoning: true` (désactivé par défaut chez TabbyAPI, requis pour parser
+les blocs `<think>` de Qwen).
+
+Modèle cible : fichiers HuggingFace-style (safetensors + `config.json` +
+tokenizer) attendus sous `./models/agent-llm/` (ou `MODELS_HOST_PATH`) —
+**jamais téléchargés automatiquement**, comme pour `llama-server`. Le nom
+`agent-llm` (plutôt que le nom réel du dépôt HuggingFace téléchargé) est
+requis pour matcher le `model="agent-llm"` en dur dans `ChatOpenAI`
+(`services/langgraph-agent/app/graph.py`) sans toucher au code — même
+convention que l'aliasing Ollama plus bas (`scripts/rebuild-agent-llm.sh`).
+
+⚠️ **Plusieurs points non encore vérifiés empiriquement** au moment de la
+migration (à valider avant de considérer ce backend pleinement fiable) :
+le nom exact du champ SSE de reasoning émis par TabbyAPI (le fallback dans
+`graph.py` ne gère pour l'instant que les noms connus de llama-server/Ollama),
+le support natif du WebP par ExLlamaV3 (probablement absent,
+`IMAGE_FORMAT_PASSTHROUGH` défaut à PNG par précaution), le budget VRAM réel
+une fois le modèle chargé sur un seul GPU 16 Go, et la justesse de
+`tool_format: qwen3_coder` pour ce modèle précis. Voir le plan d'implémentation
+de cette migration pour le détail complet des risques ouverts.
+
+### Backend alternatif : `llama-server` (llama.cpp)
+
+`llama-server`, buildé depuis le fork
 [YV17labs/llama-cpp-turboquant-webp](services/llama-server/Dockerfile)
 (branche `feature/turboquant-webp`) plutôt que llama.cpp upstream — ce fork
 ajoute le décodage WebP natif (voir Conversion d'images plus bas) et un
-type de cache KV `turbo3` (compression propriétaire à ce fork).
+type de cache KV `turbo3` (compression propriétaire à ce fork). **Non démarré
+par défaut** depuis la migration vers TabbyAPI (voir `docker-compose.yml` pour
+l'activer : `LLM_BASE_URL=http://llama-server:8000/v1` dans `.env`, puis
+`docker compose up -d llama-server`, et repasser
+`IMAGE_FORMAT_PASSTHROUGH=webp`).
 
 Le build, le démarrage ET l'inférence ont été exécutés réellement (GPU +
 accès réseau disponibles), modèle cible chargé (`Qwen3.6-35B-A3B` quant
-`Q5_K_M` + `mmproj-F16`, réparti sur les deux GPU via `--tensor-split`)
-et une conversation complète menée de bout en bout à travers toute la
-stack (`langgraph-agent` → `llama-server`, streaming SSE, balises
-`<think>` correctement ouvertes/fermées, réponse finale correcte) — cinq
-bugs ont été trouvés et corrigés dans ce processus (packaging du build,
-CLI du serveur, format des deltas de raisonnement), voir le tableau des
-bugs plus bas.
+`Q5_K_M`/`UD-Q4_K_XL` + `mmproj-F16`, réparti sur les deux GPU via
+`--tensor-split`) et une conversation complète menée de bout en bout à
+travers toute la stack (`langgraph-agent` → `llama-server`, streaming SSE,
+balises `<think>` correctement ouvertes/fermées, réponse finale correcte).
 
 Commande de démarrage (`services/llama-server/entrypoint.sh`) :
 `--tensor-split 0.55,0.45 --ctx-size 32768 --cache-type-k q8_0
---cache-type-v turbo3 --flash-attn --jinja --mmproj <mmproj> --parallel 1`.
+--cache-type-v turbo3 --flash-attn --jinja --mmproj <mmproj> --parallel 1
+--ubatch-size 128` (ce dernier flag est un contournement permanent d'un
+crash CUDA inter-GPU sous gros lot de prefill, confirmé et documenté en
+détail dans le tableau des bugs plus bas et
+`tests_integration/CUDA-DIAGNOSTIC.md` — c'est la raison de la migration
+vers TabbyAPI comme défaut).
 
-Modèle cible : **Qwen3.6-35B-A3B, quantisation Q5_K_M**, plus un projecteur
-multimodal (`--mmproj`) pour l'entrée image (screen_shot GhostDesk). Fichiers
-attendus dans `./models` (ou `MODELS_HOST_PATH`), noms configurables via
-`LLAMA_MODEL_FILE`/`LLAMA_MMPROJ_FILE` (défauts :
-`Qwen3.6-35B-A3B-Q5_K_M.gguf`/`mmproj-F16.gguf`) — **jamais téléchargés
-automatiquement** : `entrypoint.sh` vérifie leur présence au démarrage du
-conteneur et échoue avec un message clair (sur stderr, avant même de lancer
-`llama-server`) plutôt que de laisser échouer `llama-server` lui-même avec
-une erreur générique de chemin introuvable.
+Modèle : **Qwen3.6-35B-A3B**, plus un projecteur multimodal (`--mmproj`) pour
+l'entrée image. Fichiers `.gguf` attendus dans `./models` (ou
+`MODELS_HOST_PATH`), noms configurables via `LLAMA_MODEL_FILE`/
+`LLAMA_MMPROJ_FILE` — **jamais téléchargés automatiquement** :
+`entrypoint.sh` vérifie leur présence au démarrage du conteneur et échoue
+avec un message clair (sur stderr, avant même de lancer `llama-server`)
+plutôt que de laisser échouer `llama-server` lui-même avec une erreur
+générique de chemin introuvable.
+
+### Backend alternatif : Ollama
 
 vLLM a été retiré du projet : il attend un format de poids HuggingFace natif
 incompatible avec les `.gguf`, et n'apportait rien que llama.cpp ne couvre
 pas ici. Ollama reste disponible comme backend alternatif dans
 `docker-compose.yml` (llama.cpp sous le capot lui aussi, voir ce fichier
-pour l'activer), notamment pour un modèle non couvert par le fork
-turboquant-webp ; penser alors à repasser `IMAGE_FORMAT_PASSTHROUGH=png`
+pour l'activer), notamment pour un modèle non couvert par ExLlamaV3 ou le
+fork turboquant-webp ; penser alors à repasser `IMAGE_FORMAT_PASSTHROUGH=png`
 (voir Conversion d'images plus bas), le décodeur mtmd d'Ollama échouant
 explicitement sur le WebP.
 
@@ -119,12 +181,15 @@ explicitement sur le WebP.
 **Conversion d'images** (`IMAGE_FORMAT_PASSTHROUGH`, variable d'env, défaut
 absent = conversion PNG) : `_to_png_data_uri` reste le chemin par défaut —
 chaque résultat image d'outil (`screen_shot` GhostDesk, WebP natif) est
-systématiquement reconverti en PNG avant transmission au LLM, seul format
-supporté par le décodeur mtmd d'Ollama. `IMAGE_FORMAT_PASSTHROUGH=webp`
-bascule sur `_to_image_data_uri`, qui transmet le WebP brut tel quel (data
-URI directe, aucun passage par Pillow) : à activer avec le backend
-`llama-server` par défaut, dont le fork llama.cpp décode le WebP nativement
-— gain CPU non négligeable sur une boucle capture/clic répétée.
+systématiquement reconverti en PNG avant transmission au LLM. C'est le
+défaut pour le backend TabbyAPI (ExLlamaV3 n'est pas connu pour décoder le
+WebP nativement — à vérifier empiriquement, voir Backend d'inférence
+plus haut) comme pour Ollama (décodeur mtmd, échec explicite sur le WebP).
+`IMAGE_FORMAT_PASSTHROUGH=webp` bascule sur `_to_image_data_uri`, qui
+transmet le WebP brut tel quel (data URI directe, aucun passage par
+Pillow) : à activer uniquement avec le backend alternatif `llama-server`,
+dont le fork llama.cpp décode le WebP nativement — gain CPU non négligeable
+sur une boucle capture/clic répétée.
 
 **Rétention d'images** (`MAX_IMAGES_IN_CONTEXT`, variable d'env, défaut `1`) :
 seules les `MAX_IMAGES_IN_CONTEXT` dernières captures d'écran restent en
@@ -343,7 +408,7 @@ Cette démarche a permis de trouver et corriger les bugs suivants :
 | `langgraph-agent` | observé en usage réel (conversation "va sur wikipedia.org et cherche l'article sur la ville de toulouse, en français", pilotage GhostDesk) : le modèle finissait parfois un tour SANS aucun `tool_calls` structuré ET sans texte de réponse visible — sa tentative d'appel d'outil restait écrite en prose façon Qwen (`<tool_call><function=NOM><parameter=...>`) noyée dans le raisonnement (`reasoning_content`), jamais reconnue comme un vrai tool_calls OpenAI. **Cause racine confirmée** en lisant le parseur du fork (`common/chat-auto-parser-generator.cpp`) : le raisonnement (`<think>...`) est capturé comme texte LIBRE, non contraint par la grammaire, jusqu'à rencontrer `</think>` — la grammaire stricte du tool-calling n'est appliquée qu'APRÈS cette balise. Si le modèle "tente" un appel avant d'avoir fermé `</think>` (observé après un raisonnement anormalement long/répétitif, à rapprocher de la dérive sémantique déjà documentée pour Ollama), la tentative reste piégée dans la zone non contrainte. Confirmé non-déterministe (rejouer le même prompt donne tantôt un `tool_calls` correct, tantôt cet échec) et confirmé résolu par `/no_think` (contourne entièrement ce chemin de code, voir Thinking adaptatif) — mais celui-ci ne s'injecte qu'à partir du tour suivant un tour auto-approuvé, pas sur le tout premier tour d'une tâche, là où le bug a justement été observé la première fois. Sans correctif, l'utilisateur ne voyait que la bulle de raisonnement se refermer sur rien, exactement le symptôme "l'agent s'arrête en plein milieu d'une tâche" déjà documenté pour `MAX_TOOL_ITERATIONS` | Trois mitigations complémentaires (aucune ne corrige la cause côté serveur/modèle, hors de portée ici) : **(1)** `_extract_fallback_tool_call` (`app/graph.py`) reconnaît la syntaxe `<tool_call><function=...>` piégée dans le texte et la reconstruit en tool_calls structuré avant même de compter le tour comme un échec (log `WARNING` à chaque récupération, pour garder la visibilité sur la fréquence réelle du problème) ; **(2)** `retry_empty_answer` reboucle automatiquement sur `call_llm` jusqu'à `MAX_EMPTY_ANSWER_RETRIES` fois (défaut `1`, budget cumulé pour toute la tâche comme `tool_iterations`) quand la reconstruction échoue aussi ; **(3)** au-delà, `has_visible_answer`/`_format_empty_answer_notice` (`app/main.py`) affiche une notice explicite plutôt qu'un message vide. **Confirmé efficace en conditions réelles** : sur 4 tâches indépendantes rejouées après déploiement du correctif, le parseur de secours s'est déclenché 5 fois (`app_launch`, `app_running` ×2, `screen_shot`) et a récupéré l'intention du modèle à chaque fois, sans qu'aucune des 4 tâches n'affiche la notice de repli |
 
 | `ocr-service` | build de l'image réellement exécuté (jusque-là seule la suite de tests, en `OCR_ENGINE=fake`, avait tourné) : trois échecs successifs. **(1)** `libgomp.so.1` introuvable — absent de `python:3.12-slim`, requis dès l'import de paddlepaddle (même classe de bug que `llama-server` ci-dessus). **(2)** une fois corrigé, `ModuleNotFoundError: No module named 'setuptools'` — `paddle.utils.cpp_extension` l'importe inconditionnellement dès `import paddle`, absent par défaut de cette image (seul `pip` y est préinstallé). **(3)** une fois les deux corrigés, crash restant (`Segmentation fault`, puis `double free or corruption`/`munmap_chunk(): invalid pointer` selon le run — symptôme différent à chaque fois selon l'ASLR, signature classique d'une corruption de tas plutôt que d'une dépendance manquante). **Cause racine confirmée par backtrace `gdb`** : `paddlepaddle==2.6.2` embarque sa propre copie de `zlib` dans `libpaddle.so`, avec des symboles globaux non isolés (`inflateReset2`) qui entrent en collision avec `libz.so.1` système dès que `Cython` (importé en cascade par `paddle.utils.cpp_extension`) décompresse quoi que ce soit via le module `zlib` de la stdlib | `libgomp1`/`libgl1`/`libglib2.0-0` (ce dernier duo requis par `cv2`, dépendance transitive de paddleocr) ajoutés au `Dockerfile` ; `setuptools==75.6.0` épinglé dans `requirements.txt` ; `ENV LD_PRELOAD=/lib/x86_64-linux-gnu/libz.so.1` force la résolution vers la bonne bibliothèque, au build ET à l'exécution (import paresseux dans `app/ocr_engine.py`) — revérifié en buildant l'image pour de vrai (téléchargement des modèles PP-OCRv3 au build) puis en déclenchant un vrai appel `read_screen` via `mcp-client` contre GhostDesk : texte réel détecté à l'écran avec coordonnées et scores de confiance |
-| `llama-server` | découvert en rejouant le harnais de baseline Phase 0 de la migration langgraph/langchain-openai/openai (`tests_integration/test_tool_calling_baseline.py`) : une bonne partie des tours (jusqu'à environ la moitié sur une session de 25 générations réelles) se terminaient par la notice de repli `⚠️ Erreur interne pendant la génération, réessayez.` (`except Exception` de `_stream_response`, `app/main.py`) au lieu d'un résultat de tool-calling exploitable — le `<think>` du tour restait parfois même ouvert sans jamais se refermer, la génération ayant été coupée en plein milieu. Persiste à l'identique en espaçant les requêtes de plusieurs secondes avec vérification de santé entre chaque (`_wait_for_llama_health`) : pas un effet du harnais qui martèlerait le serveur. **Cause racine confirmée** dans les logs `llama-server` : un crash GPU dur (`CUDA error: unspecified launch failure` sur `ggml_backend_cuda_device_event_synchronize`, `ggml-cuda.cu:5742`, `cudaEventSynchronize((cudaEvent_t)event->context)`), systématiquement sur `device 1` (RTX 5060 Ti, Blackwell) et systématiquement juste après une ligne `restored context checkpoint` (ou parfois juste après un `W find_slot: non-consecutive token position ... for sequence 0 with 256/512 new tokens`, qui précède aussi une restauration) — pointe vers le mécanisme de checkpoints de contexte de ce fork (`prompt cache is enabled`, cf. [llama.cpp#16391](https://github.com/ggml-org/llama.cpp/pull/16391)), probablement incompatible avec ce rig double-GPU hétérogène (Ada `RTX 4070 Ti SUPER` + Blackwell `RTX 5060 Ti`, `--tensor-split 0.55,0.45`) lors de la resynchronisation CUDA inter-GPU nécessaire pour restaurer un checkpoint. `llama-server` se relance seul après coup (superviseur interne `cmd_child_to_router`), d'où l'absence de panne totale visible côté utilisateur — seulement des tours qui échouent au hasard. **Contournement `--cache-ram 0` testé et INSUFFISANT** : réduit la fréquence (~52 % de tours touchés avant → ~40 % après, sur deux sessions de 25 générations, cf. `tests_integration/BASELINE.md`) mais n'élimine pas le crash — les logs montrent encore `restored context checkpoint` juste avant chaque `CUDA error` avec `--cache-ram 0` actif, donc `--cache-ram` (qui ne borne que le cache RAM du prompt cache *inter-requêtes*) ne désactive pas le mécanisme de checkpoint *intra-génération* qui semble être le vrai déclencheur | **Non résolu à ce jour, hors périmètre de cette migration** (bug driver/CUDA de `llama-server`/ce fork llama.cpp, aucun rapport avec le trio Python langgraph/langchain-openai/openai en cours de montée de version). **Pour qui reprend ce diagnostic** : commande de lancement exacte (`services/llama-server/entrypoint.sh`, vérifiable en direct via `docker compose exec llama-server cat /proc/1/cmdline`) : `--tensor-split 0.55,0.45 --ctx-size 32768 --cache-type-k q8_0 --cache-type-v turbo3 --flash-attn on --jinja --parallel 1`, modèle `Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf` + `mmproj-F16.gguf`. Pistes non encore testées : désactiver complètement le checkpointing de contexte (pas seulement son cache RAM — chercher un flag dédié dans ce fork, ex. équivalent à `--no-context-shift` ou un plafond de `n_ctx_checkpoints`/nombre de checkpoints à 0/1) ; forcer un seul GPU (`--tensor-split 1,0` ou `CUDA_VISIBLE_DEVICES` limité à `device 0`, l'Ada) pour confirmer que c'est bien l'hétérogénéité Ada/Blackwell qui casse la resynchronisation d'event CUDA plutôt qu'un bug générique du fork ; version de driver NVIDIA et de CUDA runtime (host) à comparer avec la matrice de compatibilité Blackwell (sm_120) de ce fork. `LLAMA_EXTRA_ARGS` (`.env`, voir section Observabilité) permet de tester n'importe quel flag sans toucher au code, à condition de **rebuilder l'image** après toute modification d'`entrypoint.sh` (`COPY entrypoint.sh` au build, pas de bind mount — `docker compose build llama-server` avant `up -d`) |
+| `llama-server` | découvert en rejouant le harnais de baseline Phase 0 de la migration langgraph/langchain-openai/openai (`tests_integration/test_tool_calling_baseline.py`) : une bonne partie des tours (jusqu'à environ la moitié sur une session de 25 générations réelles) se terminaient par la notice de repli `⚠️ Erreur interne pendant la génération, réessayez.` (`except Exception` de `_stream_response`, `app/main.py`) au lieu d'un résultat de tool-calling exploitable — crash GPU dur (`CUDA error`, `device 1`/Blackwell) capturé dans les logs `llama-server`, qui se relance seul après coup (superviseur interne), d'où l'absence de panne totale visible côté utilisateur. **Cause confirmée** par une matrice d'expériences dédiée (`tests_integration/CUDA-DIAGNOSTIC.md`, historique complet) : chemin de copie/synchronisation **inter-GPU** du fork sous gros lot de prefill (`--ubatch-size` par défaut 512), sur `--tensor-split` hétérogène (Ada + Blackwell) — confirmé par une paire de runs mono-GPU stables en isolation (Blackwell seule et Ada seule, aucun crash sous charge équivalente) et par un `Xid 31` (MMU Fault, moteur copy-engine `CE4`) au `dmesg`, signature logicielle plutôt que matérielle. Alimentation/matériel explicitement exonérés (recâblage et plafonnement de puissance sans effet) | **Contournement adopté en production** : `--ubatch-size 128` (au lieu du défaut 512), désormais permanent dans `entrypoint.sh` — revérifié par un run de validation complet (25/25 générations réussies, prompt set avec images, 0 crash). Coût mesuré : environ **+34 % de latence par génération réussie** (~13-17 s au lieu de ~13 s, chiffrage détaillé et biais de mesure discutés dans `CUDA-DIAGNOSTIC.md`) — compensé par la disparition des tours en échec complet (~40-50 % avant correctif). Seuil encadré : **stable à ≤256** (75 générations cumulées sans crash entre 128 et 256), **crash confirmé à 512** — `256` écarté malgré sa stabilité, pas de gain net justifiant de réduire la marge de sécurité vs 128. **Statut : issue amont en préparation** (bug probablement upstream `ggml-org/llama.cpp`, repro vanilla en cours pour router l'issue au bon dépôt) |
 
 Une fausse alerte a aussi été rencontrée puis écartée : un test utilisait un
 monkeypatch global de `httpx.AsyncClient` pour simuler les appels HTTP vers

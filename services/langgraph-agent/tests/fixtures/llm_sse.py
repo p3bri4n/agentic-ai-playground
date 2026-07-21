@@ -118,3 +118,21 @@ def reasoning_response(reasoning_tokens, content_tokens, field="reasoning"):
         + [({"content": tok}, None) for tok in content_tokens]
         + [({}, "stop")]
     )
+
+
+def reasoning_response_combined_final_chunk(reasoning_tokens, final_content, field="reasoning_content"):
+    """
+    Variante de reasoning_response où le DERNIER chunk contient à la fois la
+    fin du raisonnement ET le début/toute la réponse finale dans le même
+    delta ({field: ..., "content": ...}) — observé en conditions réelles
+    avec TabbyAPI/ExLlamaV3 (llama-server/Ollama séparaient toujours les
+    deux en chunks distincts). Voir app/graph.py,
+    _convert_delta_with_reasoning : sans gérer ce cas, la vraie réponse
+    était silencieusement jetée.
+    """
+    return sse_body(
+        [({"role": "assistant", "content": ""}, None)]
+        + [({field: tok}, None) for tok in reasoning_tokens[:-1]]
+        + [({field: reasoning_tokens[-1], "content": final_content}, None)]
+        + [({}, "stop")]
+    )
