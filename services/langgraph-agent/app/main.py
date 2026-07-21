@@ -218,6 +218,7 @@ async def _resolve_run(request: ChatCompletionRequest):
         "session_grants": [],
         "grant_session": False,
         "empty_answer_retries": 0,
+        "slash_command_image_shown": False,
     }
     return config, run_input
 
@@ -245,6 +246,28 @@ def _sse_chunk(completion_id: str, model: str, delta: dict, finish_reason: Optio
         "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
     }
     return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
+# Taille max d'un morceau de contenu par chunk SSE. Nécessaire depuis que
+# certains contenus envoyés d'un seul bloc (notices, et surtout une image en
+# data URI base64 pour une commande slash sur un outil comme screen_shot —
+# voir app/graph.py, run_slash_command_direct) peuvent dépasser largement la
+# taille d'un token de streaming LLM normal. Sans ce découpage, un client
+# HTTP avec une limite de taille de ligne (ex. aiohttp côté Open WebUI,
+# 131072 octets par défaut) rejette la réponse en bloc avec une erreur peu
+# parlante ("Got more than 131072 bytes when reading") plutôt que de la
+# recevoir en plusieurs petits morceaux comme le ferait un vrai streaming
+# token-par-token.
+_SSE_CONTENT_CHUNK_SIZE = 8192
+
+
+def _sse_content_chunks(completion_id: str, model: str, content: str):
+    if not content:
+        return
+    for i in range(0, len(content), _SSE_CONTENT_CHUNK_SIZE):
+        piece = content[i : i + _SSE_CONTENT_CHUNK_SIZE]
+        delta = {"role": "assistant", "content": piece} if i == 0 else {"content": piece}
+        yield _sse_chunk(completion_id, model, delta)
 
 
 async def _stream_response(config: dict, run_input: Optional[dict], model: str):
@@ -300,7 +323,8 @@ async def _stream_response(config: dict, run_input: Optional[dict], model: str):
         snapshot = await agent_graph.aget_state(config)
         if snapshot.next:
             pending = closing_prefix + _format_approval_request(snapshot.values["messages"][-1].tool_calls)
-            yield _sse_chunk(completion_id, model, {"role": "assistant", "content": pending})
+            for chunk in _sse_content_chunks(completion_id, model, pending):
+                yield chunk
         else:
             last_message = snapshot.values["messages"][-1]
             if getattr(last_message, "tool_calls", None):
@@ -310,13 +334,34 @@ async def _stream_response(config: dict, run_input: Optional[dict], model: str):
                 # sans qu'aucune erreur ni pause d'approbation ne l'explique
                 # (voir MAX_TOOL_ITERATIONS, app/graph.py).
                 notice = closing_prefix + _format_iteration_limit_notice(last_message.tool_calls)
-                yield _sse_chunk(completion_id, model, {"role": "assistant", "content": notice})
+                for chunk in _sse_content_chunks(completion_id, model, notice):
+                    yield chunk
             elif not has_visible_answer(full_streamed + closing_prefix):
-                # Voir _format_empty_answer_notice : aucun tool_calls en attente
-                # ET rien de visible hors <think> — même symptôme "agent
-                # silencieux" que ci-dessus, cause différente.
-                notice = closing_prefix + _format_empty_answer_notice()
-                yield _sse_chunk(completion_id, model, {"role": "assistant", "content": notice})
+                if has_visible_answer(last_message.content):
+                    # Le message final PERSISTÉ a bien une réponse visible,
+                    # mais elle n'a jamais transité par on_chat_model_stream
+                    # ci-dessus (ex. commande slash — app/graph.py,
+                    # run_slash_command_direct — qui n'invoque jamais le LLM
+                    # et ne produit donc aucun chunk de contenu ici). Sans ce
+                    # cas, cette réponse pourtant bien présente en base serait
+                    # remplacée à tort par la notice "réponse non
+                    # exploitable" ci-dessous, qui suppose que rien n'a
+                    # streamé ET que rien n'existe. Découpée en plusieurs
+                    # chunks (_sse_content_chunks) : peut contenir une image
+                    # en data URI base64 (screen_shot via commande slash),
+                    # largement au-dessus de la limite de taille de ligne de
+                    # certains clients HTTP (aiohttp côté Open WebUI).
+                    visible = _render_visible_answer(snapshot.values)
+                    for chunk in _sse_content_chunks(completion_id, model, visible):
+                        yield chunk
+                else:
+                    # Voir _format_empty_answer_notice : aucun tool_calls en
+                    # attente ET rien de visible hors <think>, ni ici ni dans
+                    # le message persisté — même symptôme "agent silencieux"
+                    # que ci-dessus, cause différente.
+                    notice = closing_prefix + _format_empty_answer_notice()
+                    for chunk in _sse_content_chunks(completion_id, model, notice):
+                        yield chunk
     except Exception:
         # Sans ce filet, une erreur ici (llama-server qui coupe la connexion
         # en plein streaming, checkpointer indisponible...) fait mourir ce
@@ -340,6 +385,38 @@ async def _stream_response(config: dict, run_input: Optional[dict], model: str):
     yield "data: [DONE]\n\n"
 
 
+def _render_visible_answer(snapshot_values: dict) -> str:
+    """
+    Reconstruit le texte final visible pour CE tour à partir de l'état
+    persisté — si slash_command_image_shown est vrai (voir app/graph.py,
+    run_slash_command_direct : commande slash sur un outil image-only, ex.
+    /screen_shot), ajoute l'image du message "human" juste avant en markdown
+    à la réponse renvoyée ICI UNIQUEMENT. Jamais persisté sous cette forme :
+    le message assistant stocké reste léger (texte seul), pour ne pas
+    retokeniser le base64 comme du texte brut lors d'un futur tour LLM sur
+    ce thread — sans cette séparation, une seule capture d'écran
+    (MAX_IMAGES_IN_CONTEXT=1 ne trimme jamais LA dernière image) suffisait à
+    elle seule à dépasser 32768 tokens dès le tour LLM suivant (bug réel
+    observé via Open WebUI). Le signal explicite slash_command_image_shown
+    (plutôt que deviner depuis la forme des messages) est nécessaire : un
+    tour LLM normal qui a lui-même analysé une image via vision produit
+    aussi un AIMessage juste après un message image, sans qu'il faille lui
+    rajouter l'image une seconde fois (elle est déjà correctement décrite).
+    """
+    messages = snapshot_values["messages"]
+    text = messages[-1].content
+    if snapshot_values.get("slash_command_image_shown") and len(messages) >= 2:
+        prev = messages[-2]
+        if getattr(prev, "type", None) == "human" and isinstance(prev.content, list):
+            image_urls = [
+                b["image_url"]["url"] for b in prev.content if isinstance(b, dict) and b.get("type") == "image_url"
+            ]
+            if image_urls:
+                images_md = "\n".join(f"![résultat outil]({url})" for url in image_urls)
+                text = f"{text}\n\n{images_md}" if text else images_md
+    return text
+
+
 async def _current_answer(config: dict) -> str:
     snapshot = await agent_graph.aget_state(config)
     if snapshot.next:
@@ -349,7 +426,7 @@ async def _current_answer(config: dict) -> str:
         return _format_iteration_limit_notice(last_message.tool_calls)
     if not has_visible_answer(last_message.content):
         return _format_empty_answer_notice()
-    return last_message.content
+    return _render_visible_answer(snapshot.values)
 
 
 @app.post("/pending")

@@ -361,6 +361,17 @@ class AgentState(TypedDict):
     # MAX_EMPTY_ANSWER_RETRIES plus haut) — budget cumulé pour toute la
     # tâche, comme tool_iterations, jamais remis à zéro entre deux retries.
     empty_answer_retries: int
+    # Signal explicite (pas déduit de la forme des messages, trop fragile —
+    # un tour LLM normal qui a analysé une image via vision produit aussi un
+    # AIMessage juste après un message image) : True uniquement quand le
+    # dernier message vient de run_slash_command_direct ET portait une
+    # image, pour que main.py sache reconstruire l'affichage de l'image pour
+    # CE tour (_render_visible_answer) sans la persister en base64 dans le
+    # message assistant lui-même. call_llm le remet à False à chaque appel :
+    # c'est le seul autre nœud qui termine un tour sur un AIMessage visible,
+    # donc la seule remise à zéro nécessaire pour que ce signal reste correct
+    # quelle que soit la façon dont ce tour se termine.
+    slash_command_image_shown: bool
 
 
 # Plafond de tokens par TOUR (un seul appel LLM), pas pour la conversation
@@ -671,7 +682,19 @@ async def call_llm(state: AgentState) -> dict:
             )
             merged.tool_calls = [fallback]
 
-    return {"messages": [merged], "think_opened": think["opened"], "think_closed": think["closed"]}
+    return {
+        "messages": [merged],
+        "think_opened": think["opened"],
+        "think_closed": think["closed"],
+        # Remis à False à chaque appel : c'est le seul autre nœud qui
+        # termine un tour sur un AIMessage visible (voir
+        # AgentState.slash_command_image_shown) — sans cette remise à zéro,
+        # un tour LLM normal qui suit une image (ex. vision sur screen_shot
+        # décidé par le modèle) réutiliserait à tort la reconstruction
+        # d'image de main.py, dupliquant l'image dans sa propre réponse déjà
+        # correcte.
+        "slash_command_image_shown": False,
+    }
 
 
 def has_tool_calls(state: AgentState) -> str:
@@ -946,6 +969,13 @@ def _format_tool_result_as_text(result: dict) -> str:
     """Extrait le texte des blocs {"type": "text", ...} du résultat d'outil ;
     à défaut (résultat vide, erreur, forme inattendue), JSON indenté brut."""
     blocks = result.get("content", []) if isinstance(result, dict) else []
+    if isinstance(blocks, str):
+        # _split_image_blocks retombe sur ce placeholder textuel quand TOUS
+        # les blocs du résultat étaient des images (ex. screen_shot seul) —
+        # ce n'est déjà pas une liste de blocs, le renvoyer tel quel plutôt
+        # que d'itérer sur ses caractères (aucun n'est un dict "text", donc
+        # ça retombait silencieusement sur un dump JSON de tout le dict).
+        return blocks
     texts = [b.get("text", "") for b in blocks if isinstance(b, dict) and b.get("type") == "text"]
     if texts:
         return "\n".join(texts)
@@ -1031,11 +1061,27 @@ async def run_slash_command_direct(state: AgentState, config: dict) -> dict:
                 ],
             }
         )
+    # Le message "user" ci-dessus (bloc image_url standard) est ce que voit
+    # un futur tour LLM sur ce thread — format efficace pour un modèle
+    # multimodal (coût fixe par image côté API), PAS de base64 embarqué en
+    # texte brut dans le message assistant final : un essai précédent
+    # embarquait l'image en markdown directement ici, ce qui la faisait
+    # certes apparaître dans CETTE réponse, mais la persistait aussi dans
+    # l'historique sous forme de texte — tokenisée comme du texte ordinaire
+    # (des dizaines de milliers de tokens pour une seule capture) au lieu du
+    # coût fixe d'un vrai bloc image_url, faisant exploser le contexte
+    # (32768 tokens dépassés) dès le tour LLM suivant sur ce thread, même
+    # avec une seule image (MAX_IMAGES_IN_CONTEXT=1 ne trimme jamais LA
+    # dernière image, donc aucune protection possible sous cette forme).
+    # L'affichage de l'image POUR CE TOUR est reconstruit côté main.py
+    # (_render_visible_answer) à partir de ce message "user" séparé, jamais
+    # en la persistant une seconde fois ici.
     new_messages.append({"role": "assistant", "content": _format_tool_result_as_text(result)})
 
     return {
         "messages": new_messages,
         "tool_iterations": state["tool_iterations"] + 1,
+        "slash_command_image_shown": bool(images),
     }
 
 

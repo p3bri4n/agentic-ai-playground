@@ -42,6 +42,10 @@ def mock_side_services():
                         },
                         {
                             "type": "function",
+                            "function": {"name": "screen_shot", "description": "", "parameters": {}},
+                        },
+                        {
+                            "type": "function",
                             "function": {"name": "key_type", "description": "", "parameters": {}},
                         },
                     ]
@@ -155,6 +159,59 @@ async def test_unknown_slash_like_message_falls_back_to_normal_flow(mock_side_se
     assert not call_route.called
     assert llm_route.called
     assert result["messages"][-1].content == "Chemin recu."
+
+
+@pytest.mark.asyncio
+async def test_slash_command_image_only_result_persists_light_text_only(mock_side_services):
+    """
+    Non-régression (bug réel signalé via Open WebUI) : /screen_shot (résultat
+    100% image, aucun bloc texte) affichait littéralement
+    '{"content": "(voir image ci-dessous)"}' au lieu de l'image. Cause :
+    _format_tool_result_as_text n'attendait qu'une LISTE de blocs dans
+    result["content"], alors que _split_image_blocks y met le placeholder
+    textuel "(voir image ci-dessous)" (une chaîne, pas une liste) quand tous
+    les blocs étaient des images — itérer sur les caractères d'une chaîne ne
+    trouve jamais de bloc "text", d'où le repli sur un dump JSON brut.
+
+    Le message assistant PERSISTÉ doit rester léger (texte seul, jamais
+    l'image elle-même en base64) : un essai précédent l'embarquait ici, ce
+    qui affichait bien l'image mais la faisait aussi retokeniser comme du
+    texte brut lors d'un futur tour LLM sur ce thread, faisant exploser le
+    contexte (voir test_render_visible_answer_appends_image_for_this_turn_
+    only pour la reconstruction, propre à main.py, qui affiche l'image sans
+    la persister sous cette forme).
+    """
+    import base64
+    import io
+
+    from PIL import Image
+
+    import app.graph as g
+
+    png_buf = io.BytesIO()
+    Image.new("RGB", (2, 2), color="blue").save(png_buf, format="PNG")
+    png_b64 = base64.b64encode(png_buf.getvalue()).decode()
+
+    mock_side_services.post("http://fake-mcp-client/call").mock(
+        return_value=httpx.Response(
+            200, json={"content": [{"type": "image", "data": png_b64, "mimeType": "image/png"}]}
+        )
+    )
+    g.agent_graph = g.build_graph()
+
+    state = {"messages": [{"role": "user", "content": "/screen_shot"}], "tool_iterations": 0, "approved": None}
+    result = await g.agent_graph.ainvoke(state, CONFIG)
+
+    final = result["messages"][-1].content
+    assert '{"content"' not in final  # plus de dump JSON brut
+    assert final == "(voir image ci-dessous)"
+    assert png_b64 not in final  # jamais le base64 dans le message persisté
+
+    image_message = next(
+        m for m in result["messages"] if getattr(m, "type", None) == "human" and isinstance(m.content, list)
+    )
+    assert image_message.content[0]["type"] == "image_url"
+    assert png_b64 in image_message.content[0]["image_url"]["url"]
 
 
 @pytest.mark.asyncio
