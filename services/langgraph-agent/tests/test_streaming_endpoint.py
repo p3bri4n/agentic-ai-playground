@@ -527,7 +527,7 @@ async def test_non_streaming_endpoint_resumes_after_approval_reply(mock_side_ser
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         first = await client.post(
             "/v1/chat/completions",
-            json={"model": "agent-llm", "messages": [{"role": "user", "content": "Question ?"}], "stream": False},
+            json={"model": "agent-llm", "messages": [{"role": "user", "content": "Question ? Site : http://example.com"}], "stream": False},
         )
         assert "Approbation requise" in first.json()["choices"][0]["message"]["content"]
 
@@ -538,7 +538,7 @@ async def test_non_streaming_endpoint_resumes_after_approval_reply(mock_side_ser
             json={
                 "model": "agent-llm",
                 "messages": [
-                    {"role": "user", "content": "Question ?"},
+                    {"role": "user", "content": "Question ? Site : http://example.com"},
                     {"role": "assistant", "content": first.json()["choices"][0]["message"]["content"]},
                     {"role": "user", "content": "approuver"},
                 ],
@@ -578,7 +578,7 @@ async def test_approve_endpoint_resumes_without_text_reply(mock_side_services):
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         first = await client.post(
             "/v1/chat/completions",
-            json={"model": "agent-llm", "messages": [{"role": "user", "content": "Question ?"}], "stream": False},
+            json={"model": "agent-llm", "messages": [{"role": "user", "content": "Question ? Site : http://example.com"}], "stream": False},
         )
         approval_text = first.json()["choices"][0]["message"]["content"]
         assert "Approbation requise" in approval_text
@@ -587,7 +587,7 @@ async def test_approve_endpoint_resumes_without_text_reply(mock_side_services):
             "/approve",
             json={
                 "messages": [
-                    {"role": "user", "content": "Question ?"},
+                    {"role": "user", "content": "Question ? Site : http://example.com"},
                     {"role": "assistant", "content": approval_text},
                 ],
                 "approved": True,
@@ -605,7 +605,7 @@ async def test_approve_endpoint_resumes_without_text_reply(mock_side_services):
             json={
                 "model": "agent-llm",
                 "messages": [
-                    {"role": "user", "content": "Question ?"},
+                    {"role": "user", "content": "Question ? Site : http://example.com"},
                     {"role": "assistant", "content": "Resultat: 42."},
                     {"role": "user", "content": "Autre question ?"},
                 ],
@@ -615,7 +615,7 @@ async def test_approve_endpoint_resumes_without_text_reply(mock_side_services):
 
     assert second.json()["choices"][0]["message"]["content"] == "Autre reponse."
 
-    thread_id = main_mod._derive_thread_id([type("M", (), {"role": "user", "content": "Question ?"})()])
+    thread_id = main_mod._derive_thread_id([type("M", (), {"role": "user", "content": "Question ? Site : http://example.com"})()])
     snapshot = await g.agent_graph.aget_state({"configurable": {"thread_id": thread_id}})
     # human1, AI(tool_call), tool, AI(final), human2, AI(autre) : exactement 6, aucun doublon
     assert len(snapshot.values["messages"]) == 6
@@ -818,11 +818,11 @@ async def test_streaming_endpoint_resumes_after_approval_reply(mock_side_service
 
     transport = httpx.ASGITransport(app=main_mod.app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        approval_text = await _stream_contents(client, [{"role": "user", "content": "Question ?"}])
+        approval_text = await _stream_contents(client, [{"role": "user", "content": "Question ? Site : http://example.com"}])
         final_text = await _stream_contents(
             client,
             [
-                {"role": "user", "content": "Question ?"},
+                {"role": "user", "content": "Question ? Site : http://example.com"},
                 {"role": "assistant", "content": approval_text},
                 {"role": "user", "content": "approuver"},
             ],
@@ -863,11 +863,11 @@ async def test_streaming_endpoint_reopens_think_tag_after_approval_resume(mock_s
 
     transport = httpx.ASGITransport(app=main_mod.app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        approval_text = await _stream_contents(client, [{"role": "user", "content": "Question ?"}])
+        approval_text = await _stream_contents(client, [{"role": "user", "content": "Question ? Site : http://example.com"}])
         final_text = await _stream_contents(
             client,
             [
-                {"role": "user", "content": "Question ?"},
+                {"role": "user", "content": "Question ? Site : http://example.com"},
                 {"role": "assistant", "content": approval_text},
                 {"role": "user", "content": "approuver"},
             ],

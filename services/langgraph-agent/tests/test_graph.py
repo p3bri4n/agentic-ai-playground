@@ -329,7 +329,7 @@ async def test_approval_resumes_and_calls_mcp_client(mock_side_services):
     )
     g.agent_graph = g.build_graph()
 
-    state = {"messages": [{"role": "user", "content": "Question ?"}], "tool_iterations": 0, "approved": None}
+    state = {"messages": [{"role": "user", "content": "Question ? Site : http://example.com"}], "tool_iterations": 0, "approved": None}
     await g.agent_graph.ainvoke(state, CONFIG)
 
     await g.agent_graph.aupdate_state(CONFIG, {"approved": True})
@@ -387,7 +387,7 @@ async def test_tool_call_loop_resolves_and_does_not_duplicate_messages(mock_side
     ]
     g.agent_graph = g.build_graph()
 
-    state = {"messages": [{"role": "user", "content": "Question ?"}], "tool_iterations": 0, "approved": None}
+    state = {"messages": [{"role": "user", "content": "Question ? Site : http://example.com"}], "tool_iterations": 0, "approved": None}
     await g.agent_graph.ainvoke(state, CONFIG)
     await g.agent_graph.aupdate_state(CONFIG, {"approved": True})
     result = await g.agent_graph.ainvoke(None, CONFIG)

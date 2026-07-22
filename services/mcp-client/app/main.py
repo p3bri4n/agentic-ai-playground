@@ -40,8 +40,17 @@ SERVERS = {
             args=[
                 "run", "-i", "--rm",
                 "-v", f"{WORKSPACE_HOST_PATH}:/projects",
+                # Volume PARTAGÉ en LECTURE SEULE avec playwright-mcp (voir
+                # docker-compose.yml, --output-dir) : donne à l'agent un
+                # chemin de lecture DOCUMENTÉ pour un fichier téléchargé par
+                # le navigateur, plutôt que de deviner un chemin interne au
+                # conteneur playwright-mcp (voir HISTORY.md "Phase
+                # 1d-révisée", T5). ":ro" car ce serveur ne doit jamais
+                # pouvoir écrire dans les téléchargements de l'agent web.
+                "-v", "agent-downloads:/downloads:ro",
                 os.environ.get("MCP_FILESYSTEM_IMAGE", "mcp/filesystem:latest"),
                 "/projects",
+                "/downloads",
             ],
         ),
     },

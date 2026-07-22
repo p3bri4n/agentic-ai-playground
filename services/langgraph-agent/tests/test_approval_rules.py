@@ -128,6 +128,15 @@ def test_session_grant_still_applies_after_rule_resolution(monkeypatch):
     assert policy.effective_tier("browser_navigate", {}, session_grants=["browser_navigate"]) == policy.TIER_REVERSIBLE
 
 
+@pytest.mark.parametrize("tool_name", ["browser_run_code_unsafe", "browser_evaluate"])
+def test_never_grantable_tools_stay_sensitive_despite_session_grant(tool_name):
+    """Phase 1d-révisée (voir HISTORY.md, T5) : exécution de code arbitraire
+    dans la page est une élévation, pas une primitive de lecture — un grant
+    de session ne doit JAMAIS l'assouplir, contrairement au reste des outils
+    TIER_SENSITIVE (voir NEVER_GRANTABLE_TOOLS)."""
+    assert policy.effective_tier(tool_name, {}, session_grants=[tool_name]) == policy.TIER_SENSITIVE
+
+
 # ─────────────────────────────────────────────────────────────────────────
 # Test d'intégration : routage réel dans le graphe
 # ─────────────────────────────────────────────────────────────────────────

@@ -102,6 +102,17 @@ _DEFAULT_TIER_REVERSIBLE = {
 # que cette exception saute aux yeux à la relecture.
 _DEFAULT_TIER_READ.discard("clipboard_get")
 
+# Jamais accordable pour la session (Phase 1d-révisée, voir HISTORY.md, T5) :
+# exécution de code arbitraire dans la page (JS non contraint) — une
+# élévation, pas une primitive de lecture, quel que soit le nombre de fois
+# où un humain l'a déjà approuvée dans ce thread. Ces deux outils restent
+# TIER_SENSITIVE par défaut (absents de toute liste ci-dessus) ; ce
+# qu'ajoute NEVER_GRANTABLE_TOOLS est l'interdiction de l'assouplissement
+# normalement permis par un grant de session (voir effective_tier) —
+# "approuver pour la session" reste sans effet sur ces deux-là : chaque
+# appel requiert une approbation explicite, individuelle.
+NEVER_GRANTABLE_TOOLS = {"browser_run_code_unsafe", "browser_evaluate"}
+
 
 def _load_tier_override(env_var: str, default: set) -> set:
     raw = os.environ.get(env_var)
@@ -153,7 +164,12 @@ def effective_tier(tool_name: str, args=None, session_grants=None) -> str:
     """
     rule_tier = _match_rules(tool_name, args or {})
     resolved = rule_tier if rule_tier is not None else tool_tier(tool_name)
-    if resolved == TIER_SENSITIVE and session_grants and tool_name in session_grants:
+    if (
+        resolved == TIER_SENSITIVE
+        and session_grants
+        and tool_name in session_grants
+        and tool_name not in NEVER_GRANTABLE_TOOLS
+    ):
         return TIER_REVERSIBLE
     return resolved
 

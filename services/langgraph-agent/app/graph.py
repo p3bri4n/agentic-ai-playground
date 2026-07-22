@@ -32,6 +32,7 @@ redémarre (acceptable pour un usage local, voir README).
 
 import base64
 import contextvars
+import difflib
 import io
 import logging
 import math
@@ -41,6 +42,7 @@ import re
 import shlex
 import uuid
 from typing import Annotated, Optional, TypedDict
+from urllib.parse import urljoin
 
 import httpx
 import langchain_openai.chat_models.base as _openai_base
@@ -123,6 +125,238 @@ LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "http://tabbyapi:5000/v1")
 CONTEXT_MANAGER_URL = os.environ.get("CONTEXT_MANAGER_URL", "http://context-manager:8002")
 SKILL_MANAGER_URL = os.environ.get("SKILL_MANAGER_URL", "http://skill-manager:8001")
 MCP_CLIENT_URL = os.environ.get("MCP_CLIENT_URL", "http://mcp-client:8003")
+
+# Garde-fou fabrication d'URL (Phase 1, voir PLAN.md/HISTORY.md — cible n°1
+# du point zéro Phase 0 : l'agent invente régulièrement des URL plausibles
+# jamais observées — page-4.html sur un catalogue à 3 pages, un chemin de
+# recherche inexistant... — plutôt que de suivre un lien réel du DOM).
+BROWSER_NAVIGATE_GUARDRAIL = os.environ.get("BROWSER_NAVIGATE_GUARDRAIL", "true").lower() == "true"
+
+# Feedback gradué (Phase 1c, voir HISTORY.md) : la 1b (liste complète des
+# liens à CHAQUE rejet) a fait reculer T4/T7/T8 par rapport à la 1a — la
+# liste complète était redondante (déjà dans le snapshot structuré) et
+# alourdissait chaque rejet. Trois paliers par NOMBRE DE TENTATIVES
+# fabriquées pour cette tâche (pas par sous-tâche — la Phase 1 complète,
+# pas encore faite, introduira ce découpage plus fin) :
+#   1-2  : message minimal, aucune liste (le snapshot l'a déjà).
+#   3..LIMIT-1 : + les quelques liens les plus proches de l'URL fabriquée
+#                (aide ciblée, pas un annuaire).
+#   >=LIMIT : le feedback change de nature — pousse vers une conclusion
+#             honnête d'absence plutôt que vers une énième supposition
+#             (pont vers T7 : l'obstination devient un aveu d'échec légitime).
+FABRICATION_LIMIT = int(os.environ.get("FABRICATION_LIMIT", "5"))
+
+def _fabrication_feedback(fabricated_url: str, attempt_number: int, page_links: list) -> str:
+    if attempt_number >= FABRICATION_LIMIT:
+        # Plafond (Phase 1c) : redirection conditionnelle vers des "candidats
+        # forts" tentée en Phase 1d puis SUSPENDUE (voir HISTORY.md) —
+        # l'hypothèse motivant ce branchement (0a, vérification d'archive
+        # T5/T8) n'a pas été confirmée par les séquences réellement
+        # observées. Revient au message inconditionnel de 1c : au plafond,
+        # conclure à l'absence est une réponse valide, point final. Le vrai
+        # correctif T5 vit maintenant côté infra (volume de téléchargement
+        # dédié, voir HISTORY.md "Phase 1d-révisée") plutôt que dans une
+        # heuristique de similarité sur ce feedback.
+        return (
+            f"URL non observée (tentative n°{attempt_number}). Plusieurs tentatives vers des URL "
+            "inexistantes. Si la cible ne figure dans aucune page observée, conclure qu'elle "
+            "est introuvable est une réponse valide — ne continue pas à deviner des chemins."
+        )
+    if attempt_number >= 3:
+        closest = difflib.get_close_matches(fabricated_url, page_links, n=8, cutoff=0.0)[:8]
+        liens_txt = "\n".join(f"- {u}" for u in closest) or "(aucun lien connu pour l'instant)"
+        return (
+            f"URL non observée dans la page (tentative n°{attempt_number}) — utilise un lien "
+            f"réellement présent dans le snapshot. Liens les plus proches de ce que tu cherchais :\n{liens_txt}"
+        )
+    return (
+        "URL non observée sur cette page. Utilise un lien réellement présent dans le snapshot "
+        "(l'inventaire complet des liens y figure déjà) — ne devine pas un chemin."
+    )
+
+
+_URL_RE = re.compile(r"https?://[^\s'\")\]]+")
+_SNAPSHOT_URL_LINE_RE = re.compile(r"/url:\s*(\S+)")
+_PAGE_URL_LINE_RE = re.compile(r"Page URL:\s*(\S+)")
+
+# Borne de sortie d'outil (Phase 1) : un résultat d'outil browser_* trop
+# volumineux (page réelle dense, voir T8/T11 — dépassement de contexte LLM
+# découvert en conditions réelles, voir HISTORY.md) est tronqué à la SOURCE,
+# avant d'entrer dans l'historique de conversation. Distinct de la rétention
+# d'images (Phase 2, MAX_IMAGES_IN_CONTEXT) : ceci borne la taille d'UN SEUL
+# résultat d'outil, pas l'historique complet.
+BROWSER_TOOL_OUTPUT_MAX_CHARS = int(os.environ.get("BROWSER_TOOL_OUTPUT_MAX_CHARS", "8000"))
+
+
+def _clean_url(url: str) -> str:
+    """Retire la ponctuation de fin de phrase accolée par erreur au match
+    (ex. "http://exemple.com/page.html," dans une phrase française) — une
+    URL réelle ne se termine normalement jamais par ces caractères."""
+    return url.rstrip(",.;:")
+
+
+def _extract_urls(text: str, base_url: Optional[str]) -> set:
+    """URL absolues et relatives (résolues via base_url) trouvées dans un
+    texte de résultat d'outil browser_* (snapshot Playwright au format YAML,
+    "- /url: ...", ou texte libre contenant des URL absolues)."""
+    found = {_clean_url(m) for m in _URL_RE.findall(text)}
+    for match in _SNAPSHOT_URL_LINE_RE.findall(text):
+        match = _clean_url(match)
+        found.add(urljoin(base_url, match) if base_url else match)
+    return found
+
+
+def _extract_page_url(text: str) -> Optional[str]:
+    match = _PAGE_URL_LINE_RE.search(text)
+    return match.group(1) if match else None
+
+
+def _task_scope_urls(messages: list) -> set:
+    """Racines du périmètre de la tâche : URL mentionnées dans le premier
+    message humain (voir tests_integration/test_web_tasks.py, convention de
+    prompt — une tâche mentionne toujours l'URL du site cible)."""
+    first_human = next((m for m in messages if getattr(m, "type", None) == "human"), None)
+    if first_human is None or not isinstance(first_human.content, str):
+        return set()
+    return {_clean_url(m) for m in _URL_RE.findall(first_human.content)}
+
+
+_AFFORDANCE_LINE_RE = re.compile(r'-\s*\'?(link|button|textbox|combobox|checkbox|option)\s+"([^"]*)"')
+
+# Inventaire hiérarchisé (Phase 1d, point 2) : au-delà de ce nombre
+# d'affordances, préserver la liste COMPLÈTE devient contre-productif — sur
+# une vraie page Wikipédia (593 affordances, ~47000 caractères d'inventaire
+# à elle seule), l'inventaire dépassait déjà largement le plafond de sortie
+# et affamait TOUT le contenu descriptif, y compris le lien sémantique entre
+# "Naissance" et "Muret" (voir HISTORY.md, vérification d'archive T8).
+AFFORDANCE_THRESHOLD = int(os.environ.get("AFFORDANCE_THRESHOLD", "60"))
+_NAV_KEYWORDS = {
+    "suivant", "précédent", "precedent", "next", "previous", "prev", "page",
+    "retour", "accueil", "home", "sommaire", "menu", "navigation",
+}
+
+
+def _is_nav_label(label: str) -> bool:
+    lowered = label.lower()
+    return any(kw in lowered for kw in _NAV_KEYWORDS)
+
+
+def _extract_affordances_structured(text: str) -> list[dict]:
+    """
+    Inventaire structuré des éléments INTERACTIFS d'un snapshot (liens avec
+    href, boutons, champs de formulaire). Une ligne "link/button/..." est
+    suivie (dans les 2 lignes suivantes, format Playwright) d'une ligne
+    "- /url: ..." si l'élément a une cible ; sinon (bouton, champ) elle est
+    listée sans URL.
+    """
+    lines = text.splitlines()
+    items = []
+    for i, line in enumerate(lines):
+        match = _AFFORDANCE_LINE_RE.search(line)
+        if not match:
+            continue
+        kind, label = match.groups()
+        url = None
+        for lookahead in lines[i + 1 : i + 3]:
+            url_match = _SNAPSHOT_URL_LINE_RE.search(lookahead)
+            if url_match:
+                url = _clean_url(url_match.group(1))
+                break
+        items.append({"kind": kind, "label": label, "url": url})
+    return items
+
+
+def _format_affordance(item: dict) -> str:
+    # Garde le motif littéral "/url: <cible>" (pas "-> url") : ce bloc
+    # repasse ensuite par _extract_urls (voir _execute_tool_calls), qui
+    # reconnaît spécifiquement ce motif pour les liens relatifs — un autre
+    # format y serait invisible et casserait le suivi observed_urls sur
+    # tout résultat tronqué.
+    return f'- {item["kind"]} "{item["label"]}"' + (f' /url: {item["url"]}' if item["url"] else "")
+
+
+def _extract_affordances(text: str) -> list[str]:
+    """Voir _truncate_browser_result : cet inventaire est TOUJOURS conservé
+    intégralement en dessous d'AFFORDANCE_THRESHOLD éléments — au-delà,
+    _prioritize_affordances hiérarchise plutôt que de tout garder (voir
+    ce module, HISTORY.md, "le tronquage affame la navigation")."""
+    return [_format_affordance(i) for i in _extract_affordances_structured(text)]
+
+
+def _prioritize_affordances(items: list[dict], objective: str) -> tuple[list[str], int]:
+    """
+    Au-delà d'AFFORDANCE_THRESHOLD : la pagination/navigation reste
+    TOUJOURS intégrale (jamais le goulot), les liens de zone de contenu
+    sont triés par proximité avec l'objectif de la tâche courante (le
+    prompt initial, faute de sous-tâches explicites — Phase 1 complète pas
+    encore faite) et plafonnés ; le reste est compté, pas listé.
+    """
+    nav = [i for i in items if _is_nav_label(i["label"])]
+    content = [i for i in items if not _is_nav_label(i["label"])]
+    if objective:
+        content.sort(
+            key=lambda i: difflib.SequenceMatcher(None, i["label"].lower(), objective.lower()).ratio(),
+            reverse=True,
+        )
+    kept_content = content[:AFFORDANCE_THRESHOLD]
+    elided = len(content) - len(kept_content)
+    lines = [_format_affordance(i) for i in nav] + [_format_affordance(i) for i in kept_content]
+    return lines, elided
+
+
+def _truncate_browser_result(result: dict, max_chars: int, objective: str = "") -> dict:
+    """
+    Tronque un résultat d'outil browser_* trop volumineux SANS jamais perdre
+    l'inventaire des affordances PERTINENTES (voir _extract_affordances /
+    _prioritize_affordances) : celui-ci est placé en tête, avant le contenu
+    (potentiellement tronqué). Le budget max_chars s'applique au CONTENU,
+    pas à l'inventaire — si l'inventaire (déjà hiérarchisé si besoin) dépasse
+    quand même max_chars, il reste entier : préserver la navigation prime
+    sur le respect strict du plafond dans ce cas rare.
+    """
+    content = result.get("content")
+    if not isinstance(content, list):
+        return result
+    new_content = []
+    for block in content:
+        if isinstance(block, dict) and block.get("type") == "text" and len(block.get("text", "")) > max_chars:
+            structured = _extract_affordances_structured(block["text"])
+            if len(structured) > AFFORDANCE_THRESHOLD:
+                formatted, elided = _prioritize_affordances(structured, objective)
+                elided_note = (
+                    f"\n(+ {elided} liens de contenu supplémentaires non affichés, triés par pertinence)"
+                    if elided
+                    else ""
+                )
+            else:
+                formatted, elided_note = [_format_affordance(i) for i in structured], ""
+            page_url = _extract_page_url(block["text"])
+            # La ligne "Page URL: ..." elle-même est préservée en tête,
+            # jamais tronquée : nécessaire pour résoudre les liens relatifs
+            # de l'inventaire ci-dessous (voir _extract_urls, base_url).
+            page_url_line = f"Page URL: {page_url}\n" if page_url else ""
+            affordances_block = (
+                (
+                    page_url_line
+                    + "### Éléments interactifs (liens/boutons/champs)\n"
+                    + "\n".join(formatted)
+                    + elided_note
+                    + "\n\n"
+                )
+                if formatted
+                else page_url_line
+            )
+            remaining = max(max_chars - len(affordances_block), 0)
+            block = {
+                **block,
+                "text": (
+                    affordances_block
+                    + block["text"][:remaining]
+                    + f"\n[...contenu tronqué à {remaining} caractères (éléments interactifs ci-dessus préservés)...]"
+                ),
+            }
+        new_content.append(block)
+    return {**result, "content": new_content}
 
 # Format transmis au LLM pour les résultats image d'outil (screen_shot
 # GhostDesk, format WebP natif) : vide (le défaut) reconvertit
@@ -207,6 +441,24 @@ GROUNDING_DIRECTIVE = (
     "find_text pour obtenir ses coordonnées exactes plutôt que d'estimer "
     "visuellement leur position — réserve l'estimation visuelle aux "
     "éléments sans texte (icônes)."
+)
+
+# Chemin de consommation de fichier DOCUMENTÉ (Phase 1d-révisée, voir
+# HISTORY.md, T5) : un téléchargement déclenché dans le navigateur atterrit
+# dans un volume désormais partagé en lecture seule avec le serveur MCP
+# filesystem (voir docker-compose.yml, --output-dir/agent-downloads), sous
+# /downloads — jamais dans le filesystem du conteneur playwright-mcp
+# lui-même (fetch()/browser_evaluate comme canal de transfert de fichier a
+# été explicitement écarté, voir HISTORY.md : ce n'est pas la primitive
+# d'un outil de lecture). Donner le chemin réel plutôt que de laisser le
+# modèle en deviner un (observé : /app/.playwright-mcp/, /.playwright-mcp/
+# — tous deux faux) est l'anti-fabrication directe pour ce cas.
+DOWNLOAD_DIRECTIVE = (
+    "Pour un fichier à télécharger (lien/bouton de téléchargement) : "
+    "déclenche le téléchargement dans le navigateur, puis lis son contenu "
+    "via l'outil filesystem read_file sous /downloads/<nom_du_fichier> — "
+    "jamais via browser_navigate/browser_evaluate vers un chemin du "
+    "navigateur, que tu ne peux pas connaître à l'avance."
 )
 
 # Filet de sécurité (bug réel observé en usage réel avec llama-server —
@@ -372,6 +624,29 @@ class AgentState(TypedDict):
     # donc la seule remise à zéro nécessaire pour que ce signal reste correct
     # quelle que soit la façon dont ce tour se termine.
     slash_command_image_shown: bool
+    # Garde-fou fabrication d'URL (Phase 1, voir _check_navigate_url) :
+    # ensemble des URL "vues" pour cette tâche — cible de départ (racines du
+    # périmètre, extraites du 1er message humain), navigations déjà
+    # exécutées, et liens observés dans le contenu renvoyé par un outil
+    # browser_* (snapshot/DOM). Remis à zéro à chaque nouveau tour utilisateur
+    # (voir run_input, app/main.py), comme tool_iterations — le périmètre est
+    # celui de LA TÂCHE en cours, pas de toute la conversation.
+    observed_urls: list
+    # URL de la page actuellement chargée dans le navigateur (dernière valeur
+    # "Page URL: ..." vue dans un résultat d'outil browser_*), nécessaire pour
+    # résoudre les liens RELATIFS (ex. "/catalog/product-14.html") en URL
+    # absolues avant de les ajouter à observed_urls.
+    current_page_url: Optional[str]
+    # Liens de la DERNIÈRE page vue (remplacés, pas accumulés, contrairement
+    # à observed_urls) : utilisés pour orienter le modèle vers de vrais
+    # liens quand une navigation fabriquée est refusée (voir
+    # _execute_tool_calls) — "voici où tu es réellement", pas tout
+    # l'historique de navigation qui serait moins actionnable.
+    current_page_links: list
+    # Compteur de tentatives de navigation vers une URL non observée,
+    # bloquées AVANT exécution (voir _check_navigate_url) — métrique Phase 1,
+    # pas juste un frein silencieux.
+    fabricated_navigation_attempts: int
 
 
 # Plafond de tokens par TOUR (un seul appel LLM), pas pour la conversation
@@ -500,7 +775,7 @@ def describe_context(messages: list, pending_text: Optional[str] = None) -> list
             for label, kind in _CONTEXT_BLOCK_SKELETON
         ]
 
-    system_parts = [GROUNDING_DIRECTIVE]
+    system_parts = [GROUNDING_DIRECTIVE, DOWNLOAD_DIRECTIVE]
     skills_parts = []
     history_parts = []
     image_count = 0
@@ -638,7 +913,9 @@ def _apply_adaptive_thinking(messages: list, session_grants) -> list:
 
 async def call_llm(state: AgentState) -> dict:
     bound_llm = await _get_bound_llm()
-    messages_for_llm = [SystemMessage(content=GROUNDING_DIRECTIVE)] + state["messages"]
+    messages_for_llm = [
+        SystemMessage(content=f"{GROUNDING_DIRECTIVE}\n{DOWNLOAD_DIRECTIVE}")
+    ] + state["messages"]
     messages_for_llm = _apply_image_retention(messages_for_llm)
     messages_for_llm = _apply_adaptive_thinking(messages_for_llm, state.get("session_grants") or [])
     # Repris tel quel depuis l'appel précédent au sein de ce tour (voir
@@ -852,13 +1129,68 @@ async def _execute_tool_calls(state: AgentState, config: dict, *, audit: bool) -
     grants = state.get("session_grants") or []
     thread_id = config.get("configurable", {}).get("thread_id", "")
 
+    # Garde-fou fabrication d'URL (Phase 1) : périmètre = URL déjà observées
+    # CE tour-ci/tours précédents de la tâche + racines du périmètre (1er
+    # message humain). Recalculé/étendu au fil des tool_calls DE CE TOUR
+    # (plusieurs browser_* peuvent apparaître dans le même tour_calls).
+    observed_urls = set(state.get("observed_urls") or []) | _task_scope_urls(state["messages"])
+    current_page_url = state.get("current_page_url")
+    current_page_links = state.get("current_page_links") or []
+    fabricated_attempts = 0
+    # Objectif de la tâche (voir _prioritize_affordances) : le 1er message
+    # humain, faute de sous-tâches explicites (Phase 1 complète pas encore
+    # faite — ce découpage plus fin viendra avec le nœud planificateur).
+    first_human = next((m for m in state["messages"] if getattr(m, "type", None) == "human"), None)
+    objective = first_human.content if first_human and isinstance(first_human.content, str) else ""
+
     async with httpx.AsyncClient(timeout=60) as client:
         for tool_call in last.tool_calls:
+            audit_tier = None
             if audit:
                 tier = approval_policy.effective_tier(tool_call["name"], tool_call.get("args"), grants)
                 if tier == approval_policy.TIER_REVERSIBLE:
-                    audit_log.log_tool_call(thread_id, tool_call["name"], tool_call["args"], tier)
-            result, images = await _call_mcp_tool(client, tool_call["name"], tool_call["args"])
+                    audit_tier = tier
+
+            blocked = False
+            if (
+                BROWSER_NAVIGATE_GUARDRAIL
+                and tool_call["name"] == "browser_navigate"
+                and tool_call.get("args", {}).get("url")
+                and tool_call["args"]["url"] not in observed_urls
+            ):
+                blocked = True
+                fabricated_attempts += 1
+                attempt_number = state.get("fabricated_navigation_attempts", 0) + fabricated_attempts
+                page_links_for_feedback = current_page_links or sorted(observed_urls)
+                feedback = _fabrication_feedback(
+                    tool_call["args"]["url"], attempt_number, page_links_for_feedback
+                )
+                result = {"content": [{"type": "text", "text": feedback}]}
+                images = []
+            else:
+                result, images = await _call_mcp_tool(client, tool_call["name"], tool_call["args"])
+                if tool_call["name"].startswith("browser_"):
+                    result = _truncate_browser_result(result, BROWSER_TOOL_OUTPUT_MAX_CHARS, objective)
+                    for block in result.get("content", []) if isinstance(result.get("content"), list) else []:
+                        if isinstance(block, dict) and block.get("type") == "text":
+                            text = block["text"]
+                            page_url = _extract_page_url(text)
+                            if page_url:
+                                current_page_url = page_url
+                            page_links = _extract_urls(text, current_page_url)
+                            if page_links:
+                                current_page_links = sorted(page_links)
+                            observed_urls |= page_links
+                    if tool_call["name"] == "browser_navigate" and not blocked:
+                        observed_urls.add(tool_call["args"]["url"])
+                        current_page_url = tool_call["args"]["url"]
+
+            if audit_tier is not None:
+                # Journalisé APRÈS exécution (voir plus haut) pour porter le
+                # résultat tel que vu par le modèle (déjà tronqué/hiérarchisé
+                # ci-dessus si browser_*) — voir app/audit_log.py, "Phase
+                # 1d-révisée".
+                audit_log.log_tool_call(thread_id, tool_call["name"], tool_call["args"], audit_tier, result)
 
             new_messages.append(
                 {
@@ -891,6 +1223,10 @@ async def _execute_tool_calls(state: AgentState, config: dict, *, audit: bool) -
         # donc cette exécution repart correctement à 1 (voir
         # AUTO_APPROVAL_STREAK_LIMIT).
         "auto_approval_streak": state.get("auto_approval_streak", 0) + 1,
+        "observed_urls": sorted(observed_urls),
+        "current_page_url": current_page_url,
+        "current_page_links": current_page_links,
+        "fabricated_navigation_attempts": state.get("fabricated_navigation_attempts", 0) + fabricated_attempts,
     }
 
 
@@ -1038,11 +1374,12 @@ async def run_slash_command_direct(state: AgentState, config: dict) -> dict:
     grants = state.get("session_grants") or []
     tier = approval_policy.effective_tier(tool_name, args, grants)
     thread_id = config.get("configurable", {}).get("thread_id", "")
-    if tier == approval_policy.TIER_REVERSIBLE:
-        audit_log.log_tool_call(thread_id, tool_name, args, tier)
 
     async with httpx.AsyncClient(timeout=60) as client:
         result, images = await _call_mcp_tool(client, tool_name, args)
+
+    if tier == approval_policy.TIER_REVERSIBLE:
+        audit_log.log_tool_call(thread_id, tool_name, args, tier, result)
 
     new_messages = [
         {"role": "tool", "tool_call_id": call_id, "content": json.dumps(result, ensure_ascii=False)},

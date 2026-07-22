@@ -82,9 +82,10 @@ async def test_context_decomposition_with_mixed_text_and_image_history():
         blocks = {b["kind"]: b for b in body["blocks"]}
 
         assert set(blocks) == {"system", "skills", "tools_schema", "history_text", "images"}
-        # system prompt transitoire (GROUNDING_DIRECTIVE) toujours présent,
-        # aucun contexte RAG/skill injecté dans ce flux (résultats vides).
-        assert blocks["system"]["count"] == 1
+        # system prompt transitoire (GROUNDING_DIRECTIVE + DOWNLOAD_DIRECTIVE,
+        # voir Phase 1d-révisée) toujours présent, aucun contexte RAG/skill
+        # injecté dans ce flux (résultats vides).
+        assert blocks["system"]["count"] == 2
         assert blocks["skills"]["count"] == 0
         # Schéma d'outils mesuré depuis le cache _tools_schema_cache (2 outils
         # enregistrés côté mcp-client), jamais recalculé.

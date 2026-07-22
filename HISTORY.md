@@ -235,3 +235,412 @@ serveur persistant) semblait suffisante sur le papier, mais un test réel
 immédiat a révélé qu'elle ne l'était pas — la persistance de session côté
 client est une couche distincte de la persistance du process serveur, et
 aucune des deux ne remplace l'autre pour ce serveur précis.
+
+## Phase 0 — harnais de tâches web construit, baseline double campagne
+
+Construction complète du harnais `test_web_tasks.py` : 3 fixtures locales
+générées et vérifiées réellement (`catalog` 30 produits/3 pages,
+`docs` ~30 pages avec piste à 2 sauts, `hr-app` Flask avec login/tableau
+dynamique/formulaire/export CSV), branchées en service `docker-compose`
+dédié (profil `test-fixtures`). Recalibrages faits AVANT la baseline (donc
+non contaminants) : catalogue réduit de 120/12 pages à 30/3 (le pire cas
+exhaustif dépassait largement `MAX_TOOL_ITERATIONS`), T5 recentré sur la
+valeur finale plutôt qu'un fichier CSV présent sur disque (aucun outil
+`browser_*` ne fait redescendre un téléchargement vers un répertoire
+lisible par le harnais).
+
+Le harnais joue lui-même le rôle de l'humain (`POST /approve`,
+`grant_session=True`) puisque les outils `browser_*` sont TIER_SENSITIVE
+par défaut (Phase 3 pas encore faite) — comptabilisé comme métrique
+"approbations". Ajout d'une métrique diagnostique demandée explicitement en
+cours de session : `tool_calls_observés` (proxy = approbations + entrées du
+journal d'audit pour le thread) et une sous-classification des échecs
+"boucle" en `boucle_fabrication` (navigation vers une URL absente du
+sitemap réel du fixture) vs `boucle_budget` (URLs réelles mais budget
+épuisé) — vérifiable seulement pour les tâches locales (sitemap de
+référence connu), pas pour les sites réels.
+
+**Deux campagnes réelles, une seule variable (MAX_TOOL_ITERATIONS)** :
+
+| | Campagne A (budget 20, défaut) | Campagne B (budget 60, diagnostic) |
+|---|---|---|
+| Score | 16/33 | 25/33 |
+| T1 (catalogue paginé) | 0/3 (extraction) | 3/3 |
+| T5 (CSV + calcul) | 3/3 | 1/3 |
+| T7 (produit inexistant) | 1/3 (`boucle_fabrication`×1) | 3/3 |
+| T8/T11 (Wikipédia/python.org) | 0/3 chacune (infra) | 0/3 chacune (infra) |
+| T9 (Google→INSEE) | 0/3 (infra) | 3/3 |
+
+**Constat n°1 : fabrication d'URL.** Sur les deux campagnes, l'agent invente
+régulièrement des URL plausibles mais jamais observées (`page-4.html` sur
+un catalogue à 3 pages, `product-KX-4471.html` en devinant un motif depuis
+la référence cherchée, `/catalog/search?q=...` sans fonction de recherche,
+`file:///app/.playwright-mcp/employees.csv` pour "télécharger" un CSV)
+plutôt que de suivre un lien réellement présent dans le DOM. Un budget plus
+large (Campagne B) laisse le temps de se rattraper après ces essais ratés
+(T1, T7 passent à 3/3), mais le comportement de fabrication lui-même
+persiste identique — relever le budget ne le corrige pas, ça masque juste
+son coût. Première cible désignée pour la Phase 1 (vérification post-action
+systématique, budget d'échec avec stratégie alternative exigée à chaque
+retry).
+
+**Constat n°2 : dépassement de contexte non rattrapé, pas une limite
+d'itérations.** T8/T11 échouent identiquement dans LES DEUX campagnes
+(budget 20 ET 60) — pas un problème de budget d'itérations donc, mais
+`openai.BadRequestError: Prompt length 69510 exceeds the available context
+size of 32768 tokens` : les pages réelles (Wikipédia, python.org) génèrent
+des snapshots DOM bien plus lourds que les fixtures locales, et
+`/v1/chat/completions` (chemin non-streaming) n'a pas le même filet de
+rattrapage que le chemin streaming (`except Exception` présent dans
+`_stream_response`, absent équivalent autour de `agent_graph.ainvoke` en
+non-streaming, `app/main.py`) — d'où un 500 brut plutôt qu'une notice
+propre. Bug identifié mais PAS corrigé ici (hors périmètre : mesurer
+l'agent tel quel, pas le modifier).
+
+**T9 a réussi en Campagne B** (Google → INSEE, 3/3, budget 60) : la
+recherche/tri du signal Google + navigation vers insee.fr a fonctionné une
+fois le budget suffisant — donc pas bloqué par l'INSEE elle-même
+(contrairement à l'hypothèse d'incident technique envisagée plus tôt), mais
+par le nombre d'étapes nécessaires pour traverser écran de consentement +
+SERP.
+
+**Bug de harnais trouvé et corrigé en cours de route** : `_assert_t9`
+retournait toujours le même message de détail ("insee absent...") qu'importe
+le verdict réel — le booléen de succès était correct, seul le texte affiché
+en cas de succès était trompeur. Corrigé (`test_web_tasks.py`), rapport
+Campagne B corrigé a posteriori pour refléter le vrai verdict sans
+relancer (coûteux).
+
+Rapports complets : `tests_integration/TASKS-BASELINE.md` (Campagne A,
+officielle) et `tests_integration/TASKS-DIAGNOSTIC-budget60.md` (Campagne B,
+diagnostic). `MAX_TOOL_ITERATIONS` restauré à 20 (défaut) sur la stack
+après la Campagne B.
+
+## Phase 0 — vérification T5, correctif de parité d'erreur, GO Phase 1
+
+**Vérification T5 (Campagne B)** : les logs bruts des runs originaux avaient
+été perdus (le conteneur `langgraph-agent` avait été recréé juste après pour
+restaurer `MAX_TOOL_ITERATIONS=20`, vidant le checkpointer `MemorySaver` en
+mémoire). Reproduction fraîche (3 runs, budget 60) plutôt qu'analyse
+forensique des runs originaux. Verdict : ni errance ni pollution de
+contexte — un bug d'assertion. L'agent répondait correctement "199 000 €"
+(espace comme séparateur de milliers), `_assert_t5` cherchait la sous-chaîne
+stricte "199000". Faux négatif à 100%, corrigé (tolère espace/virgule/point).
+Score T5 réel : 3/3 aux deux budgets. Aucune contre-indication empirique à
+l'élargissement du budget trouvée pour cette tâche — voir détail dans
+`TASKS-DIAGNOSTIC-budget60.md`.
+
+**Correctif de parité d'erreur interne** (`app/main.py`) : le chemin
+streaming (`_stream_response`) attrapait déjà toute exception pendant
+`agent_graph.ainvoke`/`astream_events` via un `except Exception` englobant
+et répondait une notice propre. Ni `/v1/chat/completions` non-streaming ni
+`/approve` ne l'avaient — découvert en conditions réelles pendant la
+Campagne A/B (T8/T11, `openai.BadRequestError: Prompt length ... exceeds
+the available context size`), qui y remontait en 500 brut plutôt qu'une
+réponse HTTP 200 avec notice. Ajout d'une constante partagée
+`_INTERNAL_ERROR_NOTICE` (au lieu du literal dupliqué) et d'un `try/except`
+autour de `ainvoke` sur les deux chemins manquants, retournant directement
+la notice sans passer par `_current_answer` (l'état du graphe peut être
+incohérent après une erreur en plein milieu). Test de non-régression
+`test_internal_error_parity.py` (2 tests, reproduit le `BadRequestError`
+exact vu en conditions réelles via `respx`, sur les 3 chemins). Suite
+complète rejouée : 119 tests passent, aucune régression. Campagne complète
+PAS relancée (T8/T11 seront re-mesurées naturellement à la campagne
+post-Phase 1, comme convenu) — seuls les 2 nouveaux tests unitaires
+valident ce correctif pour l'instant.
+
+**GO Phase 1** décidé sur ces bases : fabrication d'URL désignée cible n°1
+(garde-fou mécanique sur `browser_navigate`, voir `PLAN.md`), tronquage des
+snapshots à la source également en périmètre Phase 1 (borne de sortie
+d'outil, pas de la gestion d'historique qui reste Phase 2). Critère de
+réussite chiffré, sur la même Campagne A (budget 20) : T1 et T4 passent
+(tuées par la fabrication), compteur de fabrications proche de zéro, T7 à
+3/3, aucun recul sur T2/T3/T10.
+
+## Phase 1 (1ère tranche) — garde-fou fabrication d'URL + tronquage snapshots
+
+Implémenté dans `app/graph.py` : `_execute_tool_calls` vérifie désormais
+l'URL de tout `browser_navigate` contre `observed_urls` (racines du
+périmètre de la tâche, extraites du 1er message humain + navigations déjà
+exécutées + liens extraits des résultats `browser_*` précédents, y compris
+liens relatifs résolus via la page courante). URL non observée → refusée
+AVANT tout appel à `mcp-client`, feedback d'outil explicite, comptée dans
+`fabricated_navigation_attempts` (nouveau champ `AgentState`). Bascule
+`BROWSER_NAVIGATE_GUARDRAIL` (défaut activé). En parallèle,
+`BROWSER_TOOL_OUTPUT_MAX_CHARS` (défaut 8000) tronque à la source tout
+résultat d'outil `browser_*` trop volumineux — distinct de la rétention
+d'images (Phase 2) : une borne de sortie d'outil, pas de gestion
+d'historique. 5 nouveaux tests unitaires
+(`test_url_fabrication_guardrail.py`) + 6 tests existants ajustés (URL de
+test `http://example.com` absente du périmètre de leur tâche factice,
+jamais mentionnée dans le 1er message — corrigé en l'y ajoutant). Suite
+complète : 124 tests passent.
+
+**Campagne A rejouée (même budget 20, seule variable : le garde-fou actif)
+— verdict chiffré contre les 5 critères de réussite fixés, aucun n'est
+intégralement atteint** (détail complet et analyse dans
+`tests_integration/TASKS-BASELINE-post-phase1.md`) :
+- Score global : 16/33 → **24/33** (amélioration réelle, non ciblée
+  spécifiquement par les critères).
+- T1 : toujours 0/3 (❌ critère non atteint).
+- T4 : 1/3 → 3/3 (✅ critère atteint).
+- Compteur de fabrications : PAS proche de zéro (❌) — jusqu'à 20 URL
+  fabriquées distinctes par run en échec (T7). Le garde-fou bloque bien
+  l'EXÉCUTION (vérifié unitairement : `mcp_route.call_count == 0` sur URL
+  fabriquée), mais le modèle ne cesse pas d'inventer : il enchaîne
+  plusieurs suppositions rejetées une par une plutôt qu'une seule
+  navigation ratée puis un abandon — `tool_calls_observés` sur T1/T7 a
+  AUGMENTÉ (T1 : 20-32 → 49-61 ; T7 : 30-42 → 58-70). Le garde-fou change
+  la CONSÉQUENCE de la fabrication (pas de pollution du contexte par de
+  vraies navigations ratées), pas le COMPORTEMENT lui-même.
+- T7 : 1/3 → 2/3 (❌ critère "3/3" non atteint, mais amélioré).
+- Aucun recul T2/T3/T10 : T2 et T3 stables (3/3), **T10 recule à 2/3**
+  (❌, 1 échec "boucle" — site réel, pas de sitemap de référence donc pas
+  de sous-classification possible ; possiblement du bruit de
+  non-déterminisme plutôt qu'un effet du garde-fou).
+
+**Gains inattendus, probablement dus au tronquage plutôt qu'au garde-fou
+de navigation** : T8 (Wikipédia) 0/3 (infra, dépassement de contexte) →
+3/3 ; T9 (Google→INSEE) stable à 3/3. Cohérent avec la cause identifiée au
+bloc précédent (dépassement de contexte sur pages réelles denses) —
+`BROWSER_TOOL_OUTPUT_MAX_CHARS` semble la traiter efficacement, sans test
+dédié isolant formellement ce lien de cause à effet ici.
+
+T11 reste 0/3 (hallucination) — attendu, hors périmètre de cette tranche
+(conscience temporelle, amendement séparé du plan).
+
+**Conclusion** : le garde-fou mécanique seul ne suffit pas à faire
+converger le modèle vers les vrais liens après un refus — confirmé
+empiriquenent, pas juste supposé. Prochaine tranche Phase 1 à discuter :
+soit enrichir le feedback de refus (suggérer explicitement les liens
+RÉELLEMENT observés dans la dernière page, pas juste dire "non"), soit
+la vérification post-action systématique déjà prévue au plan d'origine
+(énoncer un critère de succès AVANT l'action, comparer après), qui
+pourrait mieux capter ce pattern de raisonnement répétitif que le seul
+blocage d'exécution.
+
+## Phase 1 (2e tranche) — hypothèse "le tronquage affame la navigation"
+
+**Étape 1, vérification d'archive (zéro run agent)** : appels directs
+`mcp-client` (hors LLM) sur les pages réellement en cause.
+- **T1 (catalogue local)** : hypothèse NON applicable — plus gros snapshot
+  observé (page-1.html, 10 produits) = 1626 caractères, snapshot produit =
+  508 caractères, très sous le seuil de troncature (8000). Le tronquage ne
+  s'est jamais déclenché sur ce fixture.
+- **T10 (books.toscrape.com, réel)** : hypothèse CONFIRMÉE. Snapshot de la
+  catégorie Science = 25900 caractères, 82 liens ; la cible ("The Origin
+  of Species") apparaît après le 8000e caractère — seuls 49/82 liens
+  survivaient à l'ancien tronquage naïf, et pas le bon.
+
+**Étape 2, tronquage structuré** (`app/graph.py`) : `_extract_affordances`
+extrait tout élément interactif (lien avec cible, bouton, champ) d'un
+snapshot ; `_truncate_browser_result` place cet inventaire INTÉGRAL en
+tête (jamais tronqué, y compris si l'inventaire seul dépasse le plafond —
+préserver la navigation prime sur le respect strict du plafond dans ce cas
+rare), et ne tronque que le contenu descriptif restant. La ligne
+"Page URL: ..." est préservée séparément (nécessaire pour résoudre les
+liens relatifs). Test dédié : page catalogue synthétique à 200 liens
+(>8000 car.) → 100% des liens survivent à la troncature à 2000 car.
+
+**Étape 3, feedback redirection** : le rejet d'une URL fabriquée inclut
+désormais les liens réellement observés sur la page COURANTE (coût nul,
+même ensemble que celui consulté par le garde-fou), pas juste un refus sec.
+
+**Bug trouvé en cours de route** : le premier format choisi pour
+l'inventaire (`- link "Label" -> url`) était invisible à `_extract_urls`
+(qui reconnaît spécifiquement le motif `/url: ...`), ce qui aurait cassé
+le suivi `observed_urls` sur tout résultat effectivement tronqué en
+production (pas seulement en test). Corrigé (format `/url: ...` conservé).
+8 tests unitaires dédiés, suite complète : 127 tests passent.
+
+**Étape 4, re-campagne A (budget 20 inchangé), mêmes 5 critères — recul
+net, pas une amélioration** :
+
+| Tâche | Phase 1a (garde-fou seul) | Phase 1b (+ tronquage structuré + feedback) |
+|---|---|---|
+| Score global | 24/33 | **20/33** |
+| T1 | 0/3 | 2/3 (amélioré) |
+| T4 | 3/3 | **1/3** (recul net) |
+| T7 | 2/3 | **0/3** (recul net) |
+| T8 | 3/3 | **0/3** (recul net) |
+| T10 | 2/3 | 3/3 (récupéré, cohérent avec l'hypothèse confirmée) |
+
+Aucun des 5 critères de réussite n'est mieux atteint qu'en 1a — T10 seul
+progresse comme attendu (cohérent avec la vérification d'archive), mais
+T4/T7/T8 se dégradent nettement. Hypothèse la plus probable (non vérifiée
+formellement, faute de budget dans cette itération) : la liste de liens
+ajoutée à CHAQUE rejet (jusqu'à 40 lignes) alourdit le message de rejet
+lui-même — sur des tâches qui accumulent déjà beaucoup de rejets (T7 :
+jusqu'à 85 tool_calls_observés ici, contre 70 en 1a), ce surcoût par rejet
+semble épuiser le budget plus vite qu'il n'aide à corriger la trajectoire.
+Détail complet dans `tests_integration/TASKS-BASELINE-post-phase1b.md`.
+
+**Étape 5, pas de conclusion sur les critères Phase 1** (comme demandé) :
+les mécanismes restants (plan explicite, vérification post-action
+systématique, budget d'échec avec stratégie alternative exigée à chaque
+retry) ne sont pas encore en place. Le comportement "enchaîne les
+suppositions" est précisément ce que le budget d'échec doit adresser —
+prématuré de juger la Phase 1 avant qu'il soit implémenté. Prochaine
+décision à prendre au checkpoint : garder, ajuster (ex. alléger le
+feedback : moins de liens, ou seulement sur la 2e tentative fabriquée) ou
+retirer l'étape 3 (feedback enrichi) en isolant sa contribution de celle du
+tronquage structuré (étape 2), qui elle est positivement confirmée par la
+vérification d'archive sur T10.
+
+## Phase 1 (3e tranche) — feedback gradué + plafond de rejets
+
+Diagnostic retenu du recul 1b : la liste complète des liens à CHAQUE rejet
+était redondante (le snapshot structuré la contient déjà) et alourdissait
+chaque rejet. Remplacé par un feedback à 3 paliers selon le nombre de
+tentatives fabriquées POUR CETTE TÂCHE (`fabricated_navigation_attempts`,
+déjà suivi) : 1-2 = message minimal sans liste ; 3 à `FABRICATION_LIMIT-1`
+(défaut 5) = quelques liens les plus proches de l'URL fabriquée
+(`difflib.get_close_matches`) ; à partir de `FABRICATION_LIMIT` = le
+feedback change de nature, pousse vers une conclusion honnête d'absence
+plutôt qu'une énième supposition — pont direct vers T7. Nouvelle fonction
+pure `_fabrication_feedback` (`app/graph.py`), `FABRICATION_LIMIT` en env.
+4 nouveaux tests unitaires (les 3 paliers + câblage bout en bout du
+compteur), 1 ancien test remplacé (l'assertion "Liens disponibles"
+inconditionnelle ne tenait plus). Suite complète : 130 tests passent.
+
+**Campagne A rejouée (budget 20 inchangé), mêmes 5 critères — 4/5 atteints,
+un motif de vigilance nouveau hors périmètre des critères** (détail complet
+dans `tests_integration/TASKS-BASELINE-post-phase1c.md`) :
+
+| Critère | Résultat |
+|---|---|
+| T1 passe | ✅ 3/3 |
+| T4 passe | ✅ 3/3 |
+| Fabrications ≈ 0 | ⚠️ toujours nombreuses (T7 : jusqu'à 24/run), mais convergent maintenant vers une conclusion honnête plutôt que la limite d'itérations |
+| **T7 à 3/3 (juge principal)** | **✅ 3/3, atteint** — les 3 runs concluent honnêtement à l'absence, avec peu d'approbations (5, 1, 0), signe d'une vraie convergence plutôt qu'un blocage mécanique |
+| Aucun recul T2/T3/T10 | ✅ tous 3/3 |
+
+Score global : 16/33 (pré-Phase 1) → 24/33 (1a) → 20/33 (1b) → **24/33
+(1c)**, avec un mix de tâches réussies différent de 1a (T1/T4/T6/T7 montent,
+T5 tombe à 0/3 — nouveau, absent des 5 critères fixés). Cause du recul T5
+non investiguée dans cette itération (hors périmètre demandé) : le
+"fichier" CSV réapparaît comme `file:///...` fabriqué (déjà connu), mais
+`tool_calls_observés` a nettement augmenté (30-34 contre 20-30
+auparavant) — hypothèse à vérifier séparément (interaction avec le
+matching "liens proches" du palier 2, ou simple non-déterminisme). T8 reste
+bloqué mais change de cause (extraction, plus infra — le tronquage a bien
+réglé le dépassement de contexte identifié en 1b, Wikipédia reste
+difficile pour une autre raison non isolée ici).
+
+## Phase 1d — vérification d'archive T5/T8 (zéro run) et sa limite
+
+Avant tout nouveau code, tentative de trancher les hypothèses du checkpoint
+1c (un lien/bouton export était-il présent au moment du plafond ? la
+donnée cible était-elle dans la partie élidée de l'inventaire ?) depuis les
+archives existantes, sans rejouer aucune tâche. Le journal d'audit
+(`workspace/.audit/`, bind mount hôte) a survécu au redémarrage du
+conteneur `langgraph-agent` entre la campagne 1c et cette vérification
+(contrairement au checkpointer `MemorySaver`, en mémoire) : les threads T5
+et T8 de la campagne ont été retrouvés par fenêtre temporelle.
+
+**Limite structurelle découverte** : `audit_log` ne journalisait que
+`tool` + `arguments`, jamais le RÉSULTAT de l'appel — le contenu du
+snapshot renvoyé au modèle n'était persisté nulle part. Les hypothèses 0a/0b
+portent précisément sur ce contenu (présence d'un lien, portion élidée) :
+ni confirmables ni infirmables strictement avec l'existant. Seule la
+SÉQUENCE d'appels était reconstructible :
+- T5 : navigation correcte et répétée vers l'URL réelle d'export, une
+  fabrication (`file:///.playwright-mcp/employees.csv` et variantes), puis
+  retour spontané à l'URL réelle et tentatives `browser_run_code_unsafe`/
+  `browser_evaluate` — pas de blocage permanent visible sur le chemin
+  fabriqué.
+- T8 : URL directe, variante mobile, recherche interne Wikipédia,
+  `Spécial:Recherche`, repli Google — jamais de retour franc sur une page
+  exploitée avec succès dans la séquence journalisée.
+
+**Conséquence sur le correctif "plafond conditionnel" de la 1d initiale**
+(candidats forts par jetons distinctifs à `_strong_candidates`) : conçu et
+codé sur l'hypothèse 0a, non confirmée par les séquences ci-dessus.
+**SUSPENDU** — reverté (`_fabrication_feedback` revient au message
+inconditionnel de 1c). Principe retenu : on ne corrige pas un mécanisme sur
+une hypothèse affaiblie par la vérification ; il redeviendra candidat si
+des archives enrichies (voir plus bas) montrent le pattern ailleurs.
+
+## Phase 1d-révisée — observabilité d'abord, puis T5 requalifié côté infra
+
+**1. Persistance des résultats d'outil dans le journal d'audit**
+(`app/audit_log.py`) : chaque entrée porte désormais le résultat TEL QUE VU
+PAR LE MODÈLE (déjà tronqué/hiérarchisé par `_truncate_browser_result` côté
+appelant, jamais la version brute — on n'archive pas une donnée que le
+modèle n'a jamais reçue). Rotation/compression ajoutée (`AUDIT_LOG_MAX_BYTES`,
+défaut 20 Mio) : un fichier journalier qui dépasse le seuil est compressé en
+`.N.jsonl.gz` avant la prochaine écriture, `read_entries` relit les deux
+formes de façon transparente. C'est la fondation du futur endpoint
+"contexte de l'agent" du dashboard, et ce qui manquait pour vérifier
+strictement 0a/0b la prochaine fois qu'un cas similaire se présente.
+
+**2. Investigation infra pour T5** : les deux options envisagées au
+checkpoint précédent se sont révélées non viables, vérifié empiriquement
+avant tout code —
+- (a) outil de download natif + lecture via filesystem-MCP : `playwright-mcp`
+  tourne en `--isolated` SANS AUCUN volume monté (vérifié dans
+  `docker-compose.yml`) ; un téléchargement atterrit dans le filesystem du
+  conteneur `playwright-mcp` lui-même
+  (`/home/node/.playwright-mcp/employees.csv` — vérifié en inspectant le
+  conteneur en direct : NI `/app/.playwright-mcp/` NI `/.playwright-mcp/`,
+  les deux chemins que le modèle fabriquait à chaque tentative), jamais
+  partagé avec filesystem-MCP.
+- (b) `curl` via mcp-terminal : conteneur spawné SANS accès réseau
+  (`agent-net` non attaché, vérifié : une requête `curl` vers
+  `fixture-hr-app` échoue) et liste blanche strictement en lecture
+  (`ls`/`pwd`/`cat`/`git_status`, voir `services/mcp-terminal/server.py`) —
+  ajouter `curl` aurait été une vraie extension de surface réseau, pas une
+  simple directive.
+
+**Option refusée, consignée pour faire jurisprudence** : utiliser
+`browser_evaluate` (`fetch(url).then(r=>r.text())` dans le contexte de la
+page) comme canal de transfert de fichier — ne demandait aucune nouvelle
+capacité ni changement de surface, mais **rejetée sur le principe** :
+l'exécution de code arbitraire dans la page n'est pas la primitive d'un
+outil de lecture/téléchargement, même quand elle "marche" pour ce cas
+précis. Un besoin de transfert de fichier légitime mérite un CHEMIN
+DÉDIÉ, pas un détournement d'un canal d'exécution. Si un besoin futur
+similar se présente, ne pas reproposer `browser_evaluate`/
+`browser_run_code_unsafe` comme solution de contournement — construire le
+chemin dédié équivalent.
+
+**3. Solution retenue : volume de téléchargement dédié** —
+- `docker-compose.yml` : volume nommé `agent-downloads`, monté en écriture
+  dans `playwright-mcp` (`--output-dir=/downloads`, chemin EXPLICITE plutôt
+  que le défaut implicite du conteneur — l'anti-fabrication directe), monté
+  en LECTURE SEULE dans le serveur MCP filesystem (voir
+  `services/mcp-client/app/main.py`, `SERVERS["filesystem"]`, argument racine
+  supplémentaire `/downloads`). Le profil navigateur reste `--isolated` en
+  mémoire — seuls les artefacts de téléchargement sont partagés, jamais
+  l'état du navigateur.
+- Directive système `DOWNLOAD_DIRECTIVE` (`app/graph.py`) : documente le
+  chemin réel (`/downloads/<nom>`) plutôt que de laisser le modèle en
+  deviner un.
+- Tiers (`app/approval_policy.py`) : `NEVER_GRANTABLE_TOOLS` —
+  `browser_run_code_unsafe` ET `browser_evaluate` restent TIER_SENSITIVE
+  même accordés pour la session (un grant ne les assouplit jamais,
+  contrairement au reste des outils sensibles) — exécution de code
+  arbitraire dans la page est une élévation, chaque appel requiert une
+  approbation individuelle, décision étendue à `browser_evaluate` (même
+  famille de primitive que `browser_run_code_unsafe`).
+- Nettoyage : `_purge_downloads_volume()` (`tests_integration/
+  test_web_tasks.py`), appelé avant CHAQUE répétition de tâche (pas
+  seulement au setup de session) — sinon une répétition de T5 "réussirait"
+  en lisant l'artefact laissé par la précédente plutôt qu'en téléchargeant
+  réellement.
+- Nouveau test d'intégration dédié (`test_download_then_filesystem_read_
+  roundtrip`) : isolé de la campagne complète (plus rapide à diagnostiquer
+  en cas d'échec), vérifie le fichier réellement présent dans le volume
+  (pas seulement déduit de la réponse finale) en plus de l'assertion sur le
+  contenu.
+- mcp-terminal : INCHANGÉ — sa doctrine "zéro réseau, liste blanche stricte"
+  était correcte, pas érodée pour un cas d'usage qui a une meilleure
+  solution.
+
+131 tests unitaires -> 134 après ce chantier (persistance de résultat +
+rotation, revert du plafond conditionnel, `NEVER_GRANTABLE_TOOLS`). Nécessite
+un rebuild/restart de `playwright-mcp` et `mcp-client` (nouveau volume,
+nouvel argument de commande) avant de rejouer la Campagne A — voir
+commandes au checkpoint. 🧑 **Checkpoint : rejouer la Campagne A (critères :
+T5 et T8 remontent, T1/T4/T7/T10 tiennent) avant de considérer la Phase 1
+close.**

@@ -59,6 +59,12 @@ services:
       # infructueuse. Budget cumulé pour toute la tâche, comme
       # MAX_TOOL_ITERATIONS.
       - MAX_EMPTY_ANSWER_RETRIES=${MAX_EMPTY_ANSWER_RETRIES:-1}
+      # Plafond de tours d'outils par tâche avant la notice de limite (voir
+      # app/graph.py). Pas de passthrough env avant le harnais
+      # tests_integration/test_web_tasks.py (Campagne B, budget relevé pour
+      # isoler l'effet du plafond des vraies capacités de navigation —
+      # voir BENCHMARK0.md).
+      - MAX_TOOL_ITERATIONS=${MAX_TOOL_ITERATIONS:-20}
       # Forfait de tokens par image dans la décomposition approximative du
       # contexte (POST /context, voir README section Observabilité) — un
       # compte exact dépendrait du tokenizer visuel du modèle servi, hors
@@ -255,6 +261,16 @@ services:
       - --isolated   # profil navigateur en mémoire, jamais persisté sur disque
       - --headless
       - --browser=chromium
+      # Chemin EXPLICITE (voir HISTORY.md "Phase 1d-révisée", T5) plutôt que
+      # le défaut implicite (~/.playwright-mcp du conteneur) — l'agent
+      # fabriquait régulièrement de mauvais chemins en devinant ce défaut
+      # (/app/.playwright-mcp, /.playwright-mcp...), jamais le vrai. Partagé
+      # en LECTURE SEULE avec le serveur MCP filesystem ci-dessous (volume
+      # agent-downloads) : on partage l'artefact téléchargé, jamais l'état du
+      # profil navigateur (--isolated reste actif).
+      - --output-dir=/downloads
+    volumes:
+      - agent-downloads:/downloads
     healthcheck:
       test: ["CMD-SHELL", "bash -c '</dev/tcp/localhost/8931' || exit 1"]
       interval: 5s
@@ -386,6 +402,51 @@ services:
     # ports:
     #   - "5000:5000"
 
+  # ──────────────────────────────────────────────────────────────
+  # Fixtures Benchmark 0 (plan d'autonomie, voir PLAN.md et
+  # tests_integration/BENCHMARK0.md) : sites/app auto-hébergés à vérité
+  # terrain connue par construction, ciblés par le harnais
+  # test_web_tasks.py (T1-T7). Profil dédié : ne tournent jamais par défaut
+  # avec le reste de la stack, seulement quand on lance ce harnais.
+  #   docker compose --profile test-fixtures up -d fixture-catalog fixture-docs fixture-hr-app
+  # ──────────────────────────────────────────────────────────────
+  fixture-catalog:
+    build: ./services/langgraph-agent/tests_integration/fixtures/catalog
+    container_name: fixture-catalog
+    profiles: ["test-fixtures"]
+    networks:
+      - agent-net
+    # pas de port publié : seul le conteneur playwright-mcp (agent-net) y accède
+
+  fixture-docs:
+    build: ./services/langgraph-agent/tests_integration/fixtures/docs
+    container_name: fixture-docs
+    profiles: ["test-fixtures"]
+    networks:
+      - agent-net
+
+  fixture-hr-app:
+    build: ./services/langgraph-agent/tests_integration/fixtures/hr-app
+    container_name: fixture-hr-app
+    profiles: ["test-fixtures"]
+    environment:
+      # court délibérément (voir T6, BENCHMARK0.md) : teste que l'agent reste
+      # efficace dans sa trajectoire plutôt que d'errer avant de répondre.
+      - HR_APP_SESSION_TIMEOUT_SECONDS=${HR_APP_SESSION_TIMEOUT_SECONDS:-90}
+    volumes:
+      # soumissions du formulaire de congé (T2) : écrites ici par l'app,
+      # lues par les assertions du harnais depuis l'hôte, jamais par l'app
+      # elle-même après écriture.
+      - ./workspace/hr-app-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://localhost:5000/health', timeout=3)\" || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    networks:
+      - agent-net
+
 networks:
   agent-net:
     driver: bridge
@@ -394,3 +455,10 @@ volumes:
   open-webui-data:
   qdrant-data:
   ghostdesk-home:
+  # Volume PARTAGÉ entre playwright-mcp (écriture) et le serveur MCP
+  # filesystem spawné par mcp-client (lecture seule) — voir playwright-mcp
+  # (--output-dir) et services/mcp-client/app/main.py (SERVERS["filesystem"])
+  # ci-dessous, HISTORY.md "Phase 1d-révisée" (T5). On partage les
+  # ARTEFACTS de téléchargement, jamais l'état du navigateur : playwright-mcp
+  # reste --isolated (profil en mémoire, jamais persisté).
+  agent-downloads:

@@ -5,6 +5,9 @@ AUDIT_LOG_DIR pointe vers un répertoire temporaire dédié aux tests (voir
 tests/conftest.py, _reset_audit_log_dir), jamais vers /workspace/.audit.
 """
 
+import os
+from pathlib import Path
+
 import httpx
 import pytest
 import respx
@@ -60,6 +63,9 @@ async def test_tier_reversible_auto_approved_call_is_audited(mock_side_services)
     assert entry["arguments"] == {"x": 1, "y": 2}
     assert entry["tier"] == "reversible"
     assert "timestamp" in entry
+    # Phase 1d-révisée : le résultat tel que renvoyé au modèle est archivé
+    # avec l'appel — voir app/audit_log.py, "l'observabilité d'abord".
+    assert entry["result"] == {"content": [{"type": "text", "text": "ok"}]}
 
 
 @pytest.mark.asyncio
@@ -147,3 +153,32 @@ async def test_audit_endpoint_filters_by_thread_id(mock_side_services):
     assert len(matching.json()["entries"]) == 1
     assert other.json()["entries"] == []
     assert len(everything.json()["entries"]) == 1
+
+
+def test_rotation_archives_full_file_as_gzip_and_read_entries_still_sees_it():
+    """Phase 1d-révisée : la persistance des résultats gonfle le volume par
+    rapport à tool+arguments seuls — voir app/audit_log.py,
+    AUDIT_LOG_MAX_BYTES. Un fichier journalier qui dépasse le seuil est
+    compressé (.N.jsonl.gz) avant la prochaine écriture ; read_entries doit
+    rester capable de le relire de façon transparente."""
+    import app.audit_log as audit_log
+
+    audit_log.AUDIT_LOG_MAX_BYTES = 200  # seuil artificiellement bas pour ce test
+    try:
+        # La rotation se décide AVANT chaque écriture, sur la taille déjà sur
+        # disque (voir _rotate_if_needed) : cette première entrée (>200
+        # octets à elle seule) ne déclenche donc rien tout de suite, mais
+        # fait dépasser le seuil pour la PROCHAINE écriture.
+        audit_log.log_tool_call("t1", "write_file", {"path": "a.txt", "content": "x" * 300}, "reversible")
+        assert not list(Path(audit_log.AUDIT_LOG_DIR).glob("*.jsonl.gz"))
+
+        audit_log.log_tool_call("t1", "write_file", {"path": "b.txt", "content": "y"}, "reversible")
+        archives = list(Path(audit_log.AUDIT_LOG_DIR).glob("*.jsonl.gz"))
+        assert len(archives) == 1
+
+        entries = audit_log.read_entries("t1")
+        assert len(entries) == 2
+        assert entries[0]["arguments"]["path"] == "a.txt"
+        assert entries[1]["arguments"]["path"] == "b.txt"
+    finally:
+        audit_log.AUDIT_LOG_MAX_BYTES = int(os.environ.get("AUDIT_LOG_MAX_BYTES", str(20 * 1024 * 1024)))

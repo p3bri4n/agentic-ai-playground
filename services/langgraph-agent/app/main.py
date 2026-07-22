@@ -128,6 +128,9 @@ def _parse_approval_reply(text: str) -> tuple:
     return approved, grant_session
 
 
+_INTERNAL_ERROR_NOTICE = "⚠️ Erreur interne pendant la génération, réessayez."
+
+
 def _format_iteration_limit_notice(tool_calls: list) -> str:
     demandes = ", ".join(f'`{tc["name"]}`({tc["args"]})' for tc in tool_calls)
     return (
@@ -219,6 +222,10 @@ async def _resolve_run(request: ChatCompletionRequest):
         "grant_session": False,
         "empty_answer_retries": 0,
         "slash_command_image_shown": False,
+        "observed_urls": [],
+        "current_page_url": None,
+        "current_page_links": [],
+        "fabricated_navigation_attempts": 0,
     }
     return config, run_input
 
@@ -378,7 +385,7 @@ async def _stream_response(config: dict, run_input: Optional[dict], model: str):
         yield _sse_chunk(
             completion_id,
             model,
-            {"role": "assistant", "content": "⚠️ Erreur interne pendant la génération, réessayez."},
+            {"role": "assistant", "content": _INTERNAL_ERROR_NOTICE},
         )
 
     yield _sse_chunk(completion_id, model, {}, finish_reason="stop")
@@ -533,7 +540,18 @@ async def approve(request: ApprovalDecisionRequest):
             "owui_message_count": owui_message_count,
         },
     )
-    await agent_graph.ainvoke(None, config)
+    try:
+        await agent_graph.ainvoke(None, config)
+    except Exception:
+        # Parité avec _stream_response (chemin streaming) : sans ce filet,
+        # une erreur ici (ex. dépassement de contexte LLM, `llama-server`/
+        # TabbyAPI qui coupe la connexion...) remontait en 500 brut au lieu
+        # d'une notice propre — constaté en conditions réelles pendant le
+        # harnais tests_integration/test_web_tasks.py (T8/T11, pages web
+        # réelles volumineuses). `_current_answer` n'est PAS appelé ici : le
+        # graphe a pu s'arrêter en plein milieu sans état cohérent à relire.
+        logger.exception("Erreur pendant /approve (thread_id=%s)", thread_id)
+        return {"content": _INTERNAL_ERROR_NOTICE}
 
     return {"content": await _current_answer(config)}
 
@@ -547,7 +565,28 @@ async def chat_completions(request: ChatCompletionRequest):
             _stream_response(config, run_input, request.model), media_type="text/event-stream"
         )
 
-    await agent_graph.ainvoke(run_input, config)
+    try:
+        await agent_graph.ainvoke(run_input, config)
+    except Exception:
+        # Voir la même parenthèse dans /approve ci-dessus : même filet que
+        # le chemin streaming (_stream_response), absent ici jusqu'ici.
+        logger.exception(
+            "Erreur pendant /v1/chat/completions non-streaming (thread_id=%s)",
+            config["configurable"]["thread_id"],
+        )
+        return {
+            "id": f"chatcmpl-{uuid.uuid4().hex[:12]}",
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": request.model,
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": _INTERNAL_ERROR_NOTICE},
+                    "finish_reason": "stop",
+                }
+            ],
+        }
 
     return {
         "id": f"chatcmpl-{uuid.uuid4().hex[:12]}",
