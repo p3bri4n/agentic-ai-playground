@@ -911,7 +911,7 @@ def _apply_adaptive_thinking(messages: list, session_grants) -> list:
     return [SystemMessage(content=NO_THINK_DIRECTIVE)] + messages
 
 
-async def call_llm(state: AgentState) -> dict:
+async def call_llm(state: AgentState, config: dict) -> dict:
     bound_llm = await _get_bound_llm()
     messages_for_llm = [
         SystemMessage(content=f"{GROUNDING_DIRECTIVE}\n{DOWNLOAD_DIRECTIVE}")
@@ -958,6 +958,20 @@ async def call_llm(state: AgentState) -> dict:
                 fallback["args"],
             )
             merged.tool_calls = [fallback]
+
+    # Observabilité (Phase 1d-révisée, voir HISTORY.md "correctif
+    # extraction" -> "OBSERVABILITÉ") : persiste CE tour du modèle
+    # (raisonnement <think> + texte + tool_calls éventuels), qu'il soit
+    # ensuite auto-approuvé, soumis à approbation ou refusé — contrairement
+    # au journal des tool_calls (log_tool_call), volontairement partiel par
+    # tier, cette trace-ci n'a pas besoin d'être sélective : c'est le
+    # raisonnement de l'agent, jamais un effet de bord à filtrer.
+    thread_id = config.get("configurable", {}).get("thread_id", "")
+    audit_log.log_message(
+        thread_id,
+        "assistant",
+        {"content": merged.content, "tool_calls": getattr(merged, "tool_calls", None)},
+    )
 
     return {
         "messages": [merged],

@@ -247,10 +247,29 @@ services:
   # mcp/playwright supporte un mode serveur HTTP natif (`--port`, endpoint
   # Streamable HTTP `/mcp`) ; on l'utilise ici comme service persistant,
   # même patron que GhostDesk/OCR ci-dessous.
+  # Un volume nommé Docker est créé root:root par défaut ; l'image
+  # mcp/playwright tourne en "node" (uid 1000), qui ne peut donc PAS écrire
+  # dans /downloads sans ce correctif — constaté en conditions réelles
+  # (browser_navigate échouait systématiquement en EACCES en tentant
+  # d'écrire son propre snapshot de debug page-*.yml sous --output-dir,
+  # voir HISTORY.md "Phase 1d-révisée", vérification post-déploiement T5).
+  # Tourne une fois avant playwright-mcp (condition
+  # service_completed_successfully), jamais en continu.
+  agent-downloads-init:
+    image: busybox
+    container_name: agent-downloads-init
+    command: ["chown", "-R", "1000:1000", "/downloads"]
+    volumes:
+      - agent-downloads:/downloads
+    restart: "no"
+
   playwright-mcp:
     image: mcp/playwright:latest
     container_name: playwright-mcp
     restart: unless-stopped
+    depends_on:
+      agent-downloads-init:
+        condition: service_completed_successfully
     command:
       - --host=0.0.0.0
       - --port=8931
@@ -461,4 +480,18 @@ volumes:
   # ci-dessous, HISTORY.md "Phase 1d-révisée" (T5). On partage les
   # ARTEFACTS de téléchargement, jamais l'état du navigateur : playwright-mcp
   # reste --isolated (profil en mémoire, jamais persisté).
+  #
+  # `name:` FIXE (pas de préfixe de projet compose) : mcp-client spawne le
+  # serveur filesystem via `docker run` BRUT sur le socket hôte (voir
+  # services/mcp-client/app/main.py), un appel totalement extérieur à ce
+  # fichier compose — le préfixage automatique "<projet>_agent-downloads"
+  # ne s'applique QUE quand Docker Compose résout lui-même le nom depuis ce
+  # fichier (ex. le volume de playwright-mcp ci-dessus). Sans ce `name:`
+  # explicite, les deux services pointaient vers deux volumes DIFFÉRENTS
+  # (celui, vide, que `docker run` créait implicitement sous le nom littéral
+  # "agent-downloads") — bug constaté en conditions réelles : le fichier
+  # téléchargé existait bien côté playwright-mcp mais `read_file` échouait
+  # en ENOENT côté filesystem-MCP (voir HISTORY.md, vérification
+  # post-déploiement T5).
   agent-downloads:
+    name: agent-downloads

@@ -53,6 +53,13 @@ _DEFAULT_TIER_READ = {
     "mouse_move",
     "find_text",  # OCR d'appoint (ocr-service) : lecture pure, aucun effet de bord
     "read_screen",
+    # Localisation/extraction ciblée dans la page (Phase 1d-révisée, voir
+    # HISTORY.md "correctif extraction") : lecture pure malgré son
+    # implémentation interne via browser_evaluate (mcp-client) — le modèle ne
+    # fournit qu'un texte à chercher, jamais de code (voir
+    # services/mcp-client/app/main.py, _build_extract_function : template JS
+    # FIXE, requête interpolée via json.dumps).
+    "browser_extract",
     "clipboard_get",  # lecture au sens outil, mais reste TIER_SENSITIVE : voir override ci-dessous
     "run_command",
     "read_file",

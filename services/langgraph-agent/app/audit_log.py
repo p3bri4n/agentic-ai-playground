@@ -60,22 +60,53 @@ def _rotate_if_needed(path: Path) -> None:
     path.unlink()
 
 
-def log_tool_call(
-    thread_id: str, tool_name: str, arguments: dict, tier: str, result: Optional[dict] = None
-) -> None:
-    entry = {
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "thread_id": thread_id,
-        "tool": tool_name,
-        "arguments": arguments,
-        "tier": tier,
-        "result": result,
-    }
+def _append_entry(entry: dict) -> None:
     path = _log_path_for(datetime.now(timezone.utc))
     path.parent.mkdir(parents=True, exist_ok=True)
     _rotate_if_needed(path)
     with path.open("a", encoding="utf-8") as f:
         f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+
+def log_tool_call(
+    thread_id: str, tool_name: str, arguments: dict, tier: str, result: Optional[dict] = None
+) -> None:
+    _append_entry(
+        {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "thread_id": thread_id,
+            "tool": tool_name,
+            "arguments": arguments,
+            "tier": tier,
+            "result": result,
+        }
+    )
+
+
+def log_message(thread_id: str, role: str, content) -> None:
+    """
+    Observabilité (Phase 1d-révisée, voir HISTORY.md "correctif extraction"
+    -> "OBSERVABILITÉ") : persiste le message ASSISTANT (raisonnement
+    <think> inclus + réponse finale, voir call_llm/app/graph.py) produit à
+    chaque tour — dernière pièce manquante de l'archive. Sans elle, une
+    investigation d'archive ne pouvait reconstruire QUE ce que l'agent a
+    perçu (résultats d'outils, voir log_tool_call) et sa séquence d'actions,
+    jamais son propre raisonnement/texte — limite honnêtement signalée
+    plusieurs fois pendant le diagnostic T1/T7/T10 (voir HISTORY.md).
+    `kind: "message"` distingue ces entrées des tool_calls (`kind` absent
+    pour ceux-ci, rétrocompatible) à la lecture — voir GET /audit,
+    app/main.py, qui reste volontairement générique (renvoie tout, au
+    consommateur de filtrer).
+    """
+    _append_entry(
+        {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "thread_id": thread_id,
+            "kind": "message",
+            "role": role,
+            "content": content,
+        }
+    )
 
 
 def _iter_log_files(root: Path):

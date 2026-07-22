@@ -77,6 +77,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+import uuid
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
@@ -90,6 +91,7 @@ pytestmark = pytest.mark.skipif(
 )
 
 AGENT_CONTAINER = os.environ.get("LANGGRAPH_AGENT_CONTAINER", "langgraph-agent")
+MCP_CLIENT_CONTAINER = os.environ.get("MCP_CLIENT_CONTAINER", "mcp-client")
 N_REPETITIONS = int(os.environ.get("WEB_TASKS_REPETITIONS", "3"))
 MAX_APPROVAL_ROUNDS = int(os.environ.get("WEB_TASKS_MAX_APPROVAL_ROUNDS", "40"))
 CHAT_TIMEOUT_SECONDS = int(os.environ.get("WEB_TASKS_CHAT_TIMEOUT", "240"))
@@ -562,6 +564,35 @@ def _purge_downloads_volume() -> None:
     )
 
 
+def _reset_browser_session() -> None:
+    """
+    Isolation entre tâches (Phase 1d-révisée, voir HISTORY.md "isolation
+    entre tâches") : la session Playwright de mcp-client est PERSISTANTE et
+    PARTAGÉE (voir services/mcp-client/app/main.py, "browser"), pas scopée
+    par thread langgraph-agent ni par tâche — sans ce reset, un onglet
+    laissé ouvert par une tâche (ex. T10, books.toscrape.com) reste visible
+    dans le snapshot d'une tâche suivante COMPLÈTEMENT différente (ex. T7),
+    parfois plusieurs campagnes/heures plus tard (constaté en conditions
+    réelles). Appelé avant CHAQUE répétition, comme
+    `_purge_downloads_volume` — mêmes garanties, même échelle. `check=False`
+    (best-effort) : un mcp-client temporairement indisponible ne doit pas
+    faire échouer toute la tâche pour un simple nettoyage préventif.
+    """
+    script = """
+import urllib.request, urllib.error
+req = urllib.request.Request('http://localhost:8003/reset-session/browser', data=b'', method='POST')
+try:
+    urllib.request.urlopen(req, timeout=10)
+except urllib.error.HTTPError:
+    pass
+"""
+    subprocess.run(
+        ["docker", "exec", "-i", MCP_CLIENT_CONTAINER, "python3", "-c", script],
+        check=False,
+        capture_output=True,
+    )
+
+
 @pytest.fixture(scope="session", autouse=True)
 def _reset_hr_submissions():
     """T2 vérifie la DERNIÈRE soumission : repartir d'un fichier propre évite
@@ -591,6 +622,7 @@ def _run_campaign():
     for task_id, prompt, assert_fn in tasks:
         for rep in range(1, N_REPETITIONS + 1):
             _purge_downloads_volume()
+            _reset_browser_session()
             result = run_task(prompt)
             ok, detail = (False, result.error) if result.error else assert_fn(result.final_text, prompt)
             cause = _classify_failure_cause(task_id, result, ok, detail)
@@ -679,6 +711,70 @@ def test_web_tasks_baseline():
     assert rows, "aucune tâche exécutée"
 
 
+T7_NOISE_REPORT_PATH = Path(__file__).parent / "TASKS-T7-NOISE-baseline.md"
+
+
+def test_t7_noise_baseline():
+    """
+    Mesure de bruit dédiée (Phase 1d-révisée, voir HISTORY.md "correctif
+    extraction") : T7 recule 3/3 (1c) -> 1/3 (post-1d) sans qu'aucune des
+    variables identifiées (browser_evaluate, DOWNLOAD_DIRECTIVE, volume
+    d'approbations) ne l'explique dans les archives — son succès 1c
+    n'utilisait déjà pas browser_evaluate. Avec n=3, un 3/3->1/3 peut être
+    de la variance pure du LLM (temperature=0.2, pas 0). 5 répétitions
+    supplémentaires ICI, à CONFIGURATION INCHANGÉE (avant le correctif
+    d'extraction), pour dimensionner ce bruit AVANT d'introduire une
+    nouvelle variable — sert de référence de comparaison.
+    """
+    task_id, base_prompt, assert_fn = next(t for t in TASKS if t[0] == "T7_impossible_par_construction")
+    rows = []
+    for rep in range(1, 6):
+        # Marqueur unique par répétition (voir _derive_thread_id, app/main.py :
+        # hachage du texte EXACT du 1er message humain) : sans lui, les 5
+        # "répétitions" partageraient le MÊME thread que la campagne
+        # précédente (déjà chaud, grants déjà accordés) — constaté en
+        # conditions réelles lors d'un premier essai (0 approbation sur les 5
+        # répétitions, détail et tool_calls_observed strictement identiques :
+        # signe que le modèle rejouait depuis la mémoire de conversation,
+        # pas une mesure indépendante).
+        prompt = f"{base_prompt} (essai {uuid.uuid4().hex[:8]})"
+        _reset_browser_session()
+        result = run_task(prompt)
+        ok, detail = (False, result.error) if result.error else assert_fn(result.final_text, prompt)
+        rows.append(
+            {
+                "repetition": rep,
+                "success": ok,
+                "detail": detail,
+                "approvals": result.approvals,
+                "tool_calls_observed": result.tool_calls_observed,
+                "duration_seconds": round(result.duration_seconds, 1),
+            }
+        )
+
+    n_ok = sum(1 for r in rows if r["success"])
+    lines = [
+        "# T7 — mesure de bruit (5 répétitions, configuration post-1d inchangée)",
+        "",
+        f"Générée automatiquement le {datetime.now(timezone.utc).isoformat()}. "
+        "Référence AVANT le correctif d'extraction (`browser_extract`) — voir HISTORY.md.",
+        "",
+        f"**Score : {n_ok}/5.**",
+        "",
+        "| # | Succès | Détail | Approbations | Tool calls | Durée (s) |",
+        "|---|---|---|---|---|---|",
+    ]
+    for r in rows:
+        status = "✅" if r["success"] else "❌"
+        lines.append(
+            f"| {r['repetition']} | {status} | {r['detail']} | {r['approvals']} | "
+            f"{r['tool_calls_observed']} | {r['duration_seconds']} |"
+        )
+    T7_NOISE_REPORT_PATH.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    assert rows, "aucune répétition exécutée"
+
+
 def test_download_then_filesystem_read_roundtrip():
     """
     Test dédié (Phase 1d-révisée, point 6 — voir HISTORY.md, T5) : vérifie
@@ -688,9 +784,22 @@ def test_download_then_filesystem_read_roundtrip():
     présent dans le volume partagé (vérifié directement via playwright-mcp,
     pas seulement déduit de la réponse finale de l'agent) -> lecture réussie
     via l'outil filesystem -> assertion sur le contenu (masse salariale).
+
+    `thread_id` dérivé par hachage du texte EXACT du premier message humain
+    (voir `app/main.py`, `_derive_thread_id`) : sans un marqueur unique par
+    exécution, ce test réutiliserait le MÊME thread qu'une exécution
+    antérieure (campagne complète comprise) tant que le conteneur
+    `langgraph-agent` n'a pas redémarré — l'agent répondrait alors
+    correctement EN MÉMOIRE de la conversation précédente, sans retélécharger
+    ni relire le fichier, ce qui invaliderait justement la vérification
+    round-trip que ce test existe pour faire (constaté en conditions
+    réelles : un rejeu immédiat après un premier run répondait juste en 7s
+    sans un seul appel d'outil).
     """
     _purge_downloads_volume()
+    _reset_browser_session()
     task_id, prompt, assert_fn = next(t for t in TASKS if t[0] == "T5_telechargement_calcul")
+    prompt = f"{prompt} (essai {uuid.uuid4().hex[:8]})"
     result = run_task(prompt)
 
     assert result.error is None, f"erreur infra : {result.error}"

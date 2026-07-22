@@ -6,6 +6,7 @@ du socket Docker ni des images mcp/* réelles.
 """
 
 import asyncio
+import json
 import socket
 import subprocess
 import sys
@@ -381,3 +382,112 @@ def test_persistent_session_dropped_and_reopened_after_error(monkeypatch):
     assert calls["n"] == 2
     # la session rouverte (la 2e) est bien celle mise en cache pour le prochain appel
     assert main_mod._persistent_sessions["browser"][1].id == 2
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# browser_extract (Phase 1d-révisée, voir HISTORY.md "correctif extraction") :
+# outil synthétique dispatché en interne vers browser_evaluate avec un
+# template JS FIXE — le modèle ne fournit jamais de code, seulement un texte
+# à chercher.
+# ─────────────────────────────────────────────────────────────────────────
+
+BROWSER_EVALUATE_ECHO_SERVER_PATH = Path(__file__).parent / "fixtures" / "browser_evaluate_echo_server.py"
+
+
+def test_build_extract_function_embeds_query_as_escaped_json_string():
+    """Fonction pure : la requête est interpolée via json.dumps (syntaxe de
+    chaîne JSON = syntaxe de chaîne JS valide), jamais concaténée brute — un
+    guillemet ou un backslash dans la requête ne peut donc jamais faire
+    "s'échapper" du littéral de chaîne vers du code JS arbitraire."""
+    import app.main as main_mod
+
+    js = main_mod._build_extract_function('") ; alert(1); ("')
+    assert json.dumps('") ; alert(1); ("') in js
+    assert js.count("const query =") == 1
+    assert "document.createTreeWalker" in js
+
+
+@pytest.fixture
+def browser_evaluate_echo_server():
+    import app.main as main_mod
+
+    main_mod.SERVERS = {
+        "browser": {
+            "transport": "stdio",
+            "params": StdioServerParameters(
+                command=sys.executable, args=[str(BROWSER_EVALUATE_ECHO_SERVER_PATH)]
+            ),
+        },
+    }
+    main_mod._tool_registry.clear()
+    yield
+    main_mod._tool_registry.clear()
+
+
+def test_browser_extract_is_registered_when_browser_server_present(browser_evaluate_echo_server):
+    resp = _client().get("/tools/schema")
+    names = {t["function"]["name"] for t in resp.json()["tools"]}
+    assert "browser_extract" in names
+    assert "browser_evaluate" in names  # le vrai outil reste exposé tel quel, pas remplacé
+
+
+def test_browser_extract_dispatches_to_browser_evaluate_with_fixed_template(browser_evaluate_echo_server):
+    """Le serveur de test renvoie tel quel le JS reçu (voir
+    browser_evaluate_echo_server.py) : permet de vérifier le template
+    généré SANS dépendre d'un vrai navigateur."""
+    import app.main as main_mod
+
+    resp = _client().post("/call", json={"tool": "browser_extract", "arguments": {"query": "KX-4471"}})
+    assert resp.status_code == 200
+    text = resp.json()["content"][0]["text"]
+    assert text == main_mod._build_extract_function("KX-4471")
+    assert json.dumps("KX-4471") in text
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# POST /reset-session/{server_name} (Phase 1d-révisée, voir HISTORY.md
+# "isolation entre tâches") : purge une session persistante (état
+# navigateur/onglets pour "browser") entre deux tâches du harnais.
+# ─────────────────────────────────────────────────────────────────────────
+
+
+def test_reset_session_drops_cache_and_next_call_reopens_fresh(monkeypatch):
+    import app.main as main_mod
+
+    main_mod.SERVERS = {
+        "browser": {"transport": "http", "url": "http://unused", "token": "", "persistent_session": True},
+    }
+    main_mod._persistent_sessions.clear()
+    main_mod._persistent_locks["browser"] = asyncio.Lock()
+    calls = _patch_open_session(main_mod, monkeypatch)
+
+    async def action(session):
+        return session.id
+
+    async def run():
+        first = await main_mod._run_on_server("browser", action)
+        return first
+
+    first = asyncio.run(run())
+    assert first == 1
+
+    resp = _client().post("/reset-session/browser")
+    assert resp.status_code == 200
+    assert "browser" not in main_mod._persistent_sessions
+
+    second = asyncio.run(run())
+    assert second == 2  # nouvelle session rouverte, pas l'ancienne réutilisée
+    assert calls["n"] == 2
+
+
+def test_reset_session_unknown_server_is_404():
+    main_mod_resp = _client().post("/reset-session/does-not-exist")
+    assert main_mod_resp.status_code == 404
+
+
+def test_reset_session_non_persistent_server_is_404():
+    """echo (fixture par défaut) n'est pas configuré en session persistante :
+    rien à réinitialiser, 404 plutôt qu'un no-op silencieux qui masquerait
+    une faute de frappe côté appelant."""
+    resp = _client().post("/reset-session/echo")
+    assert resp.status_code == 404

@@ -21,6 +21,7 @@ mcp-client s'y connecte en Streamable HTTP au lieu de spawn un container.
 """
 
 import asyncio
+import json
 import os
 from contextlib import AsyncExitStack
 
@@ -125,6 +126,78 @@ SERVERS = {
     },
 }
 
+# Outil de LOCALISATION/EXTRACTION CIBLÉE (Phase 1d-révisée, voir HISTORY.md
+# "correctif extraction") : le MCP Playwright officiel n'expose aucun outil
+# "cherche ce texte et donne son contexte" (vérifié : browser_click/hover/
+# select_option exigent tous une cible déjà localisée ; seuls
+# browser_evaluate/browser_run_code_unsafe permettent de chercher, au prix
+# de code JS arbitraire, tier ENGAGEMENT). Constaté en conditions réelles
+# (T1/T10, campagne post-1d) que rendre ces deux outils jamais accordables
+# pour la session (voir approval_policy.NEVER_GRANTABLE_TOOLS côté
+# langgraph-agent) a fait disparaître leur usage — remplacé par une
+# exploration manuelle (ctrl+f, parcours page par page) nettement moins
+# fiable. La VOIE PROPRE reçoit ici la capacité de la béquille : un
+# TEMPLATE JS FIXE (jamais de code fourni par le modèle, seulement un texte
+# à chercher, interpolé via json.dumps — donc échappé comme une chaîne JS
+# valide, aucune injection de code possible) qui parcourt les nœuds texte de
+# la page et renvoie les occurrences avec leur contexte proche (texte du
+# parent, lien englobant s'il existe). Le modèle ne voit jamais ce template,
+# seulement le paramètre "query".
+_BROWSER_EXTRACT_JS_TEMPLATE = """() => {{
+  const query = {query_json};
+  const q = query.toLowerCase();
+  const results = [];
+  const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+  let node;
+  while ((node = walker.nextNode())) {{
+    const text = (node.textContent || '').trim();
+    if (!text || !text.toLowerCase().includes(q)) continue;
+    const parent = node.parentElement;
+    const link = parent ? parent.closest('a') : null;
+    results.push({{
+      text: text.slice(0, 300),
+      parent_tag: parent ? parent.tagName.toLowerCase() : null,
+      parent_text: parent ? parent.textContent.trim().slice(0, 300) : null,
+      link_href: link ? link.getAttribute('href') : null,
+    }});
+    if (results.length >= 20) break;
+  }}
+  return JSON.stringify(results);
+}}"""
+
+
+def _build_extract_function(query: str) -> str:
+    """Fonction pure (testable sans aucun serveur MCP réel) : construit le
+    JS fixe ci-dessus avec `query` interpolé via `json.dumps` — une syntaxe
+    de chaîne JSON est une syntaxe de chaîne JS valide, donc cet
+    échappement est suffisant pour empêcher toute évasion de la chaîne
+    littérale (guillemets, backslashs, retours à la ligne dans la requête)."""
+    return _BROWSER_EXTRACT_JS_TEMPLATE.format(query_json=json.dumps(query))
+
+
+_BROWSER_EXTRACT_TOOL = {
+    "server": "browser",  # dispatché en interne vers browser_evaluate, voir call_tool()
+    "description": (
+        "Cherche un TEXTE (pas du code) dans la page actuelle — référence "
+        "produit, prix, nom, mot-clé — et renvoie les occurrences avec leur "
+        "contexte proche (texte du parent, lien englobant si présent). "
+        "Pour trouver une valeur précise dans une page, utilise CET outil : "
+        "pas de parcours manuel page par page, pas de raccourci "
+        "clavier de recherche (ctrl+f)."
+    ),
+    "inputSchema": {
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": "Texte exact ou partiel à chercher (ex: une référence produit, un nom).",
+            },
+        },
+        "required": ["query"],
+        "additionalProperties": False,
+    },
+}
+
 app = FastAPI(title="MCP Client")
 
 # registre {nom_outil: {"server", "description", "inputSchema"}}, construit
@@ -222,6 +295,11 @@ async def _refresh_registry():
         except Exception:
             # un serveur indisponible ne doit pas bloquer le démarrage des autres
             continue
+    # Outil synthétique (voir _BROWSER_EXTRACT_TOOL ci-dessus) : n'existe sur
+    # aucun serveur MCP réel, ajouté après coup pour ne jamais être écrasé
+    # par un rafraîchissement qui ne verrait, lui, que les serveurs réels.
+    if "browser" in SERVERS:
+        _tool_registry["browser_extract"] = _BROWSER_EXTRACT_TOOL
 
 
 class CallRequest(BaseModel):
@@ -232,6 +310,34 @@ class CallRequest(BaseModel):
 @app.get("/health")
 async def health():
     return {"status": "ok"}
+
+
+@app.post("/reset-session/{server_name}")
+async def reset_session(server_name: str):
+    """
+    Réinitialisation explicite d'une session PERSISTANTE (Phase 1d-révisée,
+    voir HISTORY.md "isolation entre tâches") : jette la session en cache
+    (`_drop_persistent_session`), le prochain appel en rouvrira une neuve.
+    Sans ce point d'entrée, seul un redémarrage complet du service (ou une
+    exception fortuite pendant un appel) purgeait l'état d'une session
+    persistante — pour "browser" (playwright-mcp), cela signifiait des
+    onglets/URL laissés ouverts d'une tâche à l'autre, silencieusement
+    visibles dans le snapshot de la tâche SUIVANTE (constaté en conditions
+    réelles : un onglet "Science | Books to Scrape" resté ouvert après T10
+    polluait le snapshot de T7 dans une répétition ultérieure, plusieurs
+    campagnes/heures plus tard).
+    404 si `server_name` n'est pas configuré en session persistante (rien à
+    réinitialiser) plutôt qu'un no-op silencieux — évite qu'un nom de
+    serveur mal orthographié passe inaperçu côté appelant (le harnais de
+    tâches web, voir tests_integration/test_web_tasks.py).
+    """
+    if not SERVERS.get(server_name, {}).get("persistent_session"):
+        raise HTTPException(
+            status_code=404,
+            detail=f"'{server_name}' n'est pas configuré en session persistante.",
+        )
+    await _drop_persistent_session(server_name)
+    return {"status": "reset"}
 
 
 @app.get("/tools")
@@ -270,6 +376,16 @@ async def call_tool(request: CallRequest):
     tool_info = _tool_registry.get(request.tool)
     if not tool_info:
         raise HTTPException(status_code=404, detail=f"Outil inconnu : {request.tool}")
+
+    if request.tool == "browser_extract":
+        # Dispatché en interne vers browser_evaluate avec un template JS FIXE
+        # (voir _build_extract_function) : le modèle ne fournit jamais de
+        # code, seulement le texte à chercher.
+        js_function = _build_extract_function(request.arguments.get("query", ""))
+        result = await _run_on_server(
+            "browser", lambda s: s.call_tool("browser_evaluate", {"function": js_function})
+        )
+        return {"content": [block.model_dump() for block in result.content]}
 
     result = await _run_on_server(
         tool_info["server"], lambda s: s.call_tool(request.tool, request.arguments)

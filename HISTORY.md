@@ -644,3 +644,231 @@ nouvel argument de commande) avant de rejouer la Campagne A — voir
 commandes au checkpoint. 🧑 **Checkpoint : rejouer la Campagne A (critères :
 T5 et T8 remontent, T1/T4/T7/T10 tiennent) avant de considérer la Phase 1
 close.**
+
+## Phase 1d-révisée — vérification post-déploiement : deux bugs d'infra, puis Campagne A
+
+Avant de pouvoir rejouer la Campagne A, deux bugs d'infra découverts en
+testant le round-trip T5 pour de vrai (aucun des deux n'était visible en
+tests unitaires, qui mockent mcp-client) :
+
+1. **Deux volumes Docker différents sous le même nom** : `docker-compose.yml`
+   référence `agent-downloads` (résolu par Compose en
+   `agentic-ai-playground_agent-downloads`), mais `mcp-client` spawne le
+   serveur filesystem via un `docker run` BRUT sur le socket hôte (voir
+   `services/mcp-client/app/main.py`) — cet appel est extérieur au fichier
+   compose et Docker n'applique aucun préfixe : "agent-downloads" y
+   désignait un volume totalement différent (vide, créé à la volée).
+   Conséquence concrète : le fichier téléchargé existait bien côté
+   playwright-mcp mais `read_file` échouait en `ENOENT` côté filesystem-MCP,
+   silencieusement (TIER_READ, jamais audité). Corrigé en fixant le nom réel
+   du volume (`name: agent-downloads` dans `docker-compose.yml`), qui
+   supprime toute ambiguïté de préfixage.
+2. **Permissions du volume** : un volume Docker nommé est créé `root:root`
+   par défaut ; l'image `mcp/playwright` tourne en utilisateur `node` (uid
+   1000), qui ne pouvait donc pas écrire dans `/downloads` — `browser_navigate`
+   échouait systématiquement en `EACCES` en tentant d'écrire son propre
+   snapshot de debug sous `--output-dir`. Découvert directement grâce au
+   résultat désormais persisté dans le journal d'audit (`entry["result"]`,
+   voir point 1 de ce chantier) — sans lui, ce bug serait resté invisible
+   (audit ne journalisait avant que tool+arguments). Corrigé par un
+   conteneur d'initialisation dédié (`agent-downloads-init`, `chown -R
+   1000:1000`, `condition: service_completed_successfully` avant
+   `playwright-mcp`).
+
+Un test isolé du round-trip complet a aussi révélé que le harnais lui-même
+(`run_task`/`_derive_thread_id`, hachage du texte EXACT du 1er message
+humain) réutilise le MÊME thread qu'une exécution précédente tant que le
+conteneur `langgraph-agent` n'a pas redémarré — un rejeu immédiat de
+`test_download_then_filesystem_read_roundtrip` répondait juste depuis la
+mémoire de conversation en 7s, sans un seul appel d'outil, masquant
+totalement le bug ci-dessus. Corrigé pour CE test précis (marqueur unique
+par exécution ajouté au prompt) ; **limite documentée mais non corrigée**
+pour la Campagne A elle-même — les 3 répétitions de chaque tâche y
+partagent volontairement le même thread depuis l'origine du harnais (voir
+docstring de `app/main.py`), donc les répétitions 2/3 restent des mesures
+de robustesse du GRANT DE SESSION plus que des essais totalement
+indépendants. Effet de bord potentiel sur les scores T5 : difficile à
+distinguer "l'agent relit le fichier" de "l'agent se souvient de la
+conversation" sur les répétitions 2/3 — non tranché ici.
+
+**Campagne A rejouée** (résultat complet :
+`tests_integration/TASKS-BASELINE-post-phase1d.md`) — **3 des 6 critères
+manqués** :
+
+| Critère | Résultat |
+|---|---|
+| T5 remonte | ✅ 0/3 (1c) → 3/3 |
+| T8 remonte | ⚠️ 0/3 (1c) → 2/3 (amélioré, pas résolu) |
+| T1 tient | ❌ 3/3 (1c) → 0/3 |
+| T4 tient | ✅ 3/3 → 3/3 |
+| T7 tient | ❌ 3/3 (1c) → 1/3 |
+| T10 tient | ❌ 3/3 (1c) → 0/3 |
+
+Score global inchangé (24/33) mais mix de tâches très différent. T7 est le
+recul le plus préoccupant : c'était le "témoin sensible" désigné
+précisément pour détecter un effet de bord du feedback de fabrication — or
+le plafond conditionnel qui l'aurait pu affecter était déjà reverté AVANT
+cette campagne (retour au message inconditionnel de 1c). Deux hypothèses
+non tranchées consignées dans le rapport : (a) `DOWNLOAD_DIRECTIVE` ajoutée
+au system prompt de TOUTE requête, y compris les tâches T1/T7/T10 qui n'ont
+aucun rapport avec un téléchargement — jamais mesuré isolément si cet ajout
+dilue l'attention sur des tâches non concernées ; (b) non-déterminisme du
+LLM (`temperature=0.2`) — T1/T7 échouent avec les MÊMES URL fabriquées que
+dans tous les rapports précédents, un motif déjà connu, pas nouveau en soi.
+🧑 **Checkpoint : décider comment traiter les régressions T1/T7/T10 avant de
+considérer la Phase 1 close — la Phase 0 seule est un GO net, T5/T8
+progressent, mais le critère "aucun recul" n'est pas rempli.**
+
+## Phase 1d-révisée — discrimination des régressions T1/T7/T10 (archives, zéro run)
+
+Comparaison, à partir des résultats désormais persistés dans le journal
+d'audit (voir plus haut), des threads déterministes T1/T7/T10 (thread_id =
+hash du prompt exact) entre la fenêtre 1c (~16:03-16:19) et 1d
+(~18:06-18:20) — sans rejouer aucune tâche.
+
+**Verdict : disparition de `browser_evaluate`, pas de trace de
+`DOWNLOAD_DIRECTIVE`, pas de signal net sur le volume d'approbations.**
+- **T1** : 1c termine par un `browser_evaluate` (succès, 3/3) ; 1d ne
+  l'utilise JAMAIS — remplacé par `ctrl+f`/frappe puis visite manuelle
+  produit par produit (échec, 0/3, 111 tool_calls vs 88.7 en 1c : plus
+  d'appels, pas plus efficace).
+- **T10** : même signal, plus net — 1c termine par 2× `browser_evaluate`
+  (succès, 3/3) ; 1d n'en utilise aucun, remplacé par du cyclage
+  navigate/tabs/snapshot/click qui ne converge pas (0/3).
+- **T7** : INCONCLUANT — sa fenêtre 1c "succès" n'utilisait déjà PAS
+  `browser_evaluate` (juste click/snapshot/navigate), donc son recul
+  (3/3→1/3) n'est pas expliqué par la même mécanique. Nécessite un regard
+  séparé (voir plus bas).
+- Aucune trace comportementale de dérive vers un téléchargement sur ces 3
+  threads (aucun outil lié à un fichier n'apparaît) — limite honnête :
+  le raisonnement textuel du modèle n'est pas persisté, seul le
+  comportement observable l'est.
+- Volume d'approbations inchangé (T1 : 1.7 en 1c comme en 1d) — pas un
+  changement de friction humaine, un changement de STRATÉGIE du modèle.
+
+## Phase 1d-révisée — correctif extraction : la voie propre reçoit la capacité de la béquille
+
+`NEVER_GRANTABLE_TOOLS` (voir plus haut) a fait disparaître `browser_evaluate`
+de l'usage effectif sur T1/T10 sans remplacement équivalent — décision NON
+reversée (l'élévation qu'il corrige reste réelle), le besoin légitime
+derrière la béquille (extraction ciblée dans une page) est à la place
+donné à un outil dédié :
+
+1. **Vérification préalable** : le MCP Playwright officiel n'expose AUCUN
+   outil "cherche ce texte, donne son contexte" — `browser_click`/`hover`/
+   `select_option` exigent tous une cible déjà localisée ; seuls
+   `browser_evaluate`/`browser_run_code_unsafe` permettent de chercher, au
+   prix de code JS arbitraire. Rien à documenter, un outil manque
+   réellement.
+2. **`browser_extract(query)`** (`services/mcp-client/app/main.py`) : outil
+   SYNTHÉTIQUE (n'existe sur aucun serveur MCP réel, injecté dans le
+   registre après coup), dispatché en interne vers `browser_evaluate` avec
+   un **template JS FIXE** (`_build_extract_function`) — la requête est
+   interpolée via `json.dumps` (syntaxe de chaîne JSON = syntaxe de chaîne
+   JS valide), le modèle ne fournit JAMAIS de code, seulement un texte à
+   chercher. Parcourt les nœuds texte de la page (`TreeWalker`), renvoie
+   les occurrences (jusqu'à 20) avec leur contexte (texte du parent, lien
+   englobant). Tier LECTURE (`approval_policy.TIER_READ_TOOLS`) —
+   `browser_evaluate`/`browser_run_code_unsafe` restent eux TIER_SENSIBLE
+   ET `NEVER_GRANTABLE`, inchangés.
+3. Description d'outil explicite (visible du modèle via `bind_tools`) :
+   "pas de parcours manuel page par page, pas de ctrl+f" — la consigne vit
+   dans la description de l'outil concerné, pas dans le system prompt
+   global (leçon de `DOWNLOAD_DIRECTIVE`, voir plus bas).
+4. Bascule de déploiement temporaire `ENABLE_BROWSER_EXTRACT`
+   (mcp-client) : a permis de mesurer isolément l'effet du reset de
+   session navigateur (point suivant) avant d'introduire cette seconde
+   variable — retirée une fois le correctif adopté.
+
+## Phase 1d-révisée — isolation entre tâches : la contamination d'onglets découverte via le T7×5
+
+Avant le correctif extraction, mesure de bruit dédiée demandée pour T7 (n=5,
+config post-1d inchangée) : **1er essai reproduit la contamination
+identique à un défaut déjà connu** — 0/5, détail et tool_calls_observés
+STRICTEMENT identiques sur les 5 répétitions, alors que chacune utilisait un
+thread_id UNIQUE (marqueur ajouté au prompt) donc 0 approbation attendue
+uniquement si le modèle rejoue depuis une mémoire de conversation qu'il ne
+devrait pas avoir. Investigation : le snapshot de CHAQUE run montrait un
+onglet fantôme `[Science | Books to Scrape - Sandbox]` (résidu de T10,
+tâche totalement différente) en plus de l'onglet courant.
+
+**Cause racine** : `playwright-mcp` ("browser" dans `services/mcp-client/
+app/main.py`) est une session MCP PERSISTANTE et PARTAGÉE par tout
+mcp-client, jamais scopée par thread langgraph-agent ni par tâche — rien
+dans le harnais ni le graphe ne fermait les onglets entre deux tâches ;
+seul un redémarrage complet de `playwright-mcp` purgeait cet état. Le
+dernier redémarrage datait d'AVANT la campagne 1d elle-même (qui exécute
+T10) : cet onglet a donc pollué potentiellement TOUTE la campagne 1d, pas
+seulement ce test — portée plus large que prévu.
+
+**Correctif** : `POST /reset-session/{server_name}` (mcp-client) — jette la
+session persistante en cache (`_drop_persistent_session`), le prochain
+appel en rouvre une neuve. Appelé par le harnais
+(`_reset_browser_session()`, `tests_integration/test_web_tasks.py`) avant
+CHAQUE répétition de tâche, comme `_purge_downloads_volume`. 404 explicite
+si le serveur visé n'est pas configuré en session persistante (pas de no-op
+silencieux qui masquerait une faute de frappe).
+
+**T7×5 avec isolation seule (sans browser_extract), threads indépendants** :
+**1/5** — amélioration (vs 0/5) mais insuffisante pour expliquer
+l'essentiel du recul. La contamination d'onglets est un vrai bug (corrigé),
+mais N'EST PAS la cause dominante du recul T7. Cause de T7 restée
+partiellement non résolue à l'issue de cette itération (voir campagne
+finale ci-dessous — T7 revient à 3/3 dans la campagne complète, mais avec
+`browser_extract` ET isolation ensemble, donc non disentangled proprement).
+
+## Phase 1d-révisée — bug de cache de schéma d'outils (2e faux départ)
+
+Première tentative de campagne complète avec `browser_extract` activé :
+résultat incohérent avec l'hypothèse (T1 toujours 0/3 malgré le correctif
+cible). Vérifié via `POST /context` (`tools_schema.count`) : le schéma vu
+par le thread T1 ne comptait que **63 outils**, alors que mcp-client en
+servait déjà **64** (`browser_extract` inclus) au moment du test.
+
+**Cause racine** : `_tools_schema_cache` (`app/graph.py`) est un cache
+PROCESS-LIFETIME côté langgraph-agent (rempli une fois, jamais invalidé) —
+un redémarrage de mcp-client (fait ENTRE les essais `ENABLE_BROWSER_EXTRACT
+=false` puis `=true`, pour isoler la variable T7) ne suffit PAS à
+rafraîchir ce cache si langgraph-agent, lui, n'a pas redémarré depuis. Le
+premier essai de campagne a donc tourné avec un schéma figé AVANT
+l'activation réelle de `browser_extract` — `browser_extract` n'a jamais été
+réellement proposé au modèle, invalidant ce run. Corrigé par un simple
+redémarrage de `langgraph-agent` (`docker compose restart langgraph-agent`)
+— pas un changement de code, mais une fragilité opérationnelle réelle à
+retenir : **tout changement du schéma d'outils exposé par mcp-client exige
+aussi un redémarrage de langgraph-agent**, pas seulement du service modifié.
+
+## Phase 1d-révisée — campagne A finale (isolation + browser_extract, schéma rafraîchi)
+
+Résultat complet : `tests_integration/TASKS-BASELINE-post-phase1d-extract.md`.
+**Score : 30/33 — meilleur résultat de tout le chantier Phase 1.**
+
+| Critère | Résultat |
+|---|---|
+| T1 remonte | ✅ 0/3 → 2/3 |
+| T10 remonte | ✅ 0/3 → 2/3 |
+| T4 tient | ⚠️ 3/3 → 2/3 (léger recul, probablement du bruit n=3) |
+| T5 tient | ✅ 3/3 → 3/3 |
+| T8 tient | ✅ 2/3 → 3/3 (amélioré au-delà de "tenir") |
+
+Bonus non demandé : T7 tient à 3/3 (déjà récupéré), T3/T11 à 3/3 (leur
+dégradation dans le run au schéma figé n'était qu'un artefact de ce bug,
+pas un effet du correctif). 4/5 juges explicitement atteints, T4 en léger
+recul à surveiller mais non alarmant vu l'ampleur du reste.
+
+**Trois variables changées dans cette itération, à consigner explicitement
+comme demandé** (les bugs d'infra imposaient de livrer le volume de
+téléchargement d'un bloc en 1d, mais la directive de téléchargement et le
+tiers `NEVER_GRANTABLE_TOOLS` de cette même itération auraient pu attendre
+une campagne chacun) :
+1. Isolation de session navigateur entre tâches (`_reset_browser_session`).
+2. `browser_extract` (nouvel outil, tier lecture).
+3. Correctif implicite : le redémarrage de langgraph-agent (nécessaire pour
+   le bug de cache) a aussi rafraîchi tout le reste de l'état process
+   (aucun autre effet de bord identifié, mais non isolé formellement).
+
+Les juges par-tâche (T1/T10 remontent, T4/T5/T8 tiennent) ont rattrapé le
+coup et montrent un résultat cohérent — mais ils ne remplacent pas la
+discipline "une variable à la fois" pour la PROCHAINE itération : la
+tentation de bundler des correctifs adjacents reste réelle, en particulier
+quand un bug d'infra force la main. 🧑 **Checkpoint.**
