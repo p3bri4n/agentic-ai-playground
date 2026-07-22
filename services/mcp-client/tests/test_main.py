@@ -5,6 +5,7 @@ logique réelle (registre d'outils, appel, gestion d'erreur) sans dépendre
 du socket Docker ni des images mcp/* réelles.
 """
 
+import asyncio
 import socket
 import subprocess
 import sys
@@ -274,3 +275,109 @@ def test_ocr_server_wrong_token_fails(echo_http_server):
     resp = _client().get("/tools")
     assert resp.status_code == 200
     assert resp.json()["tools"] == {}
+
+
+class _FakeSession:
+    def __init__(self, id_: int):
+        self.id = id_
+
+
+def _patch_open_session(main_mod, monkeypatch):
+    """
+    Remplace _open_session par une fabrique de sessions factices comptées :
+    permet de vérifier QUI (persistant vs éphémère) rouvre une session sans
+    dépendre d'un vrai serveur MCP ni du protocole réseau.
+    """
+    calls = {"n": 0}
+
+    async def fake_open_session(server_name, stack):
+        calls["n"] += 1
+        return _FakeSession(calls["n"])
+
+    monkeypatch.setattr(main_mod, "_open_session", fake_open_session)
+    return calls
+
+
+def test_persistent_session_reused_across_calls(monkeypatch):
+    """
+    Le serveur "browser" (Playwright) scope son état navigateur à la SESSION
+    MCP, pas au process serveur (voir BUGS.md) : mcp-client doit donc réutiliser
+    la même session entre deux appels d'outils plutôt que d'en rouvrir une à
+    chaque fois, sans quoi l'état (page visitée...) serait perdu entre deux
+    appels malgré un serveur HTTP persistant.
+    """
+    import app.main as main_mod
+
+    main_mod.SERVERS = {
+        "browser": {"transport": "http", "url": "http://unused", "token": "", "persistent_session": True},
+    }
+    main_mod._persistent_sessions.clear()
+    main_mod._persistent_locks["browser"] = asyncio.Lock()
+    calls = _patch_open_session(main_mod, monkeypatch)
+
+    async def action(session):
+        return session.id
+
+    async def run():
+        first = await main_mod._run_on_server("browser", action)
+        second = await main_mod._run_on_server("browser", action)
+        return first, second
+
+    first, second = asyncio.run(run())
+    assert first == second == 1
+    assert calls["n"] == 1
+
+
+def test_ephemeral_server_opens_new_session_per_call(monkeypatch):
+    """Sans persistent_session, chaque appel doit garder son comportement d'origine : une session neuve à chaque fois."""
+    import app.main as main_mod
+
+    main_mod.SERVERS = {
+        "desktop": {"transport": "http", "url": "http://unused", "token": ""},
+    }
+    calls = _patch_open_session(main_mod, monkeypatch)
+
+    async def action(session):
+        return session.id
+
+    async def run():
+        first = await main_mod._run_on_server("desktop", action)
+        second = await main_mod._run_on_server("desktop", action)
+        return first, second
+
+    first, second = asyncio.run(run())
+    assert (first, second) == (1, 2)
+    assert calls["n"] == 2
+
+
+def test_persistent_session_dropped_and_reopened_after_error(monkeypatch):
+    """
+    Si l'action échoue (session probablement morte, ex. serveur redémarré),
+    la session en cache doit être jetée : le prochain appel doit en rouvrir
+    une neuve plutôt que de rester bloqué sur une connexion cassée.
+    """
+    import app.main as main_mod
+
+    main_mod.SERVERS = {
+        "browser": {"transport": "http", "url": "http://unused", "token": "", "persistent_session": True},
+    }
+    main_mod._persistent_sessions.clear()
+    main_mod._persistent_locks["browser"] = asyncio.Lock()
+    calls = _patch_open_session(main_mod, monkeypatch)
+
+    async def failing_action(session):
+        raise RuntimeError("session cassée")
+
+    async def ok_action(session):
+        return session.id
+
+    async def run():
+        with pytest.raises(RuntimeError):
+            await main_mod._run_on_server("browser", failing_action)
+        return await main_mod._run_on_server("browser", ok_action)
+
+    result = asyncio.run(run())
+    assert result == 2  # nouvelle session rouverte, pas la première réutilisée
+    assert calls["n"] == 2
+    # la session rouverte (la 2e) est bien celle mise en cache pour le prochain appel
+    assert main_mod._persistent_sessions["browser"][1].id == 2

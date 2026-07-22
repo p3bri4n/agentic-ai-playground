@@ -187,3 +187,51 @@ flux d'approbation humaine (tier sensible → notice → reprise) ✅ observé
 fonctionnel à travers ces scénarios. Pas de test littéral via l'interface
 Open WebUI (extension Chrome non connectée) — tout validé via l'API
 `langgraph-agent` directement.
+
+## Prérequis Phase 0 (plan d'autonomie) — persistance du serveur MCP "browser"
+
+En préparant le harnais de tâches web de la Phase 0 (`PLAN.md`), la
+question s'est posée directement : le serveur "browser" (Playwright)
+redémarre-t-il à chaque appel d'outil ? Réponse : oui, confirmé dans
+`BUGS.md` — spawn éphémère (`docker run -i --rm mcp/playwright:latest` par
+appel), sans continuité d'état. Or la quasi-totalité des 11 tâches prévues
+(pagination, tri/filtre, piste multi-pages, session authentifiée,
+navigation inter-articles Wikipédia...) suppose un état navigateur partagé
+entre appels d'outils successifs : sans correctif, la baseline de la Phase
+0 aurait surtout mesuré ce bug d'architecture plutôt que les capacités
+réelles de l'agent. Corrigé avant de poursuivre.
+
+**Diagnostic en deux temps, chacun vérifié par un vrai appel réseau (pas
+une lecture de doc)** :
+1. L'image officielle `mcp/playwright` supporte un mode serveur HTTP natif
+   (`--host 0.0.0.0 --port 8931`, endpoint Streamable HTTP `/mcp`) —
+   confirmé en la lançant directement. Nouveau service `docker-compose`
+   `playwright-mcp`, sur le même patron que `ghostdesk`/`ocr-service`.
+   Premier test après bascule : `mcp-client` ne remontait toujours PAS
+   les outils `browser_*` (`_refresh_registry` avale les exceptions
+   silencieusement) — cause réelle trouvée en connectant directement
+   depuis le conteneur `mcp-client` : `httpx.LocalProtocolError: Illegal
+   header value b'Bearer '` (le code construisait inconditionnellement
+   `Authorization: Bearer {token}`, y compris avec un token vide — jamais
+   rencontré avant car `desktop`/`ocr` ont toujours un token non-vide).
+   Corrigé (en-tête omis si le token est vide) : les 25 outils `browser_*`
+   apparaissent alors dans `/tools`.
+2. Une fois le PROCESS serveur persistant, l'état ne l'était toujours
+   pas : un `browser_navigate` suivi d'un `browser_snapshot` séparé
+   retombait sur `about:blank`. Cause : `mcp-client` ouvrait encore une
+   SESSION MCP neuve à chaque appel HTTP (`_run_on_server`), et Playwright
+   MCP scope son contexte navigateur (page, cookies, historique) à la
+   session, pas au process. Ajout de `_get_persistent_session`/
+   `_persistent_sessions` (`services/mcp-client/app/main.py`) : la session
+   "browser" reste ouverte entre deux appels, avec relance automatique si
+   la session tombe. **Vérifié par un vrai test bout en bout** : navigation
+   vers l'article Wikipédia de Clément Ader via `browser_navigate`, puis
+   `browser_snapshot` en appel HTTP séparé — la page retournée est bien
+   celle visitée par le premier appel (titre, URL, contenu), plus
+   `about:blank`.
+
+**Point méthodologique** : la première hypothèse (juste rendre le process
+serveur persistant) semblait suffisante sur le papier, mais un test réel
+immédiat a révélé qu'elle ne l'était pas — la persistance de session côté
+client est une couche distincte de la persistance du process serveur, et
+aucune des deux ne remplace l'autre pour ce serveur précis.

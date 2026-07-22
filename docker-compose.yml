@@ -186,13 +186,16 @@ services:
       # (transport stdio, conforme à l'usage officiel des images mcp/*)
       - MCP_FILESYSTEM_IMAGE=mcp/filesystem:latest
       - MCP_GIT_IMAGE=mcp/git:latest
-      - MCP_BROWSER_IMAGE=mcp/playwright:latest
       - MCP_TERMINAL_IMAGE=mcp-terminal:local   # construite localement, voir plus bas
       - WORKSPACE_HOST_PATH=${WORKSPACE_HOST_PATH}    # chemin HOTE requis par docker run -v
       # GhostDesk (serveur "desktop") : contrairement aux autres, c'est un
       # serveur HTTP persistant (bureau virtuel), pas un conteneur spawné à
       # la demande — mcp-client s'y connecte en Streamable HTTP.
       - MCP_GHOSTDESK_URL=http://ghostdesk:3000/mcp
+      # "browser" (Playwright) : serveur HTTP persistant lui aussi (service
+      # playwright-mcp ci-dessous), pas un spawn éphémère par appel — voir
+      # BUGS.md (perte de continuité d'état entre deux appels d'outils).
+      - MCP_PLAYWRIGHT_URL=http://playwright-mcp:8931/mcp
       - GHOSTDESK_AUTH_TOKEN=${GHOSTDESK_AUTH_TOKEN}
       # Requis par les modèles Qwen pour que leurs clics tombent sur la bonne
       # cible (voir .env.example) ; ${VAR:-1000} plutôt que ${VAR} pour
@@ -209,8 +212,12 @@ services:
                                                        # voir avertissement de sécurité dans le README
       - ./workspace:/workspace
     depends_on:
-      - ghostdesk
-      - ocr-service
+      ghostdesk:
+        condition: service_started
+      ocr-service:
+        condition: service_started
+      playwright-mcp:
+        condition: service_healthy
     networks:
       - agent-net
 
@@ -226,6 +233,37 @@ services:
     container_name: mcp-terminal-build
     profiles: ["build-only"]   # ce service ne se lance jamais, il sert juste à builder l'image
     command: ["true"]
+
+  # --- Playwright MCP : navigateur piloté par l'agent (serveur HTTP) --
+  # ⚠️ Anciennement spawné à la demande par mcp-client (`docker run --rm`
+  # par appel d'outil) : chaque appel repartait sur `about:blank` sans
+  # continuité d'état avec le précédent (voir BUGS.md). L'image officielle
+  # mcp/playwright supporte un mode serveur HTTP natif (`--port`, endpoint
+  # Streamable HTTP `/mcp`) ; on l'utilise ici comme service persistant,
+  # même patron que GhostDesk/OCR ci-dessous.
+  playwright-mcp:
+    image: mcp/playwright:latest
+    container_name: playwright-mcp
+    restart: unless-stopped
+    command:
+      - --host=0.0.0.0
+      - --port=8931
+      # Host header attendu = nom DNS docker-compose du service : évite le
+      # 403 par défaut (l'image ne sert que "localhost:<port>" sinon), sans
+      # ouvrir à '*' puisque ce service n'est joignable que sur agent-net.
+      - --allowed-hosts=playwright-mcp:8931
+      - --isolated   # profil navigateur en mémoire, jamais persisté sur disque
+      - --headless
+      - --browser=chromium
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/localhost/8931' || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    networks:
+      - agent-net
+    # pas de port publié : uniquement accessible via le réseau interne (mcp-client)
 
   # --- GhostDesk : bureau virtuel complet piloté par l'agent ------
   # ⚠️ Surface d'attaque bien plus large que mcp-terminal : SYS_ADMIN +

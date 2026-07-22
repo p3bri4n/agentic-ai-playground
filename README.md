@@ -20,7 +20,7 @@ cp .env.example .env
 
 docker pull mcp/filesystem:latest
 docker pull mcp/git:latest
-docker pull mcp/playwright:latest
+docker pull mcp/playwright:latest   # serveur HTTP persistant (service playwright-mcp), voir BUGS.md
 docker compose --profile build-only build mcp-terminal-build   # construit l'image locale mcp-terminal:local
 
 docker compose up -d
@@ -44,7 +44,9 @@ services/
   context-manager/    RAG + mémoire (Qdrant + sentence-transformers)
     app/
     tests/
-  mcp-client/          spawn les serveurs MCP à la demande (docker.sock)
+  mcp-client/          spawn filesystem/git/terminal à la demande (docker.sock) ;
+                       browser/desktop/ocr sont des serveurs HTTP persistants
+                       (mcp-client s'y connecte en Streamable HTTP)
     app/
     tests/
   mcp-terminal/        serveur MCP "terminal" maison, liste blanche stricte
@@ -53,6 +55,10 @@ services/
   ghostdesk/           image officielle YV17labs, bureau virtuel piloté par l'agent
                        (pas de code applicatif ici : service docker-compose à part,
                        mcp-client s'y connecte en Streamable HTTP)
+  playwright-mcp/      image officielle mcp/playwright, navigateur piloté par
+                       l'agent (pas de code applicatif ici : service docker-compose
+                       à part, serveur HTTP natif de l'image — voir BUGS.md pour
+                       l'historique du passage depuis un spawn éphémère)
   llama-server/        build du fork llama.cpp servant le modèle (voir
                        section Backend d'inférence) — pas de code Python ici,
                        Dockerfile + entrypoint.sh de vérification du modèle
@@ -294,7 +300,7 @@ Résumé des suites, à date de la dernière vérification :
 |---|---|---|
 | `skill-manager` | 5 | chargement des skills, matching mot-clé, endpoints HTTP |
 | `context-manager` | 4 | ingestion/retrieval Qdrant, mémoire par utilisateur, collection vide |
-| `mcp-client` | 11 | registre d'outils, schéma function-calling (description/inputSchema) exposé pour le LLM, appel réel via stdio, erreur 404 sur outil inconnu, appel réel via Streamable HTTP (serveur "desktop"/GhostDesk) avec vérification du bearer token et de l'en-tête `GhostDesk-Model-Space` (présent avec la valeur configurée ET absent quand `GHOSTDESK_MODEL_SPACE=""`), serveur "ocr" (services/ocr-service) enregistré/appelable via Streamable HTTP et bearer invalide rejeté |
+| `mcp-client` | 14 | registre d'outils, schéma function-calling (description/inputSchema) exposé pour le LLM, appel réel via stdio, erreur 404 sur outil inconnu, appel réel via Streamable HTTP (serveur "desktop"/GhostDesk) avec vérification du bearer token et de l'en-tête `GhostDesk-Model-Space` (présent avec la valeur configurée ET absent quand `GHOSTDESK_MODEL_SPACE=""`), serveur "ocr" (services/ocr-service) enregistré/appelable via Streamable HTTP et bearer invalide rejeté, **persistance de session** (`persistent_session` sur "browser"/Playwright, voir BUGS.md) : session réutilisée entre deux appels consécutifs, comportement éphémère inchangé pour les serveurs sans ce flag, session cassée jetée puis rouverte proprement après une erreur |
 | `mcp-terminal` | 6 | liste blanche de commandes, lecture de fichier (y compris nom avec espace), blocage du path traversal |
 | `ocr-service` | 14 | matching `find_text` exact/fuzzy/désactivé/sans résultat (insensible à la casse, distance de Levenshtein légère mot par mot en secours), conversion de coordonnées pixels -> repère normalisé 0-1000 sur une image 1280x1024 connue (`OCR_COORD_SPACE`) et désactivation (`coord_space="pixels"`), `find_text`/`read_screen` de bout en bout contre un faux serveur MCP GhostDesk réel (Streamable HTTP, image PNG de taille connue), plafond de `read_screen` à 80 éléments triés par confiance, `OCR_ENGINE=fake` (aucune dépendance à PaddleOCR dans les tests) |
 | `dashboard` | 16 | parser Prometheus minimal maison sur un payload `/metrics` figé réaliste (commentaires `# HELP`/`# TYPE` ignorés, lignes illisibles tolérées), normalisation des slots `/slots` (clé `used_tokens` : premier champ connu présent parmi plusieurs noms possibles selon la version), parsing CSV `nvidia-smi` (lignes malformées ignorées), `GET /api/snapshot` : agrégation des 3 sources quand tout va bien, llama-server injoignable -> section `null` + statut 200 (jamais 500), langgraph-agent injoignable -> `context` à `null`, `thread_id` explicite en query prioritaire sur le plus récent, VRAM activée (`ENABLE_GPU_STATS`, nvidia-smi mocké) vs désactivée par défaut (nvidia-smi jamais appelé, pas d'erreur), `GET /` renvoie 200 en HTML (page non testée en détail, statique) |
@@ -605,6 +611,18 @@ documentée plus haut pour le streaming n'a donc pas été touchée.
   connecte via `streamablehttp_client` (SDK `mcp` ≥ 1.8, d'où le bump de
   `mcp==1.2.0` vers `mcp==1.9.4` dans `services/mcp-client/requirements.txt`),
   authentifié par bearer token (`GHOSTDESK_AUTH_TOKEN`, voir `.env.example`).
+- **`playwright-mcp` (serveur "browser") est un serveur HTTP persistant
+  depuis le correctif documenté en détail dans `BUGS.md`** — auparavant
+  spawné en STDIO éphémère (`docker run -i --rm mcp/playwright:latest` par
+  appel), il perdait tout état de navigation entre deux appels d'outils.
+  L'image officielle expose nativement un mode serveur HTTP
+  (`--host 0.0.0.0 --port 8931`, endpoint Streamable HTTP `/mcp`) ; ceci ne
+  suffisait cependant PAS à lui seul, car Playwright MCP scope son contexte
+  navigateur (page, cookies, historique) à la SESSION MCP et non au process
+  serveur — `mcp-client` doit donc en plus garder la session "browser"
+  ouverte entre deux appels HTTP (`_get_persistent_session`/
+  `_persistent_sessions` dans `services/mcp-client/app/main.py`), au lieu
+  d'en rouvrir une neuve à chaque fois comme pour les autres serveurs.
 - **Précision des clics avec les modèles Qwen** : ces modèles raisonnent
   nativement en repère de coordonnées normalisé 0-1000, alors que GhostDesk
   attend par défaut des pixels écran natifs (documenté par GhostDesk) — sans

@@ -20,6 +20,7 @@ ponctuel. Il tourne en continu comme service docker-compose à part, et
 mcp-client s'y connecte en Streamable HTTP au lieu de spawn un container.
 """
 
+import asyncio
 import os
 from contextlib import AsyncExitStack
 
@@ -56,11 +57,25 @@ SERVERS = {
         ),
     },
     "browser": {
-        "transport": "stdio",
-        "params": StdioServerParameters(
-            command="docker",
-            args=["run", "-i", "--rm", os.environ.get("MCP_BROWSER_IMAGE", "mcp/playwright:latest")],
-        ),
+        # Contrairement aux autres serveurs stdio ci-dessus, "browser" est un
+        # serveur HTTP persistant (comme "desktop"/"ocr" plus bas) : un spawn
+        # éphémère (`docker run --rm` par appel) redémarrait un navigateur
+        # tout neuf à CHAQUE appel d'outil, sans continuité d'état entre
+        # `browser_navigate` et l'appel suivant — voir BUGS.md. L'image
+        # mcp/playwright officielle supporte un mode serveur HTTP natif
+        # (`--port`, endpoint Streamable HTTP `/mcp`), utilisé ici via le
+        # service docker-compose dédié `playwright-mcp`.
+        "transport": "http",
+        "url": os.environ.get("MCP_PLAYWRIGHT_URL", "http://playwright-mcp:8931/mcp"),
+        "token": "",
+        # Playwright MCP scope son contexte navigateur (page, cookies,
+        # historique) à la SESSION MCP, pas au process serveur : passer par
+        # une session éphémère par appel (comme les autres serveurs http)
+        # recrée un `about:blank` à chaque fois même une fois le serveur
+        # rendu persistant (constaté empiriquement). Nécessite donc de
+        # garder une session ouverte entre les appels, voir
+        # `_get_persistent_session` ci-dessous.
+        "persistent_session": True,
     },
     "terminal": {
         "transport": "stdio",
@@ -109,23 +124,80 @@ app = FastAPI(title="MCP Client")
 # modèle ignore purement et simplement que ces outils existent).
 _tool_registry: dict[str, dict] = {}
 
+# Sessions MCP gardées ouvertes entre deux appels HTTP, pour les serveurs où
+# l'état (navigateur, page) vit dans la session plutôt que dans le process
+# serveur — voir "persistent_session" sur l'entrée "browser" ci-dessus.
+_persistent_sessions: dict[str, tuple[AsyncExitStack, ClientSession]] = {}
+_persistent_locks: dict[str, asyncio.Lock] = {
+    name: asyncio.Lock() for name, server in SERVERS.items() if server.get("persistent_session")
+}
+
+
+def _http_headers(server: dict) -> dict:
+    headers = {}
+    if server.get("token"):
+        headers["Authorization"] = f"Bearer {server['token']}"
+    if server.get("model_space"):
+        headers["GhostDesk-Model-Space"] = server["model_space"]
+    return headers
+
+
+async def _open_session(server_name: str, stack: AsyncExitStack) -> ClientSession:
+    server = SERVERS[server_name]
+    if server["transport"] == "stdio":
+        read, write = await stack.enter_async_context(stdio_client(server["params"]))
+    else:
+        read, write, _ = await stack.enter_async_context(
+            streamablehttp_client(server["url"], headers=_http_headers(server))
+        )
+    session = await stack.enter_async_context(ClientSession(read, write))
+    await session.initialize()
+    return session
+
+
+async def _get_persistent_session(server_name: str) -> ClientSession:
+    """Réutilise la session existante si vivante, en ouvre une nouvelle sinon."""
+    async with _persistent_locks[server_name]:
+        cached = _persistent_sessions.get(server_name)
+        if cached is not None:
+            return cached[1]
+        stack = AsyncExitStack()
+        try:
+            session = await _open_session(server_name, stack)
+        except Exception:
+            await stack.aclose()
+            raise
+        _persistent_sessions[server_name] = (stack, session)
+        return session
+
+
+async def _drop_persistent_session(server_name: str) -> None:
+    cached = _persistent_sessions.pop(server_name, None)
+    if cached is not None:
+        await cached[0].aclose()
+
 
 async def _run_on_server(server_name: str, action):
-    """Ouvre une session éphémère (stdio ou HTTP selon le serveur), exécute `action`, ferme tout proprement."""
+    """Exécute `action` sur le serveur : session persistante si configurée, éphémère sinon."""
     server = SERVERS[server_name]
+    if server.get("persistent_session"):
+        session = await _get_persistent_session(server_name)
+        try:
+            return await action(session)
+        except Exception:
+            # connexion probablement morte (serveur redémarré...) : on la jette,
+            # le prochain appel en rouvrira une neuve plutôt que de rester bloqué
+            await _drop_persistent_session(server_name)
+            raise
     async with AsyncExitStack() as stack:
-        if server["transport"] == "stdio":
-            read, write = await stack.enter_async_context(stdio_client(server["params"]))
-        else:
-            headers = {"Authorization": f"Bearer {server['token']}"}
-            if server.get("model_space"):
-                headers["GhostDesk-Model-Space"] = server["model_space"]
-            read, write, _ = await stack.enter_async_context(
-                streamablehttp_client(server["url"], headers=headers)
-            )
-        session = await stack.enter_async_context(ClientSession(read, write))
-        await session.initialize()
+        session = await _open_session(server_name, stack)
         return await action(session)
+
+
+@app.on_event("shutdown")
+async def _close_persistent_sessions():
+    for server_name in list(_persistent_sessions):
+        await _drop_persistent_session(server_name)
 
 
 async def _refresh_registry():
