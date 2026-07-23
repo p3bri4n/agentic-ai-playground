@@ -69,13 +69,20 @@ _DEFAULT_TIER_READ = {
     "search_files",
     "get_file_info",
     "list_allowed_directories",
+    # "git_branch" a été retiré d'ici (trouvé et corrigé pendant la sonde
+    # live de l'Itération 4, Phase 1 « cœur cognitif ») : ce nom n'a jamais
+    # correspondu à un outil réel du serveur MCP git officiel (12 outils
+    # vérifiés via GET /tools/schema, mcp-client ET langgraph-agent
+    # d'accord) — seul "git_create_branch" (déjà dans _DEFAULT_TIER_REVERSIBLE
+    # ci-dessous) existe pour la gestion des branches. Resté inoffensif en
+    # usage réel (un outil jamais proposé au modèle n'est jamais appelé),
+    # mais faussait tests_integration/campaign_preflight.py:EXPECTED_TOOLS.
     "git_status",
     "git_diff_unstaged",
     "git_diff_staged",
     "git_diff",
     "git_log",
     "git_show",
-    "git_branch",
 }
 
 # Effet de bord réversible et confiné : souris/clavier GhostDesk (hors saisie
