@@ -51,6 +51,12 @@ services:
       # raisonnement normal sinon (première décision d'un tour, tool
       # sensible...). Voir app/graph.py, _adaptive_thinking_directive.
       - ADAPTIVE_THINKING=${ADAPTIVE_THINKING:-true}
+      # Plan explicite (Phase 1 « cœur cognitif », Itération 1 — voir
+      # docs/briefs/phase-1-coeur-cognitif.md et README, section "Plan
+      # explicite"). Désactivé par défaut : un appel LLM supplémentaire en
+      # tête de chaque tâche, mesuré uniquement quand explicitement activé
+      # pour une campagne dédiée (voir HISTORY.md, Itération 1).
+      - PLANNER_ENABLED=${PLANNER_ENABLED:-false}
       # Filet de sécurité (voir README, tableau des bugs) : certains modèles
       # écrivent parfois leur appel d'outil en prose au lieu d'un tool_calls
       # structuré, piégé dans le raisonnement. Nombre de relances

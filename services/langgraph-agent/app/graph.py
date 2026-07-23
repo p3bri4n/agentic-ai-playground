@@ -4,21 +4,25 @@ Graphe d'orchestration LangGraph.
 Flux :
   1. retrieve_context   -> interroge Context Manager (RAG / mémoire)
   2. select_skill        -> interroge Skill Manager pour injecter un prompt de skill pertinent
-  3. call_llm             -> appelle le backend d'inférence (TabbyAPI par
+  3. plan_task            -> si PLANNER_ENABLED (Itération 1, Phase 1 « cœur
+     cognitif », voir docs/briefs/phase-1-coeur-cognitif.md), décompose
+     l'objectif en sous-tâches JSON une seule fois par tâche ; no-op sinon
+     ou si déjà planifié (voir AgentState.plan)
+  4. call_llm             -> appelle le backend d'inférence (TabbyAPI par
      défaut, API OpenAI-compatible) avec function calling
-  4. has_tool_calls       -> route vers require_approval, ou directement vers
+  6. has_tool_calls       -> route vers require_approval, ou directement vers
      auto_call_tools si TOUS les tool_calls du tour sont auto-approuvés selon
      la politique par tiers (app/approval_policy.py, voir plus bas)
-  5. require_approval (option) -> si le LLM demande un outil non auto-approuvé,
+  7. require_approval (option) -> si le LLM demande un outil non auto-approuvé,
      met le graphe en pause (NodeInterrupt) tant qu'un humain n'a pas
      approuvé/refusé via l'état "approved"
-  6. call_tools | auto_call_tools | reject_tools -> exécute l'outil via MCP
+  8. call_tools | auto_call_tools | reject_tools -> exécute l'outil via MCP
      Client (même logique partagée, voir _execute_tool_calls), ou synthétise
      un refus si l'humain a refusé, puis reboucle sur call_llm. Seul
      auto_call_tools journalise dans le journal d'audit (Phase 2, voir
      app/audit_log.py) : call_tools est TOUJOURS atteint après un passage
      humain par require_approval CE tour-ci, déjà tracé dans la conversation.
-  7. END                  -> réponse finale
+  9. END                  -> réponse finale
 
 Supervision humaine : par défaut, tout appel d'outil est soumis à
 approbation (voir require_approval/reject_tools ci-dessous), à l'exception
@@ -415,6 +419,15 @@ AUTO_APPROVAL_STREAK_LIMIT = int(os.environ.get("AUTO_APPROVAL_STREAK_LIMIT", "6
 MAX_IMAGES_IN_CONTEXT = int(os.environ.get("MAX_IMAGES_IN_CONTEXT", "1"))
 IMAGE_RETENTION_PLACEHOLDER = "[screenshot antérieure supprimée]"
 
+# Nœud planificateur (Itération 1, Phase 1 « cœur cognitif » — voir
+# docs/briefs/phase-1-coeur-cognitif.md). Défaut désactivé : un appel LLM
+# supplémentaire en tête de CHAQUE tâche casserait la quasi-totalité des
+# tests existants qui mockent une séquence FIXE de réponses sur
+# /v1/chat/completions (voir plan_task plus bas) — même convention que
+# ADAPTIVE_THINKING/IMAGE_FORMAT_PASSTHROUGH : off par défaut, à activer
+# explicitement pour mesurer le mécanisme en conditions réelles.
+PLANNER_ENABLED = os.environ.get("PLANNER_ENABLED", "false").lower() == "true"
+
 # Qwen3.6 raisonne par défaut sur chaque tour (balises de pensée étendue) —
 # utile pour une décision initiale, coûteux en latence/tokens pour une
 # boucle perception-action rapide (capture -> clic -> capture...) où chaque
@@ -570,6 +583,73 @@ def has_visible_answer(content: str) -> bool:
     return bool(_THINK_BLOCK_RE.sub("", content or "").strip())
 
 
+# Nœud planificateur (Itération 1, voir plan_task plus bas) : reconnaît un
+# éventuel enrobage ```json ... ``` / ``` ... ``` autour de la réponse — le
+# modèle peut envelopper le JSON malgré la consigne de sortie brute, comme
+# déjà observé pour d'autres formats de sortie dans ce fichier (voir
+# _extract_fallback_tool_call ci-dessus).
+_CODE_FENCE_RE = re.compile(r"^```[a-zA-Z]*\n?(.*?)\n?```$", re.DOTALL)
+
+
+def _strip_code_fence(text: str) -> str:
+    match = _CODE_FENCE_RE.match(text.strip())
+    return match.group(1).strip() if match else text.strip()
+
+
+class PlanValidationError(ValueError):
+    """Levée par _validate_plan_json : réponse du planificateur inexploitable."""
+
+
+_PLAN_SUBTASKS_MIN = 1
+_PLAN_SUBTASKS_MAX = 8
+
+
+def _validate_plan_json(raw: str) -> list[dict]:
+    """
+    Schéma validé PROGRAMMATIQUEMENT (Itération 1, pas encore de juge LLM —
+    voir Itération 3 du brief) : retire <think>...</think> puis un éventuel
+    enrobage de fences, exige {"sous_taches": [{"description":...,
+    "critere_succes":...}, ...]}, 1 à 8 éléments, description/critère non
+    vides. Lève PlanValidationError avec un motif explicite sinon — jamais
+    un plan partiellement construit à partir d'une réponse invalide.
+    """
+    text = _strip_code_fence(_THINK_BLOCK_RE.sub("", raw or ""))
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise PlanValidationError(f"JSON invalide : {exc}") from exc
+    subtasks = data.get("sous_taches") if isinstance(data, dict) else None
+    if not isinstance(subtasks, list):
+        raise PlanValidationError("clé 'sous_taches' (liste) absente ou invalide")
+    if not (_PLAN_SUBTASKS_MIN <= len(subtasks) <= _PLAN_SUBTASKS_MAX):
+        raise PlanValidationError(
+            f"nombre de sous-tâches hors bornes ({len(subtasks)}, attendu "
+            f"{_PLAN_SUBTASKS_MIN}-{_PLAN_SUBTASKS_MAX})"
+        )
+    validated = []
+    for i, item in enumerate(subtasks):
+        if not isinstance(item, dict):
+            raise PlanValidationError(f"sous-tâche {i} n'est pas un objet JSON")
+        description = item.get("description")
+        critere = item.get("critere_succes")
+        if not isinstance(description, str) or not description.strip():
+            raise PlanValidationError(f"sous-tâche {i} : description manquante ou vide")
+        if not isinstance(critere, str) or not critere.strip():
+            raise PlanValidationError(f"sous-tâche {i} : critere_succes manquant ou vide")
+        validated.append({"description": description.strip(), "success_criterion": critere.strip()})
+    return validated
+
+
+PLANNER_SYSTEM_PROMPT = (
+    "Tu es le planificateur d'un agent qui accomplit des tâches web. À "
+    "partir de l'objectif de l'utilisateur, décompose-le en 1 à 8 "
+    "sous-tâches concrètes et vérifiables. Réponds UNIQUEMENT par un JSON "
+    'de la forme {"sous_taches": [{"description": "...", "critere_succes": '
+    '"..."}, ...]}, rien d\'autre : pas de texte avant/après, pas de balise '
+    "<think>, pas de bloc de code."
+)
+
+
 class AgentState(TypedDict):
     messages: Annotated[list, add_messages]
     tool_iterations: int
@@ -647,6 +727,20 @@ class AgentState(TypedDict):
     # bloquées AVANT exécution (voir _check_navigate_url) — métrique Phase 1,
     # pas juste un frein silencieux.
     fabricated_navigation_attempts: int
+    # Plan explicite de la tâche (Itération 1, Phase 1 « cœur cognitif » —
+    # voir docs/briefs/phase-1-coeur-cognitif.md et plan_task plus bas) :
+    # liste de {description, success_criterion, status, attempts, result}.
+    # status ∈ {"a_faire", "en_cours", "fait", "echoue"} (string libre, pas
+    # d'enum dédié — cohérent avec failure_cause dans le harnais de tests).
+    # Calculé UNE FOIS par plan_task au tout début d'une tâche (liste vide ->
+    # le planificateur tourne ; non vide -> passthrough, jamais reconstruit
+    # au sein d'une même tâche). Remis à [] à chaque NOUVEAU message
+    # utilisateur top-level (voir run_input, app/main.py), comme
+    # observed_urls. Aucune validation/tier/vérification post-action
+    # branchée dessus pour l'instant (Itérations 2/3 à venir) : structure et
+    # visibilité seules. No-op tant que PLANNER_ENABLED est désactivé
+    # (défaut) : reste alors toujours [].
+    plan: list
 
 
 # Plafond de tokens par TOUR (un seul appel LLM), pas pour la conversation
@@ -736,6 +830,48 @@ async def select_skill(state: AgentState) -> dict:
         return {"messages": []}
 
     return {"messages": [{"role": "system", "content": f"Skill activée : {skill['name']}\n{skill['content']}"}]}
+
+
+async def plan_task(state: AgentState) -> dict:
+    """
+    Nœud planificateur (Itération 1, Phase 1 « cœur cognitif »). No-op
+    (`{"messages": []}`) si PLANNER_ENABLED est désactivé (défaut), si un
+    plan existe déjà pour cette tâche (calculé une seule fois, jamais
+    reconstruit au sein d'une même tâche — voir AgentState.plan) ou s'il n'y
+    a aucun message humain à planifier.
+
+    Appel LLM séparé de call_llm : `llm` brut (jamais `bound_llm`), le
+    planificateur ne doit jamais émettre de tool_calls, seulement du JSON.
+
+    Dégrade TOUJOURS sur un plan à sous-tâche unique plutôt que de bloquer
+    la tâche pour un souci de planification annexe (transport HTTP, réponse
+    invalide) — capture large volontaire (PlanValidationError ou n'importe
+    quelle erreur du client OpenAI/httpx), même esprit que la dégradation
+    httpx.HTTPError de retrieve_context/select_skill ci-dessus, élargie ici
+    car l'échec peut aussi venir de la validation JSON, pas seulement du
+    transport.
+    """
+    if not PLANNER_ENABLED or state.get("plan"):
+        return {"messages": []}
+    first_human = next((m for m in state["messages"] if getattr(m, "type", None) == "human"), None)
+    objective = first_human.content if first_human and isinstance(first_human.content, str) else ""
+    if not objective:
+        return {"messages": []}
+
+    try:
+        response = await llm.ainvoke(
+            [SystemMessage(content=PLANNER_SYSTEM_PROMPT), HumanMessage(content=objective)]
+        )
+        subtasks = _validate_plan_json(response.content)
+    except Exception:
+        logger.warning("Planification échouée, repli sur un plan à sous-tâche unique.", exc_info=True)
+        subtasks = [{"description": objective, "success_criterion": "objectif de la tâche atteint"}]
+
+    plan = [{**st, "status": "a_faire", "attempts": 0, "result": None} for st in subtasks]
+    if plan:
+        plan[0]["status"] = "en_cours"
+    logger.info("Plan initial (%d sous-tâche(s)) : %s", len(plan), plan)
+    return {"plan": plan}
 
 
 def _is_image_message(message) -> bool:
@@ -1459,6 +1595,7 @@ def build_graph(checkpointer=None):
     graph = StateGraph(AgentState)
     graph.add_node("retrieve_context", retrieve_context)
     graph.add_node("select_skill", select_skill)
+    graph.add_node("plan_task", plan_task)
     graph.add_node("call_llm", call_llm)
     graph.add_node("require_approval", require_approval)
     graph.add_node("call_tools", call_tools)
@@ -1478,7 +1615,8 @@ def build_graph(checkpointer=None):
     )
     graph.add_edge("run_slash_command_direct", END)
     graph.add_edge("retrieve_context", "select_skill")
-    graph.add_edge("select_skill", "call_llm")
+    graph.add_edge("select_skill", "plan_task")
+    graph.add_edge("plan_task", "call_llm")
     graph.add_conditional_edges(
         "call_llm",
         has_tool_calls,

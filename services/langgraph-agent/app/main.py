@@ -112,13 +112,38 @@ def _touch_thread(thread_id: str) -> None:
     _recent_threads[thread_id] = datetime.now(timezone.utc).isoformat()
 
 
-def _format_approval_request(tool_calls: list) -> str:
+_PLAN_STATUS_LABELS = {"a_faire": "à faire", "en_cours": "en cours", "fait": "fait", "echoue": "échoué"}
+
+
+def _format_plan_summary(plan: Optional[list]) -> str:
+    """
+    Résumé du plan (Itération 1, Phase 1 « cœur cognitif » — voir
+    docs/briefs/phase-1-coeur-cognitif.md et app/graph.py:plan_task) pour le
+    message d'approbation. `plan` vide/None -> chaîne vide (PLANNER_ENABLED
+    désactivé par défaut, voir app/graph.py) : ne change alors RIEN au texte
+    existant, pour ne casser aucun test qui vérifie ce message aujourd'hui.
+    """
+    if not plan:
+        return ""
+    lignes = ["Plan de la tâche :"]
+    for i, sous_tache in enumerate(plan, 1):
+        label = _PLAN_STATUS_LABELS.get(sous_tache.get("status"), sous_tache.get("status", "?"))
+        lignes.append(
+            f"{i}. [{label}] {sous_tache.get('description', '')} "
+            f"(critère : {sous_tache.get('success_criterion', '')})"
+        )
+    return "\n".join(lignes)
+
+
+def _format_approval_request(tool_calls: list, plan: Optional[list] = None) -> str:
     demandes = ", ".join(f'`{tc["name"]}`({tc["args"]})' for tc in tool_calls)
-    return (
+    base = (
         f'⚠️ Approbation requise pour : {demandes}. Réponds "approuver" (une fois), '
         f'"approuver pour la session" (pour ne plus être sollicité sur ce(s) outil(s) '
         f"tant que dure cette conversation) ou \"refuser\" pour continuer."
     )
+    plan_summary = _format_plan_summary(plan)
+    return f"{base}\n\n{plan_summary}" if plan_summary else base
 
 
 def _parse_approval_reply(text: str) -> tuple:
@@ -232,6 +257,7 @@ async def _resolve_run(request: ChatCompletionRequest):
         "current_page_url": None,
         "current_page_links": [],
         "fabricated_navigation_attempts": 0,
+        "plan": [],
     }
     return config, run_input
 
@@ -335,7 +361,9 @@ async def _stream_response(config: dict, run_input: Optional[dict], model: str):
 
         snapshot = await agent_graph.aget_state(config)
         if snapshot.next:
-            pending = closing_prefix + _format_approval_request(snapshot.values["messages"][-1].tool_calls)
+            pending = closing_prefix + _format_approval_request(
+                snapshot.values["messages"][-1].tool_calls, snapshot.values.get("plan")
+            )
             for chunk in _sse_content_chunks(completion_id, model, pending):
                 yield chunk
         else:
@@ -433,7 +461,7 @@ def _render_visible_answer(snapshot_values: dict) -> str:
 async def _current_answer(config: dict) -> str:
     snapshot = await agent_graph.aget_state(config)
     if snapshot.next:
-        return _format_approval_request(snapshot.values["messages"][-1].tool_calls)
+        return _format_approval_request(snapshot.values["messages"][-1].tool_calls, snapshot.values.get("plan"))
     last_message = snapshot.values["messages"][-1]
     if getattr(last_message, "tool_calls", None):
         return _format_iteration_limit_notice(last_message.tool_calls)
@@ -449,7 +477,10 @@ async def pending(request: PendingCheckRequest):
     snapshot = await agent_graph.aget_state(config)
     if not snapshot.next:
         return {"pending": False}
-    return {"pending": True, "text": _format_approval_request(snapshot.values["messages"][-1].tool_calls)}
+    return {
+        "pending": True,
+        "text": _format_approval_request(snapshot.values["messages"][-1].tool_calls, snapshot.values.get("plan")),
+    }
 
 
 @app.get("/tools/schema")

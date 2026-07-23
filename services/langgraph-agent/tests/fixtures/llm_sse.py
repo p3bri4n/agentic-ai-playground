@@ -76,6 +76,23 @@ def text_response(tokens):
     )
 
 
+def non_streaming_response(content):
+    """
+    Réponse LLM NON streamée (ChatCompletion classique), pour les appels via
+    .ainvoke() plutôt que .astream()/.stream() — seul appel non-streamé du
+    graphe : le nœud planificateur (app/graph.py:plan_task, Itération 1,
+    Phase 1 « cœur cognitif »). À passer via httpx.Response(200, json=...),
+    pas _sse_response (content-type JSON classique, pas text/event-stream).
+    """
+    return {
+        "id": f"chatcmpl-{uuid.uuid4().hex[:8]}",
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": "agent-llm",
+        "choices": [{"index": 0, "message": {"role": "assistant", "content": content}, "finish_reason": "stop"}],
+    }
+
+
 def reasoning_tool_call_response(reasoning_tokens, tool_name, tool_call_id, arguments_json):
     """
     Simule un tour où le modèle raisonne (champ "reasoning") puis décide

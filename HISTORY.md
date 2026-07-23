@@ -912,3 +912,59 @@ contournement local, pas un changement de dépendance projet).
 Pas de campagne live exécutée pour cette itération (c'est l'instrument, pas
 une mesure comportementale — cohérent avec le brief). 🧑 **Checkpoint court
 (itération 0) : revue du préambule avant l'itération 1 (plan explicite).**
+
+## Phase 1 « cœur cognitif » — Itération 1 : plan explicite
+
+Suite directe de l'Itération 0. Clarifié avec l'utilisateur avant
+d'écrire du code : "replanification sur échec de sous-tâche" (point 2 du
+brief) reste SANS déclencheur dans cette itération — aucun détecteur
+d'échec n'existe avant l'Itération 2 (vérification post-action). Le
+planificateur ne tourne donc qu'UNE fois, en tête de tâche.
+
+**Risque de régression identifié et sa mitigation** : un second appel LLM
+(planification) au début de CHAQUE tâche aurait cassé la quasi-totalité des
+~137 tests existants qui mockent une séquence FIXE de réponses sur
+`/v1/chat/completions` (la réponse mockée du premier tour aurait été
+consommée par l'appel de planification au lieu de `call_llm`). Plutôt que
+de retoucher ~100 tests, le mécanisme est gated par `PLANNER_ENABLED`
+(env, défaut `false`, même convention que `ADAPTIVE_THINKING`/
+`IMAGE_FORMAT_PASSTHROUGH`) : désactivé, `plan_task` est un no-op strict et
+la suite existante reste inchangée à 100 % sans qu'aucun test existant
+n'ait dû être modifié.
+
+**Ce qui est livré** (`app/graph.py`, `app/main.py`) :
+- `AgentState.plan` : liste de sous-tâches
+  `{description, success_criterion, status, attempts, result}`, calculée
+  UNE fois par tâche, remise à `[]` à chaque nouveau message utilisateur
+  top-level (`_resolve_run`, comme `observed_urls`).
+- `plan_task` (nouveau nœud, entre `select_skill` et `call_llm`) : appelle
+  `llm.ainvoke` (jamais `bound_llm` — le planificateur ne doit jamais
+  émettre de tool_calls) avec un prompt dédié exigeant un JSON strict
+  `{"sous_taches": [{"description":..., "critere_succes":...}, ...]}`.
+  `_validate_plan_json` (schéma validé PROGRAMMATIQUEMENT, pas encore de
+  juge LLM — Itération 3) retire `<think>`/fences puis valide bornes
+  (1-8 sous-tâches) et champs non vides. Toute erreur (transport, JSON
+  invalide, schéma invalide) dégrade sur un plan à sous-tâche unique
+  enveloppant l'objectif tel quel — ne bloque jamais la tâche.
+- Plan visible dans les logs (`logger.info`), et résumé dans le message
+  d'approbation existant (`_format_plan_summary`/`_format_approval_request`,
+  `plan=None` -> texte STRICTEMENT identique à avant cette itération).
+
+**Métrique "sous-tâches déclarées vs accomplies" — limite assumée** : sans
+détecteur d'échec/succès par sous-tâche (Itération 2), seul "déclarées" est
+mesurable maintenant (logs + résumé d'approbation). "Accomplies" restera
+non mesurable tant que les statuts ne transitionnent pas — sujet réel du
+juge d'Itération 2, pas de celui-ci.
+
+**Tests** : 164/164 passent (144 précédents inchangés + 20 nouveaux —
+`test_plan_task.py` : validation JSON pure, comportement du nœud LLM
+mocké (respx), no-op sur flag désactivé/plan déjà présent/absence de
+message humain, repli sur erreur de transport ou JSON invalide, et un
+test d'intégration graphe confirmant qu'une boucle d'outils de plusieurs
+tours ne redéclenche PAS la planification ; `test_approval_plan_summary.py` :
+formatage pur). Suite rejouée dans l'environnement Python 3.12 dédié
+(voir Itération 0).
+
+Pas de campagne live lancée pour cette itération : le juge "score ≥28/33"
+nécessite la stack réelle avec `PLANNER_ENABLED=true` explicitement
+activé (comportement par défaut inchangé sinon). 🧑 **Checkpoint.**
