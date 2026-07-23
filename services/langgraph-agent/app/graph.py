@@ -639,6 +639,31 @@ def has_visible_answer(content: str) -> bool:
     return bool(_THINK_BLOCK_RE.sub("", content or "").strip())
 
 
+# Correctif latence 1/2 (Itération 4, voir HISTORY.md) : le verdict de
+# vérification post-action ne vient plus d'un appel LLM séparé
+# (planner_llm.ainvoke, ~coût d'un tour entier) mais du raisonnement du
+# TOUR SUIVANT lui-même (call_llm) — voir _verification_directive et
+# verify_action plus bas. Marqueur structuré simple, cherché hors balise
+# <think> (même pipeline que has_visible_answer).
+_VERIFICATION_MARKER_RE = re.compile(r"\[CONSTAT:\s*(ATTEINT|ECHEC)\]", re.IGNORECASE)
+
+
+def _parse_verification_marker(content: str) -> Optional[bool]:
+    """
+    None si le marqueur est absent/mal formé (le modèle n'a pas respecté la
+    consigne) — traité comme "non atteint" par l'appelant (verify_action),
+    même philosophie de dégradation conservative que l'ancien mécanisme LLM
+    (ne jamais bloquer, mais ne jamais accorder un succès implicite).
+    """
+    if not content:
+        return None
+    text = _THINK_BLOCK_RE.sub("", content)
+    match = _VERIFICATION_MARKER_RE.search(text)
+    if not match:
+        return None
+    return match.group(1).upper() == "ATTEINT"
+
+
 # Nœud planificateur (Itération 1, voir plan_task plus bas) : reconnaît un
 # éventuel enrobage ```json ... ``` / ``` ... ``` autour de la réponse — le
 # modèle peut envelopper le JSON malgré la consigne de sortie brute, comme
@@ -731,7 +756,7 @@ class PlanJudgeValidationError(ValueError):
 def _validate_judge_json(raw: str) -> dict:
     """
     Schéma validé PROGRAMMATIQUEMENT (Itération 3, même pipeline que
-    _validate_plan_json/_validate_verification_json) : exige
+    _validate_plan_json) : exige
     {"faisable": bool}, "risques"/"etapes_manquantes" optionnelles (repli
     sur liste vide si absentes/mal formées — accessoires pour la
     visibilité, pas pour la décision).
@@ -807,47 +832,6 @@ async def _judge_plan(plan: list, objective: str, page_snapshot: Optional[str] =
     if verdict["etapes_manquantes"]:
         reasons.append("juge : étapes manquantes — " + "; ".join(verdict["etapes_manquantes"]))
     return reasons
-
-
-class VerificationValidationError(ValueError):
-    """Levée par _validate_verification_json : verdict du vérificateur inexploitable."""
-
-
-def _validate_verification_json(raw: str) -> dict:
-    """
-    Schéma validé PROGRAMMATIQUEMENT (Itération 2, même pipeline que
-    _validate_plan_json) : retire <think>/fences, exige
-    {"atteint": bool, "raison": str}. `raison` absente/non-str -> chaîne
-    vide plutôt qu'une erreur (accessoire pour la visibilité, pas pour la
-    décision elle-même) ; `atteint` doit être un booléen JSON réel (pas une
-    chaîne "true"/"false") sans quoi le verdict est jugé inexploitable.
-    """
-    text = _strip_code_fence(_THINK_BLOCK_RE.sub("", raw or ""))
-    try:
-        data = json.loads(text)
-    except json.JSONDecodeError as exc:
-        raise VerificationValidationError(f"JSON invalide : {exc}") from exc
-    if not isinstance(data, dict) or not isinstance(data.get("atteint"), bool):
-        raise VerificationValidationError("clé 'atteint' (bool) absente ou invalide")
-    raison = data.get("raison")
-    return {"atteint": data["atteint"], "raison": raison.strip() if isinstance(raison, str) else ""}
-
-
-VERIFIER_SYSTEM_PROMPT = (
-    "Tu es le vérificateur d'un agent. On te donne l'objectif global de la "
-    "tâche (objectif_global), la description d'une sous-tâche, son critère "
-    "de succès énoncé PAR AVANCE par le planificateur (critere_succes), le "
-    "résultat brut de la dernière action (resultat), et si disponible "
-    "l'état ACTUEL de la page (etat_actuel_de_la_page). Le critère de "
-    "succès peut décrire une approche qui n'existe pas réellement sur "
-    "cette page (ex. une barre de recherche supposée alors que le site "
-    "n'a que de la pagination) — dans ce cas, juge la PROGRESSION RÉELLE "
-    "vers l'objectif global et ce que montre effectivement la page "
-    "actuelle, PAS une lecture littérale du critère si l'approche qu'il "
-    "suppose n'existe pas. Réponds UNIQUEMENT par un JSON de la forme "
-    '{"atteint": true|false, "raison": "..."}, rien d\'autre : pas de '
-    "texte avant/après, pas de balise <think>, pas de bloc de code."
-)
 
 
 async def _fetch_verification_snapshot(objective: str) -> str:
@@ -1018,6 +1002,16 @@ class AgentState(TypedDict):
     plan_approved: Optional[bool]
     plan_grant_session: bool
     plan_grant: bool
+    # Correctif latence 1/2 (Itération 4, voir HISTORY.md) : True dès qu'une
+    # action vient d'être exécutée (_execute_tool_calls), consommé par
+    # verify_action au tour suivant. Remplace une recherche dans l'historique
+    # des messages (repérer le dernier tool_call) — plus robuste : sans ce
+    # marqueur explicite, un tour de replanification (qui n'exécute AUCUN
+    # outil) aurait pu être confondu avec une action encore à constater si le
+    # tour précédent était resté sans tool_calls (constat + budget épuisé,
+    # texte seul) — le marqueur explicite évite de constater une SOUS-TÂCHE
+    # FRAÎCHE contre un résultat d'outil PÉRIMÉ.
+    pending_verification: bool
 
 
 # Plafond de tokens par TOUR (un seul appel LLM), pas pour la conversation
@@ -1054,6 +1048,19 @@ llm = ChatOpenAI(
 # petite valeur reste un filet de sécurité voulu contre les dérives de
 # répétition, voir LLM_MAX_TOKENS).
 PLANNER_MAX_TOKENS = int(os.environ.get("PLANNER_MAX_TOKENS", "8192"))
+# Terrain préparé pour le correctif latence 2/2 (thinking bridé sur les
+# appels auxiliaires restants — plan_task/revise_plan/replan_task/
+# _judge_plan — PAS ACTIVÉ ICI) : contrairement à `/no_think` en préfixe de
+# prompt (ADAPTIVE_THINKING, déjà confirmé sans effet sur ce backend, voir
+# commentaire ci-dessus), TabbyAPI expose un vrai paramètre PAR REQUÊTE côté
+# serveur (`GET /openapi.json`, schéma ChatCompletionRequest) :
+# `enable_thinking: bool` et `reasoning_effort: str`, transmis au template de
+# chat comme variables `enable_thinking`/`reasoning_effort`. Accessible
+# depuis ce code via `ChatOpenAI(..., extra_body={...})` ou
+# `planner_llm.bind(extra_body={"enable_thinking": False})` par appel —
+# `extra_body` est un paramètre natif de langchain-openai (vérifié :
+# `"extra_body" in inspect.signature(ChatOpenAI).parameters`). Vérifié
+# accessible, non activé — décision et mesure d'impact au correctif 2/2.
 planner_llm = ChatOpenAI(
     base_url=LLM_BASE_URL,
     api_key="not-needed",
@@ -1498,31 +1505,6 @@ def _previous_turn_tool_calls(messages: list) -> Optional[list]:
     return None
 
 
-def _previous_turn_tool_results(messages: list) -> list[str]:
-    """
-    Contenus des ToolMessage produits par le dernier tour de tool_calls
-    (Itération 2, voir verify_action plus bas) : repère la limite via le
-    dernier AIMessage avec tool_calls (même idiome que
-    _previous_turn_tool_calls), puis ne garde QUE les messages "tool" après
-    cette limite — ignore les messages image "user" que _split_image_blocks
-    peut intercaler (_execute_tool_calls) : le vérificateur ne raisonne que
-    sur du texte.
-    """
-    boundary = None
-    for i in range(len(messages) - 1, -1, -1):
-        if getattr(messages[i], "type", None) == "ai" and getattr(messages[i], "tool_calls", None):
-            boundary = i
-            break
-    if boundary is None:
-        return []
-    results = []
-    for message in messages[boundary + 1 :]:
-        if getattr(message, "type", None) == "tool":
-            content = message.content
-            results.append(content if isinstance(content, str) else json.dumps(content, ensure_ascii=False))
-    return results
-
-
 def _apply_adaptive_thinking(messages: list, session_grants) -> list:
     """
     Ajoute un system prompt transitoire "/no_think" (jamais persisté dans
@@ -1561,10 +1543,42 @@ def _apply_adaptive_thinking(messages: list, session_grants) -> list:
     return [SystemMessage(content=NO_THINK_DIRECTIVE)] + messages
 
 
+def _verification_directive(state: AgentState) -> str:
+    """
+    Correctif latence 1/2 (Itération 4, voir HISTORY.md) : remplace l'appel
+    LLM séparé verify_action par une consigne injectée dans CE tour-ci —
+    le constat sur l'action précédente vit dans le même raisonnement que la
+    décision de la suite, coût marginal ~zéro (aucun aller-retour
+    supplémentaire). Chaîne vide (rien injecté) si VERIFICATION_ENABLED est
+    désactivé, si aucune sous-tâche n'est "en_cours", ou si
+    `pending_verification` (AgentState) est faux — pas de nouvelle action
+    exécutée depuis le dernier constat (ex. tour de replanification, qui
+    n'exécute aucun outil) : mêmes conditions que verify_action, DOIT rester
+    synchronisé avec lui, voir plus bas.
+    """
+    if not VERIFICATION_ENABLED:
+        return ""
+    if not state.get("pending_verification"):
+        return ""
+    plan = state.get("plan") or []
+    active_index = _active_subtask_index(plan)
+    if active_index is None:
+        return ""
+    critere = plan[active_index]["success_criterion"]
+    return (
+        "\nAvant de décider la suite : l'action précédente a-t-elle atteint "
+        f'son critère "{critere}" ? Constate sur le résultat d\'outil '
+        "ci-dessus (pas sur le critère seul — s'il suppose une approche qui "
+        "n'existe pas réellement sur cette page, juge la progression "
+        "réelle). Commence ta réponse par exactement [CONSTAT: ATTEINT] ou "
+        "[CONSTAT: ECHEC], puis continue normalement (agis ou réponds)."
+    )
+
+
 async def call_llm(state: AgentState, config: dict) -> dict:
     bound_llm = await _get_bound_llm()
     messages_for_llm = [
-        SystemMessage(content=f"{GROUNDING_DIRECTIVE}\n{DOWNLOAD_DIRECTIVE}")
+        SystemMessage(content=f"{GROUNDING_DIRECTIVE}\n{DOWNLOAD_DIRECTIVE}{_verification_directive(state)}")
     ] + state["messages"]
     messages_for_llm = _apply_image_retention(messages_for_llm)
     messages_for_llm = _apply_adaptive_thinking(messages_for_llm, state.get("session_grants") or [])
@@ -1919,6 +1933,10 @@ async def _execute_tool_calls(state: AgentState, config: dict, *, audit: bool) -
         "current_page_url": current_page_url,
         "current_page_links": current_page_links,
         "fabricated_navigation_attempts": state.get("fabricated_navigation_attempts", 0) + fabricated_attempts,
+        # Correctif latence 1/2 (voir AgentState.pending_verification) : une
+        # action vient d'être exécutée, verify_action a quelque chose à
+        # constater au prochain tour.
+        "pending_verification": True,
     }
 
 
@@ -1961,94 +1979,72 @@ def _active_subtask_index(plan: list) -> Optional[int]:
 
 async def verify_action(state: AgentState) -> dict:
     """
-    Vérification post-action (Itération 2, Phase 1 « cœur cognitif »).
+    Analyse du constat de vérification post-action (Itération 2, révisé
+    Itération 4 — correctif latence, voir HISTORY.md et
+    _verification_directive plus haut). NE FAIT PLUS D'APPEL LLM : le
+    verdict est parsé depuis la réponse que call_llm vient de produire (CE
+    même appel a aussi constaté le résultat de l'action précédente ET
+    décidé la suite — voir _verification_directive). Ce nœud ne fait que
+    lire ce marqueur et mettre à jour le plan en conséquence.
+
     No-op (`{"messages": []}`) si VERIFICATION_ENABLED est désactivé
-    (défaut), s'il n'y a pas de sous-tâche "en_cours" (pas de plan, ou plan
-    terminé/PLANNER_ENABLED désactivé) ou si le tour qui vient de s'exécuter
-    n'a produit aucun résultat d'outil texte.
+    (défaut), s'il n'y a pas de sous-tâche "en_cours", ou si
+    `pending_verification` (AgentState) est faux — mêmes conditions que
+    _verification_directive, à garder synchronisées : si la consigne n'a
+    pas été injectée, il n'y a rien à parser ici non plus. Consomme
+    toujours le marqueur (`pending_verification: False` en retour) : une
+    fois constatée, une action ne doit pas être reconstatée au prochain
+    tour si aucune NOUVELLE action n'a encore été exécutée entre-temps (ex.
+    tour de replanification, qui n'exécute aucun outil).
 
     Critère vérifié = success_criterion de la sous-tâche ACTIVE du plan
-    (Itération 1), pas un critère reformulé à la volée dans le raisonnement
-    du tour — voir docs/briefs/phase-1-coeur-cognitif.md, clarification
-    obtenue avant cette itération : aucun raisonnement structuré n'existe
-    dans ce graphe pour en extraire un fiablement. Depuis l'Itération 4
-    (correctif d'ancrage, voir HISTORY.md), le juge reçoit aussi l'objectif
-    global de la tâche et, si le tour précédent a utilisé un outil
-    browser_*, un browser_snapshot FRAIS de la page — sans quoi il jugeait
-    littéralement contre un critère parfois mal ancré (ex. "utilise la
-    barre de recherche" sur un site qui n'en a pas), sans jamais voir la
-    progression réelle montrée par la page.
-
-    Comme plan_task, dégrade TOUJOURS (verdict "non atteint") plutôt que de
-    bloquer la tâche pour un souci de vérification annexe.
+    (Itération 1). Marqueur absent/mal formé -> traité comme "non atteint"
+    (même dégradation conservative que l'ancien mécanisme LLM : ne jamais
+    bloquer, mais ne jamais accorder un succès implicite).
     """
     if not VERIFICATION_ENABLED:
+        return {"messages": []}
+    if not state.get("pending_verification"):
         return {"messages": []}
     plan = state.get("plan") or []
     active_index = _active_subtask_index(plan)
     if active_index is None:
-        return {"messages": []}
-    tool_results = _previous_turn_tool_results(state["messages"])
-    if not tool_results:
-        return {"messages": []}
+        return {"messages": [], "pending_verification": False}
 
-    subtask = plan[active_index]
-    first_human = next((m for m in state["messages"] if getattr(m, "type", None) == "human"), None)
-    objective = first_human.content if first_human and isinstance(first_human.content, str) else ""
-
-    page_snapshot = None
-    previous_tool_calls = _previous_turn_tool_calls(state["messages"]) or []
-    if any(tc.get("name", "").startswith("browser_") for tc in previous_tool_calls):
-        snapshot_text = await _fetch_verification_snapshot(objective)
-        page_snapshot = snapshot_text[:4000] if snapshot_text else None
-
-    try:
-        response = await planner_llm.ainvoke(
-            [
-                SystemMessage(content=VERIFIER_SYSTEM_PROMPT),
-                HumanMessage(
-                    content=json.dumps(
-                        {
-                            "objectif_global": objective,
-                            "sous_tache": subtask["description"],
-                            "critere_succes": subtask["success_criterion"],
-                            "resultat": "\n".join(tool_results)[:4000],
-                            "etat_actuel_de_la_page": page_snapshot,
-                        },
-                        ensure_ascii=False,
-                    )
-                ),
-            ]
-        )
-        verdict = _validate_verification_json(response.content)
-    except Exception:
-        logger.warning("Vérification post-action échouée, tour considéré comme non concluant.", exc_info=True)
-        verdict = {"atteint": False, "raison": "vérification indisponible"}
+    last = state["messages"][-1]
+    content = last.content if isinstance(last.content, str) else ""
+    atteint = _parse_verification_marker(content)
+    if atteint is None:
+        raison = "marqueur de constat absent ou mal formé dans la réponse"
+    elif atteint:
+        raison = "critère atteint (constat intégré au tour)"
+    else:
+        raison = "critère non atteint (constat intégré au tour)"
 
     new_plan = [dict(st) for st in plan]
-    if verdict["atteint"]:
+    if atteint:
         new_plan[active_index]["status"] = "fait"
-        new_plan[active_index]["result"] = verdict["raison"]
+        new_plan[active_index]["result"] = raison
         if active_index + 1 < len(new_plan):
             new_plan[active_index + 1]["status"] = "en_cours"
-        logger.info("Sous-tâche %d atteinte : %s", active_index, verdict["raison"])
-        return {"plan": new_plan}
+        logger.info("Sous-tâche %d atteinte : %s", active_index, raison)
+        return {"plan": new_plan, "pending_verification": False}
 
     attempts = new_plan[active_index]["attempts"] + 1
     new_plan[active_index]["attempts"] = attempts
     if attempts < SUBTASK_ATTEMPT_BUDGET:
         logger.info(
             "Sous-tâche %d non atteinte (tentative %d/%d) : %s",
-            active_index, attempts, SUBTASK_ATTEMPT_BUDGET, verdict["raison"],
+            active_index, attempts, SUBTASK_ATTEMPT_BUDGET, raison,
         )
-        return {"plan": new_plan}
+        return {"plan": new_plan, "pending_verification": False}
 
     new_plan[active_index]["status"] = "echoue"
-    new_plan[active_index]["result"] = verdict["raison"]
+    new_plan[active_index]["result"] = raison
     logger.warning(
-        "Sous-tâche %d échouée après %d tentatives : %s", active_index, attempts, verdict["raison"]
+        "Sous-tâche %d échouée après %d tentatives : %s", active_index, attempts, raison
     )
-    return {"plan": new_plan}
+    return {"plan": new_plan, "pending_verification": False}
 
 
 async def replan_task(state: AgentState) -> dict:
@@ -2134,18 +2130,22 @@ async def report_failure(state: AgentState) -> dict:
 
 def route_after_verification(state: AgentState) -> str:
     """
-    Routage après verify_action (Itération 2). VERIFICATION_ENABLED
-    désactivé ou aucune sous-tâche "echoue" -> "continue" (flux normal,
-    identique à avant cette itération). Sous-tâche "echoue" -> "replan" tant
-    que le budget REPLAN_BUDGET n'est pas épuisé, sinon "give_up" (rapport
-    d'échec honnête plutôt qu'une boucle infinie de replanifications).
+    Routage après verify_action (Itération 2, câblage révisé Itération 4 —
+    correctif latence, voir HISTORY.md). verify_action tourne maintenant
+    APRÈS call_llm (plus AVANT, voir build_graph) : ce routage fusionne donc
+    l'ancien "continue" avec le dispatch qu'assurait has_tool_calls
+    directement depuis call_llm — sous-tâche "echoue" -> "replan"/"give_up"
+    comme avant ; sinon, délègue à has_tool_calls (mêmes 4 issues :
+    auto_call_tools/call_tools/retry_empty_answer/end), état["messages"][-1]
+    restant le même AIMessage tout du long (verify_action ne touche jamais
+    "messages").
     """
     plan = state.get("plan") or []
     if any(st.get("status") == "echoue" for st in plan):
         if state.get("replan_count", 0) < REPLAN_BUDGET:
             return "replan"
         return "give_up"
-    return "continue"
+    return has_tool_calls(state)
 
 
 def _coerce_slash_arg_value(raw: str):
@@ -2376,26 +2376,30 @@ def build_graph(checkpointer=None):
         {"call_llm": "call_llm", "reject_plan": "reject_plan"},
     )
     graph.add_edge("reject_plan", END)
+    # Correctif latence 1/2 (Itération 4, voir HISTORY.md) : verify_action
+    # tourne maintenant APRÈS call_llm (analyse du marqueur [CONSTAT: ...]
+    # que ce même appel vient de produire), plus AVANT comme appel LLM
+    # séparé — route_after_verification fusionne donc l'ancien dispatch de
+    # has_tool_calls (call_tools/auto_call_tools/retry_empty_answer/end) et
+    # le routage replan/give_up sur sous-tâche "echoue".
+    graph.add_edge("call_llm", "verify_action")
     graph.add_conditional_edges(
-        "call_llm",
-        has_tool_calls,
+        "verify_action",
+        route_after_verification,
         {
             "call_tools": "require_approval",
             "auto_call_tools": "auto_call_tools",
             "retry_empty_answer": "retry_empty_answer",
             "end": END,
+            "replan": "replan_task",
+            "give_up": "report_failure",
         },
     )
     graph.add_conditional_edges(
         "require_approval", route_after_approval, {"call_tools": "call_tools", "reject_tools": "reject_tools"}
     )
-    graph.add_edge("call_tools", "verify_action")
-    graph.add_edge("auto_call_tools", "verify_action")
-    graph.add_conditional_edges(
-        "verify_action",
-        route_after_verification,
-        {"continue": "call_llm", "replan": "replan_task", "give_up": "report_failure"},
-    )
+    graph.add_edge("call_tools", "call_llm")
+    graph.add_edge("auto_call_tools", "call_llm")
     graph.add_edge("replan_task", "validate_plan")
     graph.add_edge("report_failure", END)
     graph.add_edge("reject_tools", "call_llm")

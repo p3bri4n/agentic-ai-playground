@@ -323,6 +323,7 @@ async def _resolve_run(request: ChatCompletionRequest):
         "plan_approved": None,
         "plan_grant_session": False,
         "plan_grant": False,
+        "pending_verification": False,
     }
     return config, run_input
 

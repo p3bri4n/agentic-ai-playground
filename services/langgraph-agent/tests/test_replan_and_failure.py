@@ -10,7 +10,7 @@ import json
 import httpx
 import pytest
 import respx
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import AIMessage, HumanMessage
 
 from tests.fixtures.llm_sse import non_streaming_response
 
@@ -31,10 +31,22 @@ def _subtask(description="A", success_criterion="critère A", status="a_faire", 
 
 
 def test_route_after_verification_continue_when_no_failed_subtask():
+    """
+    Depuis le correctif latence (Itération 4) : route_after_verification
+    tourne APRÈS call_llm et délègue à has_tool_calls quand aucune
+    sous-tâche n'est "echoue" (fusion de l'ancien "continue" avec le
+    dispatch call_tools/auto_call_tools/retry_empty_answer/end — voir
+    app/graph.py). Ici, réponse finale sans tool_calls -> "end".
+    """
     import app.graph as g
 
-    state = {"plan": [_subtask(status="fait"), _subtask(status="en_cours")]}
-    assert g.route_after_verification(state) == "continue"
+    state = {
+        "plan": [_subtask(status="fait"), _subtask(status="en_cours")],
+        "messages": [AIMessage(content="Réponse finale.")],
+        "tool_iterations": 0,
+        "empty_answer_retries": 0,
+    }
+    assert g.route_after_verification(state) == "end"
 
 
 def test_route_after_verification_replan_under_budget():
@@ -55,7 +67,13 @@ def test_route_after_verification_give_up_when_budget_exhausted(monkeypatch):
 def test_route_after_verification_continue_with_empty_plan():
     import app.graph as g
 
-    assert g.route_after_verification({"plan": []}) == "continue"
+    state = {
+        "plan": [],
+        "messages": [AIMessage(content="Réponse finale.")],
+        "tool_iterations": 0,
+        "empty_answer_retries": 0,
+    }
+    assert g.route_after_verification(state) == "end"
 
 
 # ─────────────────────────────────────────────────────────────────────────

@@ -47,6 +47,31 @@ def tool_call_response(tool_name, tool_call_id, arguments_json):
     )
 
 
+def content_and_tool_call_response(content_text, tool_name, tool_call_id, arguments_json):
+    """
+    Simule un tour qui produit à la fois du texte visible (ex. le marqueur
+    [CONSTAT: ...] du correctif latence, Itération 4 — voir
+    app/graph.py:_verification_directive) ET un tool_call, dans le MÊME
+    appel : le constat sur l'action précédente et la décision de la suite
+    vivent désormais dans un seul tour, plus deux (voir HISTORY.md).
+    """
+    return sse_body(
+        [({"role": "assistant", "content": content_text}, None)]
+        + [
+            (
+                {
+                    "tool_calls": [
+                        {"index": 0, "id": tool_call_id, "type": "function", "function": {"name": tool_name, "arguments": ""}}
+                    ],
+                },
+                None,
+            ),
+            ({"tool_calls": [{"index": 0, "function": {"arguments": arguments_json}}]}, None),
+            ({}, "tool_calls"),
+        ]
+    )
+
+
 def multi_tool_call_response(tool_calls):
     """
     Simule un tour où le modèle demande PLUSIEURS outils d'un coup.
