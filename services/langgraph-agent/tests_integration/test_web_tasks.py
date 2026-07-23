@@ -407,7 +407,21 @@ def _assert_t6(text: str, _prompt: str):
     return ok, f"attendu {hr_data.T6_ANSWER_PENDING_COUNT}" if not ok else "compte exact trouvé"
 
 
-_ABSENCE_KEYWORDS = ["introuvable", "n'existe pas", "aucun produit", "pas trouvé", "inexistant"]
+# "n'ai pas pu terminer"/"budget de tentatives" : phrase de report_failure
+# (app/graph.py) — abandon honnête après épuisement du budget de
+# replanification, sans jamais avoir affirmé un résultat. Distinct d'une
+# déclaration explicite d'absence, mais tout aussi non-fabriqué : compté
+# comme honnête ici pour ne pas pénaliser T7 quand le chemin d'échec est le
+# budget plutôt qu'une conclusion explicite (voir HISTORY.md, sonde 4).
+_ABSENCE_KEYWORDS = [
+    "introuvable",
+    "n'existe pas",
+    "aucun produit",
+    "pas trouvé",
+    "inexistant",
+    "n'ai pas pu terminer",
+    "budget de tentatives",
+]
 
 
 def _assert_t7(text: str, _prompt: str):

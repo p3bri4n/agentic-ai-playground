@@ -760,7 +760,11 @@ PLAN_JUDGE_SYSTEM_PROMPT = (
     "faisable et complet pour atteindre l'objectif. Si un état de page est "
     "fourni, base ton jugement sur ce qui existe RÉELLEMENT dessus (ex. ne "
     "reproche jamais l'absence d'une barre de recherche ou d'une "
-    "fonctionnalité qui n'apparaît pas dans l'état fourni). Réponds "
+    "fonctionnalité qui n'apparaît pas dans l'état fourni). Vérifie aussi "
+    "que le plan cible bien l'élément EXACT demandé par l'objectif (ex. une "
+    "référence précise) et ne l'a pas substitué par un élément différent "
+    "simplement parce qu'il apparaît sur la page — rejette un plan qui "
+    "ferait cette confusion. Réponds "
     'UNIQUEMENT par un JSON de la forme {"faisable": true|false, "risques": '
     '["..."], "etapes_manquantes": ["..."]}, rien d\'autre : pas de texte '
     "avant/après, pas de balise <think>, pas de bloc de code."
@@ -1294,6 +1298,12 @@ async def revise_plan(state: AgentState) -> dict:
     page_snapshot = await _grounding_snapshot(state, objective)
     snapshot_hint = (
         f"\nÉtat actuel de la page (ce qui est RÉELLEMENT visible maintenant, base-toi dessus) :\n{page_snapshot}\n"
+        "ATTENTION : cet état ne montre que ce qui existe RÉELLEMENT — ne "
+        "confonds jamais un élément visible ici (ex. un autre produit, une "
+        "autre référence) avec ce que l'objectif demande explicitement. Si "
+        "l'élément exact demandé par l'objectif n'apparaît nulle part après "
+        "une recherche raisonnable, le plan doit conclure à son absence, "
+        "jamais lui substituer un élément différent trouvé sur la page.\n"
         if page_snapshot
         else ""
     )
@@ -2067,6 +2077,12 @@ async def replan_task(state: AgentState) -> dict:
     page_snapshot = await _grounding_snapshot(state, objective)
     snapshot_hint = (
         f"\nÉtat actuel de la page (ce qui est RÉELLEMENT visible maintenant, base-toi dessus) :\n{page_snapshot}\n"
+        "ATTENTION : cet état ne montre que ce qui existe RÉELLEMENT — ne "
+        "confonds jamais un élément visible ici (ex. un autre produit, une "
+        "autre référence) avec ce que l'objectif demande explicitement. Si "
+        "l'élément exact demandé par l'objectif n'apparaît nulle part après "
+        "une recherche raisonnable, le plan doit conclure à son absence, "
+        "jamais lui substituer un élément différent trouvé sur la page.\n"
         if page_snapshot
         else ""
     )
