@@ -824,13 +824,48 @@ def _validate_verification_json(raw: str) -> dict:
 
 
 VERIFIER_SYSTEM_PROMPT = (
-    "Tu es le vérificateur d'un agent. On te donne la description d'une "
-    "sous-tâche, son critère de succès, et le résultat obtenu après une "
-    "action. Détermine si le critère est atteint. Réponds UNIQUEMENT par un "
-    'JSON de la forme {"atteint": true|false, "raison": "..."}, rien '
-    "d'autre : pas de texte avant/après, pas de balise <think>, pas de bloc "
-    "de code."
+    "Tu es le vérificateur d'un agent. On te donne l'objectif global de la "
+    "tâche (objectif_global), la description d'une sous-tâche, son critère "
+    "de succès énoncé PAR AVANCE par le planificateur (critere_succes), le "
+    "résultat brut de la dernière action (resultat), et si disponible "
+    "l'état ACTUEL de la page (etat_actuel_de_la_page). Le critère de "
+    "succès peut décrire une approche qui n'existe pas réellement sur "
+    "cette page (ex. une barre de recherche supposée alors que le site "
+    "n'a que de la pagination) — dans ce cas, juge la PROGRESSION RÉELLE "
+    "vers l'objectif global et ce que montre effectivement la page "
+    "actuelle, PAS une lecture littérale du critère si l'approche qu'il "
+    "suppose n'existe pas. Réponds UNIQUEMENT par un JSON de la forme "
+    '{"atteint": true|false, "raison": "..."}, rien d\'autre : pas de '
+    "texte avant/après, pas de balise <think>, pas de bloc de code."
 )
+
+
+async def _fetch_verification_snapshot(objective: str) -> str:
+    """
+    Capture un browser_snapshot FRAIS au moment de la vérification —
+    correctif d'ancrage trouvé pendant la sonde live de l'Itération 4 (voir
+    HISTORY.md) : le résultat brut du dernier tool_call (ex. la
+    confirmation d'un browser_click) est souvent TERSE, sans le contenu de
+    la page qui en résulte. verify_action jugeait alors une sous-tâche
+    "échouée" en se fiant uniquement à success_criterion — parfois lui-même
+    mal ancré (ex. "utilise la barre de recherche" sur un site qui n'en a
+    pas) — sans jamais voir que la page réelle montrait déjà une
+    progression valide (ex. pagination). Best-effort : erreur mcp-client ->
+    chaîne vide, le vérificateur juge alors avec les seules infos déjà
+    disponibles (comportement identique à avant ce correctif) — jamais un
+    blocage pour un souci de capture annexe, même philosophie que le reste
+    de ce fichier.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            result, _ = await _call_mcp_tool(client, "browser_snapshot", {})
+        truncated = _truncate_browser_result(result, BROWSER_TOOL_OUTPUT_MAX_CHARS, objective)
+        blocks = truncated.get("content", [])
+        texts = [b["text"] for b in blocks if isinstance(b, dict) and b.get("type") == "text"]
+        return "\n".join(texts)
+    except Exception:
+        logger.warning("Capture de vérification (browser_snapshot) indisponible, jugement sans elle.", exc_info=True)
+        return ""
 
 
 class AgentState(TypedDict):
@@ -1893,7 +1928,13 @@ async def verify_action(state: AgentState) -> dict:
     (Itération 1), pas un critère reformulé à la volée dans le raisonnement
     du tour — voir docs/briefs/phase-1-coeur-cognitif.md, clarification
     obtenue avant cette itération : aucun raisonnement structuré n'existe
-    dans ce graphe pour en extraire un fiablement.
+    dans ce graphe pour en extraire un fiablement. Depuis l'Itération 4
+    (correctif d'ancrage, voir HISTORY.md), le juge reçoit aussi l'objectif
+    global de la tâche et, si le tour précédent a utilisé un outil
+    browser_*, un browser_snapshot FRAIS de la page — sans quoi il jugeait
+    littéralement contre un critère parfois mal ancré (ex. "utilise la
+    barre de recherche" sur un site qui n'en a pas), sans jamais voir la
+    progression réelle montrée par la page.
 
     Comme plan_task, dégrade TOUJOURS (verdict "non atteint") plutôt que de
     bloquer la tâche pour un souci de vérification annexe.
@@ -1909,6 +1950,15 @@ async def verify_action(state: AgentState) -> dict:
         return {"messages": []}
 
     subtask = plan[active_index]
+    first_human = next((m for m in state["messages"] if getattr(m, "type", None) == "human"), None)
+    objective = first_human.content if first_human and isinstance(first_human.content, str) else ""
+
+    page_snapshot = None
+    previous_tool_calls = _previous_turn_tool_calls(state["messages"]) or []
+    if any(tc.get("name", "").startswith("browser_") for tc in previous_tool_calls):
+        snapshot_text = await _fetch_verification_snapshot(objective)
+        page_snapshot = snapshot_text[:4000] if snapshot_text else None
+
     try:
         response = await planner_llm.ainvoke(
             [
@@ -1916,9 +1966,11 @@ async def verify_action(state: AgentState) -> dict:
                 HumanMessage(
                     content=json.dumps(
                         {
+                            "objectif_global": objective,
                             "sous_tache": subtask["description"],
                             "critere_succes": subtask["success_criterion"],
                             "resultat": "\n".join(tool_results)[:4000],
+                            "etat_actuel_de_la_page": page_snapshot,
                         },
                         ensure_ascii=False,
                     )

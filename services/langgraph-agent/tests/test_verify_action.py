@@ -224,3 +224,85 @@ async def test_verify_action_falls_back_to_non_atteint_on_llm_error(monkeypatch)
     new_plan = result["plan"]
     assert new_plan[0]["status"] == "en_cours"
     assert new_plan[0]["attempts"] == 1
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Correctif d'ancrage (Itération 4) : _fetch_verification_snapshot + son
+# branchement dans verify_action selon que le tour précédent a utilisé un
+# outil browser_* ou non.
+# ─────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_fetch_verification_snapshot_returns_text_content():
+    import app.graph as g
+
+    with respx.mock(assert_all_called=False) as mock:
+        mock.post("http://fake-mcp-client/call").mock(
+            return_value=httpx.Response(
+                200, json={"content": [{"type": "text", "text": "Page URL: http://x\n- lien: /a"}]}
+            )
+        )
+        snapshot = await g._fetch_verification_snapshot("trouve le prix")
+
+    assert "lien: /a" in snapshot
+
+
+@pytest.mark.asyncio
+async def test_fetch_verification_snapshot_degrades_on_mcp_error():
+    import app.graph as g
+
+    with respx.mock(assert_all_called=False) as mock:
+        mock.post("http://fake-mcp-client/call").mock(side_effect=httpx.ConnectError("down"))
+        snapshot = await g._fetch_verification_snapshot("trouve le prix")
+
+    assert snapshot == ""
+
+
+@pytest.mark.asyncio
+async def test_verify_action_fetches_snapshot_when_previous_turn_used_browser_tool(monkeypatch):
+    import app.graph as g
+
+    monkeypatch.setattr(g, "VERIFICATION_ENABLED", True)
+    plan = [_subtask(status="en_cours")]
+    with respx.mock(assert_all_called=False) as mock:
+        snapshot_route = mock.post("http://fake-mcp-client/call").mock(
+            return_value=httpx.Response(200, json={"content": [{"type": "text", "text": "état frais de la page"}]})
+        )
+        llm_route = mock.post("http://fake-vllm/v1/chat/completions").mock(
+            return_value=httpx.Response(
+                200, json=non_streaming_response(json.dumps({"atteint": True, "raison": "ok"}))
+            )
+        )
+        state = {"messages": _turn_messages(tool_name="browser_click"), "plan": plan}
+        await g.verify_action(state)
+
+    assert snapshot_route.call_count == 1
+    sent_payload = json.loads(llm_route.calls.last.request.content)
+    verifier_message = json.loads(sent_payload["messages"][-1]["content"])
+    assert verifier_message["etat_actuel_de_la_page"] == "état frais de la page"
+    assert verifier_message["objectif_global"] == "Ouvre le catalogue"
+
+
+@pytest.mark.asyncio
+async def test_verify_action_skips_snapshot_when_previous_turn_has_no_browser_tool(monkeypatch):
+    import app.graph as g
+
+    monkeypatch.setattr(g, "VERIFICATION_ENABLED", True)
+    plan = [_subtask(status="en_cours")]
+    with respx.mock(assert_all_called=False) as mock:
+        snapshot_route = mock.post("http://fake-mcp-client/call").mock(
+            return_value=httpx.Response(200, json={"content": [{"type": "text", "text": "ne doit pas être appelé"}]})
+        )
+        llm_route = mock.post("http://fake-vllm/v1/chat/completions").mock(
+            return_value=httpx.Response(
+                200, json=non_streaming_response(json.dumps({"atteint": True, "raison": "ok"}))
+            )
+        )
+        state = {"messages": _turn_messages(tool_name="mouse_click"), "plan": plan}
+        await g.verify_action(state)
+
+    assert snapshot_route.call_count == 0
+    sent_payload = json.loads(llm_route.calls.last.request.content)
+    verifier_message = json.loads(sent_payload["messages"][-1]["content"])
+    assert verifier_message["etat_actuel_de_la_page"] is None
