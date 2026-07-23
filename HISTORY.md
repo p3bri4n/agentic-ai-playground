@@ -1291,3 +1291,79 @@ campagne, leçons, résumé suite v2) — remplace l'ancienne section "Plan
 explicite".
 
 🧑 **Checkpoint final du chantier « cœur cognitif ».**
+
+## Correctif latence 1/2 : verify_action replié dans le tour suivant — score cassé, corrige rejeté en l'état
+
+**Diagnostic préalable** (archives seules, zéro run — voir la demande
+utilisateur) : croisement du journal d'audit et des logs TabbyAPI (métriques
+par requête) sur 3 tâches de la campagne finale. Les appels auxiliaires
+(planification/vérification/juge) représentaient **73 à 89% du temps de
+tâche**, l'attente réseau/navigateur étant négligeable (<2%) et le débit de
+génération stable (~65-70 T/s, pas de dégradation serveur). `verify_action`
+(1 appel LLM séparé par tour d'outil) identifié comme contributeur
+dominant.
+
+**Correctif implémenté** (`634147b`) : suppression de l'appel LLM séparé de
+`verify_action`. Le constat (« l'action précédente a-t-elle atteint son
+critère ? ») est désormais injecté comme consigne dans le tour SUIVANT
+(`_verification_directive`, `call_llm`) — le modèle doit commencer sa
+réponse par `[CONSTAT: ATTEINT|ECHEC]` puis continuer normalement (agir ou
+répondre). `verify_action` ne fait plus qu'analyser ce marqueur
+(`_parse_verification_marker`), sans appel réseau. Nouveau champ
+`AgentState.pending_verification` (posé par `_execute_tool_calls`, consommé
+par `verify_action`) plutôt qu'une recherche dans l'historique des
+messages : évite un cas limite trouvé en concevant le correctif — un tour
+de replanification n'exécute aucun outil, il ne doit jamais déclencher de
+constat sur un résultat d'outil PÉRIMÉ d'une sous-tâche déjà remplacée.
+Câblage du graphe révisé (`verify_action` tourne après `call_llm`, plus
+avant). 257 tests unitaires passent.
+
+**Terrain préparé, non activé**, pour un futur correctif 2/2 (thinking
+bridé sur les appels auxiliaires restants) : TabbyAPI expose un vrai
+paramètre PAR REQUÊTE (`enable_thinking`/`reasoning_effort`, vérifié via
+`GET /openapi.json`), accessible depuis ce code via
+`ChatOpenAI(extra_body=...)` — documenté près de `planner_llm`.
+
+**Campagne propre de mesure** (post-correctifs `31aacac` thread partagé +
+`634147b` latence, thread_id uniques, préambule vert, 33 runs, ~97 min) :
+**Score 18/33** — ÉCHEC net du critère de passage fixé par l'utilisateur
+(≥29/33). Comparaison par tâche avec la Campagne A (pré-cœur-cognitif) et
+la campagne finale corrigée (29/33, avant ce correctif) dans
+`tests_integration/TASKS-BASELINE-post-correctif-latence.md`.
+
+| Tâche | Campagne A | Finale corrigée (29/33) | Propre (18/33, ce correctif) |
+|---|---|---|---|
+| T1 | 2/3, 32.0s | 2/3, 355.1s | 0/3, 252.1s |
+| T2 | 3/3, 11.5s | 3/3, 111.0s | 3/3, 172.7s |
+| T3 | 3/3, 12.3s | 3/3, 51.7s | 3/3, 60.9s |
+| T4 | 2/3, 20.2s | 3/3, 125.3s | 0/3, 209.3s |
+| T5 | 3/3, 5.2s | 3/3, 82.9s | 3/3, 63.0s |
+| T6 | 3/3, 11.2s | 3/3, 170.0s | 2/3, 232.7s |
+| T7 | 3/3, 43.4s | 2/3, 373.4s | 3/3, 281.0s |
+| T8 | 3/3, 9.9s | 1/3, 151.9s | 0/3, 151.9s |
+| T9 | 3/3, 13.5s | 3/3, 367.3s | 3/3, 151.0s |
+| T10 | 2/3, 24.6s | 3/3, 196.6s | 0/3, 244.1s |
+| T11 | 3/3, 14.5s | 3/3, 101.6s | 1/3, 112.8s |
+
+**Bilan mitigé, pas un gain net** : le nombre d'appels LLM a bien chuté
+comme prévu (confirmé par le diagnostic), et 3 tâches (T3, T5, T9) sont
+effectivement plus rapides — mais 4 tâches (T2, T4, T6, T10) sont plus
+LENTES qu'avant ce correctif (variance élevée sur n=3, pas un effet
+uniforme), et le score s'effondre sur 5 tâches (T1, T4, T8, T10 en
+extraction ; T11, nouveau mode d'échec, en hallucination — l'agent répond
+depuis sa mémoire sans consulter le web).
+
+**Cause probable identifiée en direct pendant la campagne** (logs
+applicatifs, plusieurs occurrences) : le modèle **oublie parfois le
+marqueur `[CONSTAT: ...]`** (« Sous-tâche N échouée après 3 tentatives :
+marqueur de constat absent ou mal formé dans la réponse »). La dégradation
+conservative vers « non atteint » (voulue, même philosophie que l'ancien
+mécanisme) consomme alors le budget de tentatives sur une action peut-être
+réussie, déclenchant des replanifications ou abandons prématurés qui
+n'existaient pas avant ce correctif — hypothèse plausible mais non prouvée
+formellement (pas de campagne comparative contrôlée isolant cette seule
+variable).
+
+**Aucun nouveau correctif engagé unilatéralement** : rapporté à
+l'utilisateur pour arbitrage (renforcer la fiabilité du marqueur, revenir
+en arrière, ou autre) — décision non prise dans ce tour.
