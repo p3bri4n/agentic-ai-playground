@@ -36,8 +36,8 @@ def test_validate_plan_json_accepts_well_formed_plan():
     )
     result = g._validate_plan_json(raw)
     assert result == [
-        {"description": "Ouvrir le catalogue", "success_criterion": "page catalogue affichée"},
-        {"description": "Trouver le prix", "success_criterion": "prix visible"},
+        {"description": "Ouvrir le catalogue", "success_criterion": "page catalogue affichée", "tools": []},
+        {"description": "Trouver le prix", "success_criterion": "prix visible", "tools": []},
     ]
 
 
@@ -49,7 +49,7 @@ def test_validate_plan_json_strips_think_block_and_code_fence():
         '{"sous_taches": [{"description": "A", "critere_succes": "B"}]}\n```'
     )
     result = g._validate_plan_json(raw)
-    assert result == [{"description": "A", "success_criterion": "B"}]
+    assert result == [{"description": "A", "success_criterion": "B", "tools": []}]
 
 
 def test_validate_plan_json_rejects_invalid_json():
@@ -143,6 +143,7 @@ async def test_plan_task_builds_plan_from_valid_llm_response(monkeypatch):
         }
     )
     with respx.mock(assert_all_called=False) as mock:
+        mock.get("http://fake-mcp-client/tools/schema").mock(return_value=httpx.Response(200, json={"tools": []}))
         mock.post("http://fake-vllm/v1/chat/completions").mock(
             return_value=httpx.Response(200, json=non_streaming_response(plan_json))
         )

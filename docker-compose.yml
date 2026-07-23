@@ -71,6 +71,22 @@ services:
       # d'échec honnête plutôt qu'une boucle infinie (voir replan_task/
       # report_failure, app/graph.py).
       - REPLAN_BUDGET=${REPLAN_BUDGET:-2}
+      # Pipeline de validation du plan (Itération 3 — voir
+      # docs/briefs/phase-1-coeur-cognitif.md et README, section "Plan
+      # explicite"). N'A D'EFFET QUE SI PLANNER_ENABLED EST AUSSI true.
+      - PLAN_VALIDATION_ENABLED=${PLAN_VALIDATION_ENABLED:-false}
+      # Juge LLM du plan (heuristiques déjà passées, coûteux). Clause de
+      # retrait mesurée (voir HISTORY.md, Itération 3) : désactivé par
+      # défaut, même convention que le reste de ce chantier.
+      - PLAN_JUDGE_ENABLED=${PLAN_JUDGE_ENABLED:-false}
+      # Budget de tokens dédié aux appels LLM auxiliaires (plan_task/
+      # verify_action/replan_task/revise_plan/_judge_plan), SÉPARÉ de
+      # LLM_MAX_TOKENS (boucle conversationnelle). Bug réel trouvé en
+      # conditions réelles (voir HISTORY.md, Itération 3) : Qwen3.6/TabbyAPI
+      # raisonne dans reasoning_content avant de répondre, ce raisonnement
+      # consommait à lui seul tout LLM_MAX_TOKENS (2048), tronquant la
+      # réponse JSON systématiquement.
+      - PLANNER_MAX_TOKENS=${PLANNER_MAX_TOKENS:-8192}
       # Filet de sécurité (voir README, tableau des bugs) : certains modèles
       # écrivent parfois leur appel d'outil en prose au lieu d'un tool_calls
       # structuré, piégé dans le raisonnement. Nombre de relances

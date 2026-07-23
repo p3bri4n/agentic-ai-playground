@@ -30,6 +30,7 @@ from app import audit_log
 from app.graph import (
     MAX_TOOL_ITERATIONS,
     _get_tools_schema,
+    _plan_tier,
     agent_graph,
     describe_context,
     has_visible_answer,
@@ -146,6 +147,49 @@ def _format_approval_request(tool_calls: list, plan: Optional[list] = None) -> s
     return f"{base}\n\n{plan_summary}" if plan_summary else base
 
 
+def _format_plan_approval_request(plan: list, tier: str, reasons: Optional[list] = None) -> str:
+    """
+    Message d'approbation du PLAN (Itération 3, app/graph.py:
+    require_plan_approval) — distinct de _format_approval_request
+    (approbation d'un tool_call précis). Deux cas : approbation normale par
+    tier (`reasons` vide, le plan a passé la validation) ou escalade
+    humaine après échec répété de la validation automatique (`reasons`
+    non vide — motifs affichés, voir route_after_validation).
+    """
+    if reasons:
+        header = (
+            "⚠️ Le plan proposé a été rejeté par la validation automatique après "
+            "plusieurs tentatives — décision humaine requise. Motifs :\n"
+            + "\n".join(f"- {r}" for r in reasons)
+        )
+    else:
+        header = f"⚠️ Approbation du plan requise (tier : {tier})."
+    footer = 'Réponds "approuver" (une fois), "approuver pour la session" ou "refuser".'
+    summary = _format_plan_summary(plan)
+    return f"{header}\n\n{summary}\n\n{footer}" if summary else f"{header}\n\n{footer}"
+
+
+def _pending_approval_text(snapshot) -> Optional[str]:
+    """
+    Texte de la pause d'approbation en cours pour ce snapshot, ou None s'il
+    n'y en a pas. Centralise la distinction pause PLAN
+    (require_plan_approval, Itération 3) vs pause OUTIL (require_approval,
+    existant) déjà introduite dans _resolve_run — évite de la dupliquer aux
+    4 endroits qui affichent ce texte (streaming, _current_answer,
+    /pending, /context).
+    """
+    if not snapshot.next:
+        return None
+    if "require_plan_approval" in snapshot.next:
+        plan = snapshot.values.get("plan") or []
+        reasons = snapshot.values.get("plan_validation_reasons") or []
+        return _format_plan_approval_request(plan, _plan_tier(plan), reasons)
+    messages = snapshot.values.get("messages") or []
+    if not messages or not getattr(messages[-1], "tool_calls", None):
+        return None
+    return _format_approval_request(messages[-1].tool_calls, snapshot.values.get("plan"))
+
+
 def _parse_approval_reply(text: str) -> tuple:
     """
     Distingue les trois réponses possibles au message d'approbation (voir
@@ -232,10 +276,25 @@ async def _resolve_run(request: ChatCompletionRequest):
             (m.content for m in reversed(request.messages) if m.role == "user"), ""
         )
         approved, grant_session = _parse_approval_reply(last_human)
-        await agent_graph.aupdate_state(
-            config,
-            {"approved": approved, "grant_session": grant_session, "owui_message_count": owui_message_count},
-        )
+        # Deux raisons de pause possibles depuis l'Itération 3 (pipeline de
+        # validation du plan) : require_plan_approval (le PLAN) ou
+        # require_approval (un tool_call), jamais les deux en même temps
+        # (des nœuds distincts du graphe) — snapshot.next contient le nom du
+        # nœud interrompu, assez pour les distinguer sans état supplémentaire.
+        if "require_plan_approval" in snapshot.next:
+            await agent_graph.aupdate_state(
+                config,
+                {
+                    "plan_approved": approved,
+                    "plan_grant_session": grant_session,
+                    "owui_message_count": owui_message_count,
+                },
+            )
+        else:
+            await agent_graph.aupdate_state(
+                config,
+                {"approved": approved, "grant_session": grant_session, "owui_message_count": owui_message_count},
+            )
         return config, None
 
     already_seen = snapshot.values.get("owui_message_count", 0) if snapshot.values else 0
@@ -259,6 +318,11 @@ async def _resolve_run(request: ChatCompletionRequest):
         "fabricated_navigation_attempts": 0,
         "plan": [],
         "replan_count": 0,
+        "plan_validation_reasons": [],
+        "plan_validation_cycles": 0,
+        "plan_approved": None,
+        "plan_grant_session": False,
+        "plan_grant": False,
     }
     return config, run_input
 
@@ -362,9 +426,7 @@ async def _stream_response(config: dict, run_input: Optional[dict], model: str):
 
         snapshot = await agent_graph.aget_state(config)
         if snapshot.next:
-            pending = closing_prefix + _format_approval_request(
-                snapshot.values["messages"][-1].tool_calls, snapshot.values.get("plan")
-            )
+            pending = closing_prefix + _pending_approval_text(snapshot)
             for chunk in _sse_content_chunks(completion_id, model, pending):
                 yield chunk
         else:
@@ -462,7 +524,7 @@ def _render_visible_answer(snapshot_values: dict) -> str:
 async def _current_answer(config: dict) -> str:
     snapshot = await agent_graph.aget_state(config)
     if snapshot.next:
-        return _format_approval_request(snapshot.values["messages"][-1].tool_calls, snapshot.values.get("plan"))
+        return _pending_approval_text(snapshot)
     last_message = snapshot.values["messages"][-1]
     if getattr(last_message, "tool_calls", None):
         return _format_iteration_limit_notice(last_message.tool_calls)
@@ -478,10 +540,7 @@ async def pending(request: PendingCheckRequest):
     snapshot = await agent_graph.aget_state(config)
     if not snapshot.next:
         return {"pending": False}
-    return {
-        "pending": True,
-        "text": _format_approval_request(snapshot.values["messages"][-1].tool_calls, snapshot.values.get("plan")),
-    }
+    return {"pending": True, "text": _pending_approval_text(snapshot)}
 
 
 @app.get("/tools/schema")
@@ -523,9 +582,7 @@ async def context(request: ContextRequest):
     snapshot = await agent_graph.aget_state(config)
     messages = snapshot.values.get("messages", []) if snapshot.values else []
 
-    pending_text = None
-    if snapshot.next and messages and getattr(messages[-1], "tool_calls", None):
-        pending_text = _format_approval_request(messages[-1].tool_calls)
+    pending_text = _pending_approval_text(snapshot)
 
     blocks = describe_context(messages, pending_text)
     return {
@@ -590,14 +647,31 @@ async def approve(request: ApprovalDecisionRequest):
         raise HTTPException(status_code=409, detail="Aucune approbation en attente pour ce thread.")
 
     owui_message_count = len(request.messages)
-    await agent_graph.aupdate_state(
-        config,
-        {
-            "approved": request.approved,
-            "grant_session": request.approved and request.grant_session,
-            "owui_message_count": owui_message_count,
-        },
-    )
+    # Même distinction plan vs outil qu'en _resolve_run (Itération 3, voir
+    # commentaire là-bas) — bug réel trouvé en conditions réelles pendant
+    # la campagne live de l'Itération 3 : ce endpoint mettait
+    # inconditionnellement à jour "approved"/"grant_session", laissant une
+    # pause require_plan_approval indéfiniment bloquée (plan_approved
+    # jamais renseigné) puisque approuvée via /approve plutôt que via le
+    # message texte "approuver".
+    if "require_plan_approval" in snapshot.next:
+        await agent_graph.aupdate_state(
+            config,
+            {
+                "plan_approved": request.approved,
+                "plan_grant_session": request.approved and request.grant_session,
+                "owui_message_count": owui_message_count,
+            },
+        )
+    else:
+        await agent_graph.aupdate_state(
+            config,
+            {
+                "approved": request.approved,
+                "grant_session": request.approved and request.grant_session,
+                "owui_message_count": owui_message_count,
+            },
+        )
     try:
         await agent_graph.ainvoke(None, config)
     except Exception:

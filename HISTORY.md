@@ -1031,3 +1031,95 @@ Pas de campagne live lancée pour cette itération : les juges "compteur de
 fabrications en baisse", "tool_calls moyens en baisse", "T7 à 3/3", "score
 ≥30/33" nécessitent la stack GPU réelle, avec `PLANNER_ENABLED=true` ET
 `VERIFICATION_ENABLED=true` activés ensemble. 🧑 **Checkpoint.**
+
+## Phase 1 « cœur cognitif » — Itération 3 : pipeline de validation du plan
+
+Suite directe de l'Itération 2. Trois clarifications obtenues avec
+l'utilisateur avant d'écrire du code :
+- **Schéma du plan étendu** : chaque sous-tâche gagne `"outils"` (liste de
+  noms d'outils prévus), sans quoi les heuristiques n'ont rien de concret à
+  vérifier.
+- **Vocabulaire de tier** : réutilise `TIER_READ`/`TIER_REVERSIBLE`/
+  `TIER_SENSITIVE` existants plutôt que LECTURE/ÉCRITURE RÉVERSIBLE/
+  ENGAGEMENT (vocabulaire de la Phase 3 du `PLAN.md`, pas encore construite)
+  — `TIER_SENSITIVE` fait office d'ENGAGEMENT pour cette itération.
+- **Approbation du plan** : nouveau nœud miroir `require_plan_approval`
+  (même mécanisme `NodeInterrupt` que `require_approval`), pas un
+  détournement du flux d'approbation d'outil existant.
+
+**Correction actée en cours de route** : contrairement aux itérations
+précédentes, la stack tournait réellement pendant ce tour (2 GPU visibles,
+`docker ps` avec tous les services up) — la mesure de la clause de retrait
+du juge s'est donc faite par une VRAIE campagne live, pas une note "à
+mesurer plus tard".
+
+**Ce qui est livré** (`app/graph.py`, `app/plan_validation.py`, `app/main.py`) :
+- `app/plan_validation.py` (nouveau module, testable sans docker/LLM) :
+  heuristiques programmatiques — bornes de taille (2-12 sous-tâches,
+  délibérément distinctes des bornes 1-8 de `_validate_plan_json` qui ne
+  valident que la forme JSON), doublons, outils référencés existants,
+  domaines dans le périmètre déclaré. "Pas de cycles" : N/A (liste
+  séquentielle, aucune structure de dépendance). "Cohérence de tier" :
+  vérifiée par construction (le tier dérive uniquement des outils déclarés).
+- `_judge_plan`/`PLAN_JUDGE_ENABLED` : juge LLM (création et
+  replanification uniquement), verdict JSON `{faisable, risques,
+  etapes_manquantes}`, FAIL-OPEN sur erreur (aucun veto par défaut si le
+  juge est indisponible).
+- `validate_plan`/`route_after_validation` : heuristiques puis (si
+  activé) juge, rejet → `revise_plan` (max `PLAN_VALIDATION_CYCLES_MAX=2`
+  cycles) → au-delà, escalade humaine via `require_plan_approval` avec les
+  motifs affichés.
+- `require_plan_approval`/`route_after_plan_approval`/`reject_plan` : tier
+  du plan = pire tier de tous les outils déclarés (`_plan_tier`).
+  `TIER_READ` → auto ; `TIER_REVERSIBLE` → approbation relâchable en grant
+  de plan (`plan_grant`, jamais pour `TIER_SENSITIVE` — même philosophie
+  que `NEVER_GRANTABLE_TOOLS`) ; `TIER_SENSITIVE` → approbation à chaque
+  nouveau plan. **Non fusionnable** avec l'approbation individuelle d'un
+  outil `TIER_SENSITIVE` à l'exécution — vérifié par un test d'intégration
+  graphe ET par la campagne live (voir plus bas).
+
+**Trois bugs réels trouvés et corrigés PENDANT la campagne live** (aucun
+n'existait avant cette itération — voir le calcul GPU/HTTP direct qui a
+servi à chacun) :
+
+| Bug | Cause | Correctif |
+|---|---|---|
+| Tous les appels LLM auxiliaires (`plan_task`/`verify_action`/`replan_task`/`revise_plan`/`_judge_plan`) retombaient systématiquement sur leur repli d'erreur en conditions réelles | `LLM_MAX_TOKENS=2048` (pensé pour la boucle conversationnelle principale) partagé par tous les appels ; confirmé par un appel direct à TabbyAPI : Qwen3.6 raisonne dans `reasoning_content` (champ séparé de `content`) AVANT de répondre — ce raisonnement, souvent long, consommait à lui seul tout le budget, tronquant `content` à vide ou en plein milieu du JSON (`finish_reason="length"`). `/no_think` en préfixe de prompt (mécanisme `ADAPTIVE_THINKING` existant) ne supprime PAS ce raisonnement sur ce backend (vérifié par le même appel direct) | Nouveau client `planner_llm` séparé, `PLANNER_MAX_TOKENS` (défaut `8192`) dédié aux 5 appels auxiliaires — `llm`/`LLM_MAX_TOKENS` (2048) reste le filet de sécurité de la boucle principale, inchangé |
+| Le planificateur inventait des noms d'outils plausibles mais inexistants (`web_browser`, `search`, `extract_text`...), systématiquement rejetés par l'heuristique "outils référencés existants" — aucun plan ne passait jamais la validation | Le prompt planificateur ne communiquait jamais la liste réelle des outils MCP disponibles | `_available_tools_hint()` : ajoute la liste réelle des noms d'outils (`_get_tools_schema()`) au message UTILISATEUR (pas au system prompt, pour rester à jour si le schéma change), utilisée par `plan_task`/`revise_plan`/`replan_task` |
+| `POST /approve` (bouton d'UI Open WebUI) laissait une pause `require_plan_approval` indéfiniment bloquée malgré un appel "réussi" (200 OK, mais `plan_approved` jamais renseigné) | Même bug que `_resolve_run` avant son propre correctif (Itération 3, plus haut) — mais je n'avais corrigé QUE `_resolve_run`, pas ce second endpoint qui met aussi à jour l'état d'approbation | Même distinction `"require_plan_approval" in snapshot.next` appliquée à `/approve` — couvert par un nouveau test HTTP dédié (`test_approve_endpoint_resumes_plan_approval_pause`) |
+
+**Clause de retrait du juge LLM — résultat de la campagne live (préliminaire,
+PAS la campagne complète 11-13 tâches × N répétitions que le brief appelle
+en toute rigueur)** : sur le run observé (T1, catalogue fixture), le juge a
+**réellement vétoté un plan que les heuristiques laissaient passer**, pour
+des raisons sémantiques structurellement hors de portée des heuristiques
+(pagination/recherche non gérée, contenu potentiellement dynamique,
+absence d'étape d'attente de chargement) — preuve que ce n'est pas un
+validateur "théâtre" qui approuve tout. Coût réel observé : plusieurs
+allers-retours LLM supplémentaires par plan (2 cycles de révision avant
+escalade), latence notable sur un run complet (plusieurs minutes avec
+plusieurs replanifications). Verdict : **`PLAN_JUDGE_ENABLED` reste
+désactivé par défaut** (même convention que tout ce chantier — aucun
+mécanisme n'est activé par défaut avant mesure complète), mais la preuve
+d'utilité sémantique est réelle et consignée ici pour la décision finale,
+qui nécessite la vraie campagne complète (charge à l'utilisateur, la stack
+étant disponible).
+
+**Vérifié en conditions réelles, bout en bout** (pas seulement en test
+mocké) : plan généré avec des outils réels → validation heuristiques+juge →
+rejets → 2 cycles de révision → escalade humaine avec motifs affichés →
+approbation du plan → exécution → `verify_action` fait progresser le plan
+sous-tâche par sous-tâche (`[fait]`/`[en cours]`) → nouvel échec →
+replanification (Itération 2) → **nouveau plan re-soumis à approbation,
+JAMAIS de grant réutilisé pour `TIER_SENSITIVE`** (comportement voulu,
+confirmé en direct) → tool_call `browser_navigate` redemande sa PROPRE
+approbation malgré le plan déjà approuvé (non-fusion confirmée en direct,
+pas seulement en test).
+
+**Tests** : 239/239 passent (192 précédents inchangés + 47 nouveaux —
+`test_plan_validation.py`, `test_plan_judge.py`, `test_validate_plan_node.py`,
+`test_plan_approval.py` (dont le test HTTP `/approve` couvrant le 3e bug
+trouvé), `test_plan_approval_formatting.py`). Suite rejouée dans
+l'environnement Python 3.12 dédié (voir Itération 0).
+
+🧑 **Checkpoint.**

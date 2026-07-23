@@ -75,6 +75,7 @@ async def test_replan_task_rebuilds_plan_preserving_done_subtasks(monkeypatch):
         _subtask(description="Échouée", status="echoue", attempts=3, result="rien trouvé"),
     ]
     with respx.mock(assert_all_called=False) as mock:
+        mock.get("http://fake-mcp-client/tools/schema").mock(return_value=httpx.Response(200, json={"tools": []}))
         mock.post("http://fake-vllm/v1/chat/completions").mock(
             return_value=httpx.Response(200, json=non_streaming_response(new_plan_json))
         )

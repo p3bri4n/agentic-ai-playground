@@ -65,7 +65,7 @@ from langgraph.errors import NodeInterrupt
 from langgraph.graph import StateGraph, END
 from langgraph.graph.message import add_messages
 
-from app import approval_policy, audit_log
+from app import approval_policy, audit_log, plan_validation
 
 logger = logging.getLogger(__name__)
 
@@ -466,6 +466,24 @@ SUBTASK_ATTEMPT_BUDGET = int(os.environ.get("SUBTASK_ATTEMPT_BUDGET", "3"))
 # l'infini ou de prétendre un faux succès.
 REPLAN_BUDGET = int(os.environ.get("REPLAN_BUDGET", "2"))
 
+# Pipeline de validation du plan (Itération 3, Phase 1 « cœur cognitif » —
+# voir docs/briefs/phase-1-coeur-cognitif.md et app/plan_validation.py).
+# N'A D'EFFET QUE SI PLANNER_ENABLED EST AUSSI ACTIVÉ. Défaut désactivé,
+# même raison que PLANNER_ENABLED/VERIFICATION_ENABLED : casserait les
+# tests existants qui mockent une séquence fixe de réponses.
+PLAN_VALIDATION_ENABLED = os.environ.get("PLAN_VALIDATION_ENABLED", "false").lower() == "true"
+# Juge LLM du plan (heuristiques déjà passées, coûteux — un appel LLM par
+# validation). CLAUSE DE RETRAIT (brief) : si une campagne live montre que
+# ce juge n'attrape rien que les heuristiques ne voyaient pas, désactivé
+# par défaut et consigné — voir HISTORY.md, Itération 3, pour le résultat
+# de cette mesure et la valeur par défaut retenue en conséquence.
+PLAN_JUDGE_ENABLED = os.environ.get("PLAN_JUDGE_ENABLED", "false").lower() == "true"
+# "Rejet motivé → retour planificateur, max 2 cycles puis escalade
+# humaine" (brief) : nombre de rejets (heuristiques OU juge) tolérés avant
+# qu'un humain ne tranche (require_plan_approval, avec les motifs de rejet
+# affichés) plutôt que de laisser le planificateur boucler indéfiniment.
+PLAN_VALIDATION_CYCLES_MAX = 2
+
 # Qwen3.6 raisonne par défaut sur chaque tour (balises de pensée étendue) —
 # utile pour une décision initiale, coûteux en latence/tokens pour une
 # boucle perception-action rapide (capture -> clic -> capture...) où chaque
@@ -644,12 +662,16 @@ _PLAN_SUBTASKS_MAX = 8
 
 def _validate_plan_json(raw: str) -> list[dict]:
     """
-    Schéma validé PROGRAMMATIQUEMENT (Itération 1, pas encore de juge LLM —
-    voir Itération 3 du brief) : retire <think>...</think> puis un éventuel
-    enrobage de fences, exige {"sous_taches": [{"description":...,
-    "critere_succes":...}, ...]}, 1 à 8 éléments, description/critère non
-    vides. Lève PlanValidationError avec un motif explicite sinon — jamais
-    un plan partiellement construit à partir d'une réponse invalide.
+    Schéma validé PROGRAMMATIQUEMENT (Itération 1) : retire <think>...</think>
+    puis un éventuel enrobage de fences, exige {"sous_taches": [{"description":...,
+    "critere_succes":..., "outils": [...]}, ...]}, 1 à 8 éléments,
+    description/critère non vides. `outils` optionnelle côté LLM (repli sur
+    liste vide) — sert de base concrète au pipeline de validation
+    (Itération 3, app/plan_validation.py : existence/tier des outils
+    déclarés), sans quoi une sous-tâche purement rédactionnelle (ex.
+    "formuler la réponse finale") n'aurait pas de représentation valide.
+    Lève PlanValidationError avec un motif explicite sinon — jamais un plan
+    partiellement construit à partir d'une réponse invalide.
     """
     text = _strip_code_fence(_THINK_BLOCK_RE.sub("", raw or ""))
     try:
@@ -674,7 +696,18 @@ def _validate_plan_json(raw: str) -> list[dict]:
             raise PlanValidationError(f"sous-tâche {i} : description manquante ou vide")
         if not isinstance(critere, str) or not critere.strip():
             raise PlanValidationError(f"sous-tâche {i} : critere_succes manquant ou vide")
-        validated.append({"description": description.strip(), "success_criterion": critere.strip()})
+        outils = item.get("outils")
+        if outils is None:
+            outils = []
+        if not isinstance(outils, list) or not all(isinstance(t, str) for t in outils):
+            raise PlanValidationError(f"sous-tâche {i} : outils doit être une liste de strings")
+        validated.append(
+            {
+                "description": description.strip(),
+                "success_criterion": critere.strip(),
+                "tools": [t.strip() for t in outils if t.strip()],
+            }
+        )
     return validated
 
 
@@ -683,9 +716,87 @@ PLANNER_SYSTEM_PROMPT = (
     "partir de l'objectif de l'utilisateur, décompose-le en 1 à 8 "
     "sous-tâches concrètes et vérifiables. Réponds UNIQUEMENT par un JSON "
     'de la forme {"sous_taches": [{"description": "...", "critere_succes": '
-    '"..."}, ...]}, rien d\'autre : pas de texte avant/après, pas de balise '
+    '"...", "outils": ["nom_outil", ...]}, ...]}, rien d\'autre : pas de '
+    "texte avant/après, pas de balise <think>, pas de bloc de code. "
+    '"outils" liste les noms des outils que tu comptes utiliser pour cette '
+    "sous-tâche (liste vide si aucun, ex. une sous-tâche purement "
+    "rédactionnelle)."
+)
+
+
+class PlanJudgeValidationError(ValueError):
+    """Levée par _validate_judge_json : verdict du juge de plan inexploitable."""
+
+
+def _validate_judge_json(raw: str) -> dict:
+    """
+    Schéma validé PROGRAMMATIQUEMENT (Itération 3, même pipeline que
+    _validate_plan_json/_validate_verification_json) : exige
+    {"faisable": bool}, "risques"/"etapes_manquantes" optionnelles (repli
+    sur liste vide si absentes/mal formées — accessoires pour la
+    visibilité, pas pour la décision).
+    """
+    text = _strip_code_fence(_THINK_BLOCK_RE.sub("", raw or ""))
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise PlanJudgeValidationError(f"JSON invalide : {exc}") from exc
+    if not isinstance(data, dict) or not isinstance(data.get("faisable"), bool):
+        raise PlanJudgeValidationError("clé 'faisable' (bool) absente ou invalide")
+    risques = data.get("risques")
+    etapes = data.get("etapes_manquantes")
+    return {
+        "faisable": data["faisable"],
+        "risques": [r for r in risques if isinstance(r, str)] if isinstance(risques, list) else [],
+        "etapes_manquantes": [e for e in etapes if isinstance(e, str)] if isinstance(etapes, list) else [],
+    }
+
+
+PLAN_JUDGE_SYSTEM_PROMPT = (
+    "Tu es le juge d'un agent qui accomplit des tâches web. On te donne un "
+    "objectif et un plan (liste de sous-tâches avec critère de succès et "
+    "outils prévus). Évalue s'il est réellement faisable et complet pour "
+    "atteindre l'objectif. Réponds UNIQUEMENT par un JSON de la forme "
+    '{"faisable": true|false, "risques": ["..."], "etapes_manquantes": '
+    '["..."]}, rien d\'autre : pas de texte avant/après, pas de balise '
     "<think>, pas de bloc de code."
 )
+
+
+async def _judge_plan(plan: list, objective: str) -> list:
+    """
+    Verdict du juge LLM (Itération 3) : liste des motifs de rejet (vide =
+    faisable). Dégrade en FAIL-OPEN sur erreur LLM/JSON invalide (aucun
+    motif renvoyé, pas de veto par défaut) — cohérent avec "jamais de
+    boucle infinie" du brief : un juge indisponible ne doit jamais bloquer
+    indéfiniment une tâche par ailleurs valide selon les heuristiques.
+    """
+    payload = json.dumps(
+        {
+            "objectif": objective,
+            "plan": [
+                {
+                    "description": st.get("description", ""),
+                    "critere_succes": st.get("success_criterion", ""),
+                    "outils": st.get("tools", []),
+                }
+                for st in plan
+            ],
+        },
+        ensure_ascii=False,
+    )
+    try:
+        response = await planner_llm.ainvoke([SystemMessage(content=PLAN_JUDGE_SYSTEM_PROMPT), HumanMessage(content=payload)])
+        verdict = _validate_judge_json(response.content)
+    except Exception:
+        logger.warning("Juge de plan indisponible, aucun veto appliqué par défaut.", exc_info=True)
+        return []
+    if verdict["faisable"]:
+        return []
+    reasons = [f"juge : {r}" for r in verdict["risques"]] or ["juge : plan jugé non faisable"]
+    if verdict["etapes_manquantes"]:
+        reasons.append("juge : étapes manquantes — " + "; ".join(verdict["etapes_manquantes"]))
+    return reasons
 
 
 class VerificationValidationError(ValueError):
@@ -820,6 +931,29 @@ class AgentState(TypedDict):
     # tool_iterations, plafonné par REPLAN_BUDGET. Remis à 0 à chaque
     # nouveau message utilisateur top-level (voir run_input, app/main.py).
     replan_count: int
+    # Pipeline de validation du plan (Itération 3, voir validate_plan/
+    # revise_plan/require_plan_approval plus bas). plan_validation_reasons :
+    # motifs du DERNIER rejet (heuristiques et/ou juge), [] si le plan
+    # courant est valide (ou pas encore évalué). plan_validation_cycles :
+    # nombre de rejets subis pour CETTE tâche (pas par plan proposé — un
+    # budget partagé entre planification initiale et replanifications,
+    # voir PLAN_VALIDATION_CYCLES_MAX), au-delà escalade humaine plutôt que
+    # de reboucler indéfiniment sur le planificateur. Les deux remis à
+    # zéro/vide à chaque nouveau message utilisateur top-level (voir
+    # run_input, app/main.py).
+    plan_validation_reasons: list
+    plan_validation_cycles: int
+    # Approbation du plan (Itération 3) : miroir de approved/grant_session
+    # (require_approval) mais pour le PLAN entier plutôt qu'un tool_call —
+    # voir require_plan_approval. plan_grant : persisté (contrairement à
+    # plan_grant_session, transitoire) — un plan-level grant accordé une
+    # fois évite la pause sur une replanification ultérieure DANS LA MÊME
+    # TÂCHE tant que le nouveau tier reste TIER_REVERSIBLE ou moins, jamais
+    # pour TIER_SENSITIVE (même philosophie que NEVER_GRANTABLE_TOOLS,
+    # approval_policy.py).
+    plan_approved: Optional[bool]
+    plan_grant_session: bool
+    plan_grant: bool
 
 
 # Plafond de tokens par TOUR (un seul appel LLM), pas pour la conversation
@@ -837,6 +971,31 @@ llm = ChatOpenAI(
     model="agent-llm",          # doit matcher model_name dans services/tabbyapi/config.yml
     temperature=0.2,
     max_tokens=LLM_MAX_TOKENS,
+)
+
+# Bug découvert en conditions réelles en vérifiant la campagne live de
+# l'Itération 3 (voir HISTORY.md) : les appels LLM auxiliaires (plan_task/
+# revise_plan/verify_action/_judge_plan) utilisaient `llm` ci-dessus, plafonné
+# à LLM_MAX_TOKENS (2048, pensé pour le tour conversationnel principal).
+# Qwen3.6/TabbyAPI raisonne dans un champ reasoning_content SÉPARÉ de
+# content avant de répondre (confirmé par un appel direct à TabbyAPI hors
+# streaming) ; ce raisonnement, souvent long, consommait à lui seul tout le
+# budget, tronquant `content` à vide ou au milieu du JSON
+# (finish_reason="length") — chaque validateur retombait alors
+# systématiquement sur son repli d'erreur, jamais sur une vraie évaluation.
+# `/no_think` en préfixe de prompt (mécanisme ADAPTIVE_THINKING existant)
+# ne supprime PAS le raisonnement sur ce backend (vérifié par le même appel
+# direct) — solution retenue : un budget de tokens plus généreux, dédié à
+# ces appels structurés, séparé du budget de la boucle principale (dont la
+# petite valeur reste un filet de sécurité voulu contre les dérives de
+# répétition, voir LLM_MAX_TOKENS).
+PLANNER_MAX_TOKENS = int(os.environ.get("PLANNER_MAX_TOKENS", "8192"))
+planner_llm = ChatOpenAI(
+    base_url=LLM_BASE_URL,
+    api_key="not-needed",
+    model="agent-llm",
+    temperature=0.2,
+    max_tokens=PLANNER_MAX_TOKENS,
 )
 
 # Schéma des outils MCP (terminal/filesystem/git/browser/desktop-GhostDesk),
@@ -911,6 +1070,28 @@ async def select_skill(state: AgentState) -> dict:
     return {"messages": [{"role": "system", "content": f"Skill activée : {skill['name']}\n{skill['content']}"}]}
 
 
+async def _available_tools_hint() -> str:
+    """
+    Liste réelle des outils MCP disponibles (découvert en conditions
+    réelles pendant la campagne live de l'Itération 3, voir HISTORY.md) :
+    sans elle, le planificateur invente des noms d'outils plausibles mais
+    inexistants (ex. "web_browser", "search") — systématiquement rejetés
+    par les heuristiques (outils référencés existants,
+    app/plan_validation.py), aucun plan ne passerait jamais la validation.
+    Ajoutée au message UTILISATEUR (pas au system prompt, figé lui) pour
+    rester à jour si le schéma d'outils change entre deux tâches. Utilisée
+    par plan_task/revise_plan/replan_task.
+    """
+    schema = await _get_tools_schema()
+    names = sorted({t.get("function", {}).get("name") for t in schema} - {None})
+    if not names:
+        return ""
+    return (
+        "\n\nOutils réellement disponibles (utilise UNIQUEMENT ces noms exacts "
+        'dans "outils", liste vide si aucun ne s\'applique) : ' + ", ".join(names)
+    )
+
+
 async def plan_task(state: AgentState) -> dict:
     """
     Nœud planificateur (Itération 1, Phase 1 « cœur cognitif »). No-op
@@ -938,19 +1119,170 @@ async def plan_task(state: AgentState) -> dict:
         return {"messages": []}
 
     try:
-        response = await llm.ainvoke(
-            [SystemMessage(content=PLANNER_SYSTEM_PROMPT), HumanMessage(content=objective)]
+        tools_hint = await _available_tools_hint()
+        response = await planner_llm.ainvoke(
+            [SystemMessage(content=PLANNER_SYSTEM_PROMPT), HumanMessage(content=objective + tools_hint)]
         )
         subtasks = _validate_plan_json(response.content)
     except Exception:
         logger.warning("Planification échouée, repli sur un plan à sous-tâche unique.", exc_info=True)
-        subtasks = [{"description": objective, "success_criterion": "objectif de la tâche atteint"}]
+        subtasks = [{"description": objective, "success_criterion": "objectif de la tâche atteint", "tools": []}]
 
     plan = [{**st, "status": "a_faire", "attempts": 0, "result": None} for st in subtasks]
     if plan:
         plan[0]["status"] = "en_cours"
     logger.info("Plan initial (%d sous-tâche(s)) : %s", len(plan), plan)
     return {"plan": plan}
+
+
+def _plan_tier(plan: list) -> str:
+    """
+    Tier du plan = pire tier parmi TOUS les outils déclarés par ses
+    sous-tâches (Itération 3) — approval_policy.tool_tier(), qui retombe
+    déjà sur TIER_SENSITIVE pour un outil inconnu (défaut existant "outil
+    inconnu = toujours sensible", cohérent ici). Aucun outil déclaré nulle
+    part -> TIER_READ (rien à approuver en amont).
+    """
+    tiers = {approval_policy.tool_tier(tool) for subtask in plan for tool in subtask.get("tools", [])}
+    if approval_policy.TIER_SENSITIVE in tiers:
+        return approval_policy.TIER_SENSITIVE
+    if approval_policy.TIER_REVERSIBLE in tiers:
+        return approval_policy.TIER_REVERSIBLE
+    return approval_policy.TIER_READ
+
+
+async def validate_plan(state: AgentState) -> dict:
+    """
+    Pipeline de validation du plan (Itération 3, Phase 1 « cœur cognitif »).
+    No-op (`{"messages": []}`) si PLAN_VALIDATION_ENABLED désactivé
+    (défaut) ou si `state["plan"]` est vide — comportement identique à
+    avant cette itération. Sinon : heuristiques programmatiques
+    (app/plan_validation.py, gratuites) puis, UNIQUEMENT si elles passent
+    ET que PLAN_JUDGE_ENABLED, juge LLM (coûteux — clause de retrait, voir
+    HISTORY.md). Rejet (heuristiques OU juge) -> plan_validation_cycles
+    incrémenté, motifs renvoyés pour route_after_validation.
+    """
+    if not PLAN_VALIDATION_ENABLED:
+        return {"messages": []}
+    plan = state.get("plan") or []
+    if not plan:
+        return {"messages": []}
+
+    schema = await _get_tools_schema()
+    known_tools = {t.get("function", {}).get("name") for t in schema}
+    known_tools.discard(None)
+    task_scope = _task_scope_urls(state["messages"])
+    reasons = plan_validation.validate_plan_heuristics(plan, known_tools=known_tools, task_scope_urls=task_scope)
+
+    if not reasons and PLAN_JUDGE_ENABLED:
+        first_human = next((m for m in state["messages"] if getattr(m, "type", None) == "human"), None)
+        objective = first_human.content if first_human and isinstance(first_human.content, str) else ""
+        reasons = await _judge_plan(plan, objective)
+
+    if reasons:
+        cycles = state.get("plan_validation_cycles", 0) + 1
+        logger.warning("Plan rejeté par la validation (cycle %d) : %s", cycles, reasons)
+        # plan_approved réarmé à None ICI (pas dans require_plan_approval,
+        # voir son commentaire) : que ce rejet mène à une révision ou à une
+        # escalade humaine, toute décision précédente sur un plan ANTÉRIEUR
+        # ne doit jamais être réutilisée pour celui-ci.
+        return {"plan_validation_reasons": reasons, "plan_validation_cycles": cycles, "plan_approved": None}
+
+    logger.info("Plan validé (%d sous-tâche(s)).", len(plan))
+    return {"plan_validation_reasons": [], "plan_approved": None}
+
+
+def route_after_validation(state: AgentState) -> str:
+    """
+    Routage après validate_plan. PLAN_VALIDATION_ENABLED désactivé ->
+    "call_llm" (flux identique à avant cette itération). Rejeté ->
+    "revise_plan" tant que PLAN_VALIDATION_CYCLES_MAX n'est pas dépassé,
+    sinon "require_plan_approval" (escalade humaine, motifs affichés).
+    Accepté -> "call_llm" si TIER_READ ou si TIER_REVERSIBLE et un grant de
+    plan est déjà accordé pour cette tâche (plan_grant, jamais pour
+    TIER_SENSITIVE), sinon "require_plan_approval" (approbation normale).
+    """
+    if not PLAN_VALIDATION_ENABLED:
+        return "call_llm"
+    reasons = state.get("plan_validation_reasons") or []
+    if reasons:
+        cycles = state.get("plan_validation_cycles", 0)
+        return "revise_plan" if cycles <= PLAN_VALIDATION_CYCLES_MAX else "require_plan_approval"
+    tier = _plan_tier(state.get("plan") or [])
+    if tier == approval_policy.TIER_READ:
+        return "call_llm"
+    if tier == approval_policy.TIER_REVERSIBLE and state.get("plan_grant"):
+        return "call_llm"
+    return "require_plan_approval"
+
+
+async def revise_plan(state: AgentState) -> dict:
+    """
+    Révision du plan suite à un rejet du pipeline de validation (Itération
+    3). Distinct de replan_task (Itération 2, déclenché par un ÉCHEC
+    D'EXÉCUTION d'une sous-tâche) : ici, rien n'a encore été exécuté — le
+    plan lui-même est jugé structurellement/sémantiquement insuffisant
+    AVANT le premier tour. Régénère le plan ENTIER (aucune sous-tâche
+    "fait" à préserver) avec les motifs de rejet en contexte. Même repli
+    que plan_task sur échec de génération (plan à sous-tâche unique).
+    """
+    reasons = state.get("plan_validation_reasons") or []
+    first_human = next((m for m in state["messages"] if getattr(m, "type", None) == "human"), None)
+    objective = first_human.content if first_human and isinstance(first_human.content, str) else ""
+    motifs = "\n".join(f"- {r}" for r in reasons) or "(motif non précisé)"
+    context = (
+        f"Objectif original : {objective}\n"
+        f"Ta précédente proposition de plan a été rejetée pour les raisons suivantes :\n{motifs}\n"
+        "Propose un NOUVEAU plan qui corrige ces problèmes."
+    )
+    try:
+        tools_hint = await _available_tools_hint()
+        response = await planner_llm.ainvoke(
+            [SystemMessage(content=PLANNER_SYSTEM_PROMPT), HumanMessage(content=context + tools_hint)]
+        )
+        subtasks = _validate_plan_json(response.content)
+    except Exception:
+        logger.warning("Révision du plan échouée, repli sur un plan à sous-tâche unique.", exc_info=True)
+        subtasks = [{"description": objective, "success_criterion": "objectif de la tâche atteint", "tools": []}]
+
+    plan = [{**st, "status": "a_faire", "attempts": 0, "result": None} for st in subtasks]
+    if plan:
+        plan[0]["status"] = "en_cours"
+    logger.info("Plan révisé (%d sous-tâche(s), cycle de validation) : %s", len(plan), plan)
+    return {"plan": plan}
+
+
+async def require_plan_approval(state: AgentState) -> dict:
+    """
+    Approbation humaine du PLAN (Itération 3) : miroir de require_approval
+    mais pour le plan entier plutôt qu'un tool_call — pause (NodeInterrupt)
+    tant que plan_approved est None. Reste NON FUSIONNABLE avec
+    l'approbation individuelle d'un outil TIER_SENSITIVE à l'exécution :
+    ce nœud est un gate ADDITIONNEL en amont, require_approval/
+    _execute_tool_calls restent inchangés et s'appliquent quand même.
+    """
+    if state.get("plan_approved") is None:
+        raise NodeInterrupt("Approbation humaine du plan requise avant exécution.")
+    # NE PAS remettre plan_approved à None ici : route_after_plan_approval
+    # (juste après) doit encore pouvoir lire la décision (True/False) telle
+    # que ce nœud vient de la recevoir — même piège déjà évité par
+    # require_approval, qui laisse "approved" intact pour route_after_approval
+    # et ne le réarme qu'ailleurs (_execute_tool_calls, pour le tour
+    # suivant). Ici, c'est validate_plan qui réarme plan_approved à None à
+    # chaque nouveau plan proposé (voir ce nœud).
+    updates = {"plan_grant_session": False}
+    if state.get("plan_grant_session"):
+        updates["plan_grant"] = True
+    return updates
+
+
+def route_after_plan_approval(state: AgentState) -> str:
+    return "call_llm" if state["plan_approved"] else "reject_plan"
+
+
+async def reject_plan(state: AgentState) -> dict:
+    """Miroir de reject_tools, côté plan : l'humain a refusé le plan proposé, la tâche s'arrête ici."""
+    return {"messages": [{"role": "assistant", "content": "Plan refusé par l'utilisateur — tâche non exécutée."}]}
 
 
 def _is_image_message(message) -> bool:
@@ -1578,7 +1910,7 @@ async def verify_action(state: AgentState) -> dict:
 
     subtask = plan[active_index]
     try:
-        response = await llm.ainvoke(
+        response = await planner_llm.ainvoke(
             [
                 SystemMessage(content=VERIFIER_SYSTEM_PROMPT),
                 HumanMessage(
@@ -1654,7 +1986,10 @@ async def replan_task(state: AgentState) -> dict:
         "Replanifie le RESTE de la tâche à partir de maintenant, en tenant compte de cet échec."
     )
     try:
-        response = await llm.ainvoke([SystemMessage(content=PLANNER_SYSTEM_PROMPT), HumanMessage(content=context)])
+        tools_hint = await _available_tools_hint()
+        response = await planner_llm.ainvoke(
+            [SystemMessage(content=PLANNER_SYSTEM_PROMPT), HumanMessage(content=context + tools_hint)]
+        )
         new_subtasks = _validate_plan_json(response.content)
     except Exception:
         logger.warning("Replanification échouée, nouvelle tentative sur la même sous-tâche.", exc_info=True)
@@ -1893,6 +2228,10 @@ def build_graph(checkpointer=None):
     graph.add_node("retrieve_context", retrieve_context)
     graph.add_node("select_skill", select_skill)
     graph.add_node("plan_task", plan_task)
+    graph.add_node("validate_plan", validate_plan)
+    graph.add_node("revise_plan", revise_plan)
+    graph.add_node("require_plan_approval", require_plan_approval)
+    graph.add_node("reject_plan", reject_plan)
     graph.add_node("call_llm", call_llm)
     graph.add_node("require_approval", require_approval)
     graph.add_node("call_tools", call_tools)
@@ -1916,7 +2255,19 @@ def build_graph(checkpointer=None):
     graph.add_edge("run_slash_command_direct", END)
     graph.add_edge("retrieve_context", "select_skill")
     graph.add_edge("select_skill", "plan_task")
-    graph.add_edge("plan_task", "call_llm")
+    graph.add_edge("plan_task", "validate_plan")
+    graph.add_conditional_edges(
+        "validate_plan",
+        route_after_validation,
+        {"call_llm": "call_llm", "revise_plan": "revise_plan", "require_plan_approval": "require_plan_approval"},
+    )
+    graph.add_edge("revise_plan", "validate_plan")
+    graph.add_conditional_edges(
+        "require_plan_approval",
+        route_after_plan_approval,
+        {"call_llm": "call_llm", "reject_plan": "reject_plan"},
+    )
+    graph.add_edge("reject_plan", END)
     graph.add_conditional_edges(
         "call_llm",
         has_tool_calls,
@@ -1937,7 +2288,7 @@ def build_graph(checkpointer=None):
         route_after_verification,
         {"continue": "call_llm", "replan": "replan_task", "give_up": "report_failure"},
     )
-    graph.add_edge("replan_task", "call_llm")
+    graph.add_edge("replan_task", "validate_plan")
     graph.add_edge("report_failure", END)
     graph.add_edge("reject_tools", "call_llm")
     graph.add_edge("retry_empty_answer", "call_llm")
