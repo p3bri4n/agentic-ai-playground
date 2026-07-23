@@ -120,9 +120,34 @@ CAMPAIGN_LABEL = os.environ.get("WEB_TASKS_CAMPAIGN_LABEL", "Campagne A (budget 
 # Textes exacts émis côté serveur (voir app/main.py) — même convention que
 # test_tool_calling_baseline.py.
 _APPROVAL_PREFIX = "⚠️ Approbation requise pour"
+# Pipeline de validation du plan (Itération 3, Phase 1 « cœur cognitif » —
+# voir docs/briefs/phase-1-coeur-cognitif.md et app/main.py:
+# _format_plan_approval_request) : DEUX pauses supplémentaires possibles,
+# au niveau du PLAN plutôt que d'un tool_call — approbation normale par
+# tier, ou escalade humaine après échec de la validation automatique. Sans
+# les reconnaître, run_task() traiterait ces messages comme une réponse
+# FINALE (ils ne commencent pas par _APPROVAL_PREFIX), invalidant toute
+# campagne dès que PLAN_VALIDATION_ENABLED est actif sans qu'aucune erreur
+# ne le signale sur le coup.
+_PLAN_APPROVAL_PREFIX = "⚠️ Approbation du plan requise"
+_PLAN_ESCALATION_PREFIX = "⚠️ Le plan proposé a été rejeté par la validation automatique"
 _ITERATION_LIMIT_PREFIX = "⚠️ Limite d'itérations d'outils atteinte"
 _EMPTY_NOTICE_PREFIX = "⚠️ Le modèle a terminé son tour sans réponse exploitable"
 _INTERNAL_ERROR_TEXT = "⚠️ Erreur interne pendant la génération, réessayez."
+
+
+def _is_approval_pending(content: str) -> bool:
+    """Point d'entrée unique pour reconnaître une pause d'approbation,
+    qu'elle porte sur un tool_call (require_approval, historique) ou sur le
+    PLAN entier (require_plan_approval, Itération 3 — approbation normale
+    ou escalade, deux préfixes distincts). report_failure/reject_plan
+    (messages FINAUX, pas des pauses) ne matchent aucun des trois — traités
+    comme réponse finale (échouée), sans changement nécessaire."""
+    return (
+        content.startswith(_APPROVAL_PREFIX)
+        or content.startswith(_PLAN_APPROVAL_PREFIX)
+        or content.startswith(_PLAN_ESCALATION_PREFIX)
+    )
 
 
 def _docker_exec_python(container: str, script: str, timeout: int = 300) -> str:
@@ -281,7 +306,7 @@ def run_task(prompt: str) -> TaskResult:
     start = time.monotonic()
     try:
         content = _chat(prompt)
-        while content.startswith(_APPROVAL_PREFIX):
+        while _is_approval_pending(content):
             for name, args in _parse_tool_calls(content):
                 if name == "browser_navigate" and "url" in args:
                     result.observed_navigate_urls.append(args["url"])
