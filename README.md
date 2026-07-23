@@ -265,18 +265,15 @@ contre cette substitution.
 voir `tests_integration/BENCHMARK0.md` pour la suite v1 complète — sa
 DERNIÈRE campagne de référence, la suite v1 approchant de la saturation) :
 
-**Campagne finale** (4 flags actifs, ~104 min) : **28/33** — détail complet
-dans `tests_integration/TASKS-BASELINE-post-coeur-cognitif.md`. À comparer
-avec prudence à la Campagne A pré-cœur-cognitif (30/33, voir HISTORY.md) :
-sur les 5 points manquants, 2 sont un bug de HARNAIS découvert ici (les
-répétitions d'une même tâche partagent leur thread_id — voir BUGS.md, T8
-lit alors 0/3 alors qu'il s'agit réellement d'1 seul échec de dépassement
-de contexte rejoué à l'identique), 1 est un timeout infra du harnais (T7,
-sans rapport avec l'agent), 1 est un dépassement de contexte réel sur une
-grosse page Wikipedia (T8, effet de bord attendu des tâches longues —
-confirme le besoin de la Phase 2, compaction d'historique) et 1 est un
-échec d'extraction (T1). Score agrégé volontairement affiché SANS le
-lisser : voir HISTORY.md pour le détail tâche par tâche.
+**Campagne finale** (4 flags actifs, ~104 min) : **29/33** après correctif
+et repêchage (28/33 brut initialement — voir plus bas) — détail complet
+dans `tests_integration/TASKS-BASELINE-post-coeur-cognitif.md`. Cohérent
+avec la Campagne A pré-cœur-cognitif (30/33, voir HISTORY.md), pas une
+régression. Sur les 4 points manquants : 1 timeout infra du harnais (T7,
+sans rapport avec l'agent), 1 échec d'extraction (T1), 2 échecs
+d'extraction sur T8 (Wikipedia — voir ci-dessous). Score agrégé
+volontairement affiché SANS le lisser : voir HISTORY.md pour le détail
+tâche par tâche.
 
 | Tâche | Score | Note |
 |---|---|---|
@@ -287,10 +284,24 @@ lisser : voir HISTORY.md pour le détail tâche par tâche.
 | T5 — téléchargement + calcul | 3/3 | — |
 | T6 — session authentifiée | 3/3 | — |
 | T7 — impossible par construction | 2/3 | 1 timeout infra (harnais, pas l'agent) |
-| T8 — Wikipedia | 0/3 | dépassement de contexte réel + bug de partage de thread entre répétitions |
+| T8 — Wikipedia | 1/3 (après repêchage) | 2 échecs extraction, 0 dépassement de contexte une fois les répétitions rendues indépendantes |
 | T9 — Google/INSEE | 3/3 | — |
 | T10 — books.toscrape | 3/3 | — |
 | T11 — sonde de péremption | 3/3 | version consultée en direct à chaque fois |
+
+**Bug de harnais trouvé et corrigé sur cette campagne** (`31aacac`, voir
+BUGS.md) : les répétitions d'une même tâche dans `_run_campaign()`
+partageaient leur `thread_id` (`_derive_thread_id` hache un prompt fixe,
+identique entre répétitions) — T8 rep1 a fait déborder le contexte
+(170285 tokens > 32768 côté TabbyAPI, une grosse page Wikipedia réelle +
+plusieurs cycles de plan/vérification/juge), et les répétitions 2/3
+rejouaient alors le MÊME thread déjà bloqué, ré-échouant à l'identique en
+0.4s — lisant à tort T8 0/3 au lieu d'1 seul échec réel. Corrigé (marqueur
+unique par répétition) et vérifié en direct (2 threads distincts, deux
+exécutions pleinement indépendantes) avant de rejouer T8 seule pour le
+score corrigé ci-dessus. Le dépassement de contexte réel sur des tâches
+longues reste un effet de bord à traiter — confirme le besoin de la
+Phase 2 (compaction d'historique), prochaine dans l'ordre de `PLAN.md`.
 
 **Leçons retenues** : (1) un mécanisme qui "voit" un résultat d'outil terse
 (confirmation d'action) sans jamais voir l'état réel qui en résulte juge

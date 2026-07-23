@@ -1,7 +1,28 @@
 # Campagne cœur cognitif (Itération 4 — 4 flags actifs) — suite de tâches web (Phase 0)
 
 Générée automatiquement le 2026-07-23T15:10:11.849770+00:00 (3 répétitions/tâche). Voir BENCHMARK0.md pour la spec complète et les limites connues de chaque assertion, et la docstring de test_web_tasks.py pour la méthode de sous-classification boucle_fabrication/boucle_budget.
-**Score de campagne : 28/33 passages réussis.**
+**Score de campagne (brut, avant correctif du bug de thread partagé — voir ci-dessous) : 28/33 passages réussis.**
+
+## Repêchage T8 après correctif du bug de thread partagé (voir HISTORY.md/BUGS.md)
+
+Les 3 répétitions T8 ci-dessous partageaient en réalité le MÊME thread_id
+(`_derive_thread_id` hachait un prompt fixe, identique entre répétitions) —
+la répétition 1 a fait déborder le contexte (170285 tokens > 32768), et les
+répétitions 2/3 ont rejoué le MÊME message sur ce thread déjà bloqué,
+ré-échouant à l'identique en 0.4s : ce n'étaient pas 3 essais indépendants.
+Après correctif (marqueur unique par répétition, `31aacac`), T8 rejouée
+seule le 2026-07-23 : **1/3** (rep1 ❌ extraction, rep2 ✅ Muret trouvé,
+rep3 ❌ extraction — 0 dépassement de contexte cette fois, chaque thread
+étant réellement indépendant et donc plus court). **Score de campagne
+corrigé : 29/33** (28 − 0 + 1, T8 remplacé 0/3 → 1/3). La cause résiduelle
+de T8 est désormais un échec d'extraction ordinaire (2/3), pas un problème
+d'infrastructure — cohérent avec le reste de la suite.
+
+| repêchage | Résultat | Détail | Approbations | Tool calls | Durée (s) |
+|---|---|---|---|---|---|
+| #1 | ❌ | Muret absent de la réponse | 6 | 21 | 202.9 |
+| #2 | ✅ | Muret trouvé | 10 | 30 | 417.3 |
+| #3 | ❌ | Muret absent de la réponse | 6 | 25 | 318.7 |
 
 | Tâche | Succès | Approbations (moy.) | Tool calls observés (moy.) | Durée (moy., s) | Causes d'échec |
 |---|---|---|---|---|---|

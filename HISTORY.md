@@ -1237,7 +1237,7 @@ brief, elle approchait déjà de la saturation).
 | T5 (téléchargement + calcul) | 3/3 | — |
 | T6 (session authentifiée) | 3/3 | — |
 | T7 (impossible par construction) | 2/3 | 1 échec = timeout infra du harnais (`docker exec`), pas l'agent — les 2 autres confirment le correctif de la sonde 6 |
-| T8 (Wikipedia) | 0/3 | **dépassement de contexte réel** (voir ci-dessous) — pas 3 échecs indépendants |
+| T8 (Wikipedia) | 0/3 brut → **1/3 après repêchage** (voir ci-dessous) | 0/3 initial = artefact du bug de thread partagé, pas 3 échecs indépendants |
 | T9 (Google/INSEE) | 3/3 | — |
 | T10 (books.toscrape) | 3/3 | — |
 | T11 (sonde de péremption) | 3/3 | version Python consultée en direct, jamais depuis les poids |
@@ -1257,17 +1257,27 @@ brief, elle approchait déjà de la saturation).
    d'une répétition à l'autre) — la répétition 1 a laissé le thread bloqué
    à 170285 tokens AVANT toute sauvegarde de checkpoint, les répétitions 2
    et 3 rejouent alors le même message sur ce thread déjà bloqué,
-   ré-échouant identiquement en 0.4s : pas 3 essais indépendants. **Lecture
-   honnête du score** : T8 représente réellement 1 échec de dépassement de
-   contexte, pas 3. Non corrigé dans ce tour (bug de harnais, hors
-   périmètre du cœur cognitif lui-même).
+   ré-échouant identiquement en 0.4s : pas 3 essais indépendants.
 
-**Comparaison avec Campagne A (30/33, avant le cœur cognitif)** : pas une
-régression au sens propre — T8 aurait vraisemblablement échoué aussi sous
-l'ancien graphe pour une raison différente une fois le bug de thread
-partagé corrigé et re-testé, et le reste de la suite (27/30 hors T8) est
-cohérent avec la baseline. Comparaison formelle non tranchée ici (le brief
-n'exige pas de comparer les points zéro entre chantiers).
+**Correctif et repêchage** (`31aacac`, même tour) : marqueur unique par
+répétition ajouté à `_run_campaign()` (même correctif déjà en place
+ailleurs dans le fichier, jamais étendu à la fonction de campagne
+officielle). Vérifié en direct sur 2 threads T2 consécutifs : `thread_id`
+distincts, deux exécutions pleinement indépendantes (ni l'une ni l'autre ne
+reprend l'état de approbations/tool_calls de l'autre). T8 rejouée seule
+(3 répétitions, thread indépendant chacune) : **1/3** — rep1 ❌ extraction,
+rep2 ✅ Muret trouvé, rep3 ❌ extraction, **0 dépassement de contexte cette
+fois** (chaque thread, réellement indépendant, reste plus court). **Score
+de campagne corrigé : 29/33** (28 − 0 + 1). La cause résiduelle de T8 est
+désormais un échec d'extraction ordinaire (2/3), pas un problème
+d'infrastructure — cohérent avec le reste de la suite. Détail dans
+`tests_integration/TASKS-BASELINE-post-coeur-cognitif.md`, section
+"Repêchage T8".
+
+**Comparaison avec Campagne A (30/33, avant le cœur cognitif)** : 29/33
+après correctif — cohérent avec la baseline, pas une régression. Comparaison
+formelle non tranchée ici (le brief n'exige pas de comparer les points zéro
+entre chantiers).
 
 **Suite v2 — 8 tâches validées par l'utilisateur** (multi-sites/tâches
 longues, ambiguïté, 2 pièges à injection préfigurant Phase 3, 2 tâches à
