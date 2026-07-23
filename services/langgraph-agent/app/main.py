@@ -27,7 +27,13 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from app import audit_log
-from app.graph import MAX_TOOL_ITERATIONS, agent_graph, describe_context, has_visible_answer
+from app.graph import (
+    MAX_TOOL_ITERATIONS,
+    _get_tools_schema,
+    agent_graph,
+    describe_context,
+    has_visible_answer,
+)
 
 app = FastAPI(title="LangGraph Agent")
 logger = logging.getLogger(__name__)
@@ -444,6 +450,26 @@ async def pending(request: PendingCheckRequest):
     if not snapshot.next:
         return {"pending": False}
     return {"pending": True, "text": _format_approval_request(snapshot.values["messages"][-1].tool_calls)}
+
+
+@app.get("/tools/schema")
+async def tools_schema():
+    """
+    Lecture seule (même convention que /pending) : noms d'outils tels
+    qu'EFFECTIVEMENT vus par ce process langgraph-agent (_tools_schema_cache,
+    voir app/graph.py), pas ceux servis par mcp-client au moment de l'appel —
+    la distinction a mordu en conditions réelles (Phase 1d-révisée, voir
+    HISTORY.md "bug de cache de schéma d'outils") : _tools_schema_cache est
+    rempli une fois pour la durée du process et jamais invalidé, donc un
+    redémarrage de mcp-client seul (schéma mis à jour côté serveur) peut
+    laisser cet endpoint répondre un schéma périmé tant que langgraph-agent
+    lui-même n'a pas redémarré. Existe pour permettre à un appelant externe
+    (harnais de tests, dashboard) de détecter cet écart plutôt que de le
+    découvrir après coup dans un run raté.
+    """
+    schema = await _get_tools_schema()
+    names = sorted({t.get("function", {}).get("name") for t in schema if t.get("function", {}).get("name")})
+    return {"tools": names}
 
 
 @app.post("/context")

@@ -872,3 +872,43 @@ coup et montrent un résultat cohérent — mais ils ne remplacent pas la
 discipline "une variable à la fois" pour la PROCHAINE itération : la
 tentation de bundler des correctifs adjacents reste réelle, en particulier
 quand un bug d'infra force la main. 🧑 **Checkpoint.**
+
+## Phase 1 « cœur cognitif » — Itération 0 : préambule de campagne
+
+Suite de la Phase 1, cadrée par un nouveau brief committé AVANT le code
+(`docs/briefs/phase-1-coeur-cognitif.md`, règle adoptée après le bug de
+cache de schéma ci-dessus, pour que ce type de leçon devienne une règle
+plutôt qu'un paragraphe isolé). Itération 0 : un garde-fou de campagne,
+pas encore de mécanisme cognitif.
+
+**Ce qui est livré** :
+- `GET /tools/schema` (langgraph-agent, `app/main.py`) : expose les noms
+  d'outils tels qu'EFFECTIVEMENT vus par ce process (`_tools_schema_cache`),
+  distinct de ce que sert mcp-client au même instant — c'est exactement la
+  distinction qui manquait pour détecter le bug de cache ci-dessus avant
+  qu'il ne coûte une campagne entière.
+- `tests_integration/campaign_preflight.py` : `run_preflight()` compare le
+  schéma vu par langgraph-agent à celui servi par mcp-client (désync ⇒
+  refus explicite, motif + commande à taper) puis à `EXPECTED_TOOLS` (union
+  des tiers déjà maintenus dans `app/approval_policy.py` + `browser_navigate`
+  — délibérément pas une énumération exhaustive du surface `browser_*` de
+  l'image `mcp/playwright`, jamais vérifiée contre son code installé ici).
+  Purge du volume downloads + reset de session navigateur inclus dans le
+  même appel, une fois par campagne (en plus des resets déjà existants par
+  répétition). `PreflightError` interrompt la campagne AVANT le premier run.
+- Branché au début de `_run_campaign()`, `test_t7_noise_baseline()` et
+  `test_download_then_filesystem_read_roundtrip()` (les trois points
+  d'entrée qui lancent une campagne/série dans `test_web_tasks.py`).
+
+**Tests** : logique pure (`check_tools_schema`) et orchestration de
+`run_preflight()` avec callables injectées, dans `tests/test_campaign_preflight.py`
+— aucun docker exec réel requis, contrairement à `test_web_tasks.py`
+(opt-in `RUN_LIVE_AGENT_TESTS=1`). 144/144 tests passent (139 existants +
+5 nouveaux, plus 2 pour `GET /tools/schema` isolément) ; suite complète
+rejouée en environnement Python 3.12 dédié (le `.venv` du dépôt cible
+Python 3.14, sur lequel `pydantic-core`/`Pillow` épinglés ne compilent pas —
+contournement local, pas un changement de dépendance projet).
+
+Pas de campagne live exécutée pour cette itération (c'est l'instrument, pas
+une mesure comportementale — cohérent avec le brief). 🧑 **Checkpoint court
+(itération 0) : revue du préambule avant l'itération 1 (plan explicite).**

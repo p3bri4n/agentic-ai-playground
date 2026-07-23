@@ -84,6 +84,8 @@ from pathlib import Path
 
 import pytest
 
+from tests_integration import campaign_preflight
+
 pytestmark = pytest.mark.skipif(
     os.environ.get("RUN_LIVE_AGENT_TESTS") != "1",
     reason="test d'intégration live (agent web réel) : opt-in via RUN_LIVE_AGENT_TESTS=1, "
@@ -615,6 +617,15 @@ def _reset_hr_submissions():
 
 
 def _run_campaign():
+    # Préambule de campagne (Itération 0, docs/briefs/phase-1-coeur-cognitif.md) :
+    # lève PreflightError et interrompt AVANT le premier run si le schéma
+    # d'outils vu par langgraph-agent est périmé/incomplet — voir
+    # campaign_preflight.py pour la leçon qui motive ce garde-fou.
+    campaign_preflight.run_preflight(
+        purge_downloads=_purge_downloads_volume,
+        reset_browser_session=_reset_browser_session,
+    )
+
     tasks = list(TASKS)
     tasks.append(_t11_task())
 
@@ -726,6 +737,10 @@ def test_t7_noise_baseline():
     d'extraction), pour dimensionner ce bruit AVANT d'introduire une
     nouvelle variable — sert de référence de comparaison.
     """
+    campaign_preflight.run_preflight(
+        purge_downloads=_purge_downloads_volume,
+        reset_browser_session=_reset_browser_session,
+    )
     task_id, base_prompt, assert_fn = next(t for t in TASKS if t[0] == "T7_impossible_par_construction")
     rows = []
     for rep in range(1, 6):
@@ -796,8 +811,10 @@ def test_download_then_filesystem_read_roundtrip():
     réelles : un rejeu immédiat après un premier run répondait juste en 7s
     sans un seul appel d'outil).
     """
-    _purge_downloads_volume()
-    _reset_browser_session()
+    campaign_preflight.run_preflight(
+        purge_downloads=_purge_downloads_volume,
+        reset_browser_session=_reset_browser_session,
+    )
     task_id, prompt, assert_fn = next(t for t in TASKS if t[0] == "T5_telechargement_calcul")
     prompt = f"{prompt} (essai {uuid.uuid4().hex[:8]})"
     result = run_task(prompt)

@@ -54,6 +54,17 @@ retenue pour la suite : la vérification post-action systématique
 ci-dessous (point 4) pourrait mieux capter ce pattern qu'un blocage
 d'exécution seul — à trancher au prochain checkpoint plutôt qu'assumé.
 
+**Campagne A finale (isolation + browser_extract)** : 30/33, voir
+HISTORY.md "Phase 1d-révisée — campagne A finale". La couche
+perception/outillage est désormais saine et mesurée.
+
+**Suite de la Phase 1 ("cœur cognitif")** : les points 1 à 7 ci-dessous sont
+détaillés et séquencés itération par itération (une itération = un
+mécanisme = un juge désigné = un checkpoint) dans
+`docs/briefs/phase-1-coeur-cognitif.md`, committé avant tout code de ce
+sous-chantier. Ce plan-ci garde la vue d'ensemble ; le brief fait foi pour
+l'ordre d'exécution et les critères de passage.
+
 Dans `app/graph.py`, sans casser le flux d'approbation existant :
 
 1. **État de plan explicite** dans `AgentState` : liste de sous-tâches
