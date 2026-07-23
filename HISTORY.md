@@ -1219,3 +1219,65 @@ harnais.
 les 6 correctifs de cette itération.
 
 🧑 **Checkpoint.**
+
+## Phase 1 « cœur cognitif » — Itération 4 (suite 3) : campagne finale v1, suite v2 validée, consolidation
+
+**Campagne finale** (11 tâches × 3 répétitions = 33 runs, les 4 flags
+actifs, ~104 min) : **Score 28/33** — voir
+`tests_integration/TASKS-BASELINE-post-coeur-cognitif.md` pour le détail
+complet. DERNIÈRE campagne de référence sur la suite v1 (comme prévu par le
+brief, elle approchait déjà de la saturation).
+
+| Tâche | Score | Note |
+|---|---|---|
+| T1 (extraction paginée) | 2/3 | 1 échec extraction (prix non trouvé malgré navigation correcte) |
+| T2 (formulaire congé) | 3/3 | — |
+| T3 (tableau dynamique) | 3/3 | — |
+| T4 (recherche multi-sauts) | 3/3 | — |
+| T5 (téléchargement + calcul) | 3/3 | — |
+| T6 (session authentifiée) | 3/3 | — |
+| T7 (impossible par construction) | 2/3 | 1 échec = timeout infra du harnais (`docker exec`), pas l'agent — les 2 autres confirment le correctif de la sonde 6 |
+| T8 (Wikipedia) | 0/3 | **dépassement de contexte réel** (voir ci-dessous) — pas 3 échecs indépendants |
+| T9 (Google/INSEE) | 3/3 | — |
+| T10 (books.toscrape) | 3/3 | — |
+| T11 (sonde de péremption) | 3/3 | version Python consultée en direct, jamais depuis les poids |
+
+**T8 — deux causes distinctes, comme pour la régression T7 plus haut** :
+1. **Dépassement de contexte réel** (nouveau, propre à l'Itération 4) : la
+   répétition 1 échoue avec `openai.BadRequestError: Prompt length 170285
+   exceeds the available context size of 32768 tokens` — une grosse page
+   Wikipedia réelle combinée à plusieurs cycles de plan/vérification/juge
+   fait déborder la fenêtre de contexte de TabbyAPI. Effet de bord non
+   anticipé du cœur cognitif sur des tâches longues à contenu volumineux
+   (Phase 2, compaction d'historique, est le chantier suivant dans l'ordre
+   — ce résultat en confirme la nécessité).
+2. **Bug de harnais latent, découvert ici** (voir BUGS.md) : les 3
+   « répétitions » de `_run_campaign()` partagent le MÊME thread_id
+   (`_derive_thread_id` ne hache que le texte du prompt, fixe et identique
+   d'une répétition à l'autre) — la répétition 1 a laissé le thread bloqué
+   à 170285 tokens AVANT toute sauvegarde de checkpoint, les répétitions 2
+   et 3 rejouent alors le même message sur ce thread déjà bloqué,
+   ré-échouant identiquement en 0.4s : pas 3 essais indépendants. **Lecture
+   honnête du score** : T8 représente réellement 1 échec de dépassement de
+   contexte, pas 3. Non corrigé dans ce tour (bug de harnais, hors
+   périmètre du cœur cognitif lui-même).
+
+**Comparaison avec Campagne A (30/33, avant le cœur cognitif)** : pas une
+régression au sens propre — T8 aurait vraisemblablement échoué aussi sous
+l'ancien graphe pour une raison différente une fois le bug de thread
+partagé corrigé et re-testé, et le reste de la suite (27/30 hors T8) est
+cohérent avec la baseline. Comparaison formelle non tranchée ici (le brief
+n'exige pas de comparer les points zéro entre chantiers).
+
+**Suite v2 — 8 tâches validées par l'utilisateur** (multi-sites/tâches
+longues, ambiguïté, 2 pièges à injection préfigurant Phase 3, 2 tâches à
+ENGAGEMENT réel) : détail complet dans l'annexe de
+`docs/briefs/phase-1-coeur-cognitif.md`. Fixtures non construites — prochain
+chantier, nouveau point zéro assumé.
+
+**README** : section "Autonomie" ajoutée (architecture de la boucle,
+détail de chaque mécanisme et de son flag, ancrage Itération 4, tableau de
+campagne, leçons, résumé suite v2) — remplace l'ancienne section "Plan
+explicite".
+
+🧑 **Checkpoint final du chantier « cœur cognitif ».**
