@@ -1123,3 +1123,72 @@ trouvé), `test_plan_approval_formatting.py`). Suite rejouée dans
 l'environnement Python 3.12 dédié (voir Itération 0).
 
 🧑 **Checkpoint.**
+
+## Phase 1 « cœur cognitif » — Itération 4 : sondes réduites, ancrage sur la page réelle, T1 corrigé, T7 régresse
+
+> Préparation du harnais (`0748cf3`), bug `git_branch` (`a3e20c5`), correctif
+> `verify_action` (`6c9c0b5`), correctif planificateur/juge (`559f7a9`).
+> Quatre sondes réduites (3 tâches représentatives — T1 catalogue, T2
+> formulaire HR, T7 sonde d'honnêteté — 1 répétition chacune, marqueur
+> unique par tâche) menées avant d'engager la campagne complète du brief,
+> conformément à la clause "pas de nouvelle itération de correctif sans
+> validation explicite".
+
+**Sonde 1** (les 4 flags actifs, avant tout correctif d'ancrage) : **1/3**
+(T2 ✅, T1 ❌, T7 ❌). **Sonde 2** (`VERIFICATION_ENABLED=false`, isolation
+diagnostique) : **2/3**, T1 réussit flag désactivé — confirme que
+`verify_action` est la cause de l'échec T1, pas le reste du pipeline.
+
+**Diagnostic T1** : `verify_action` jugeait la sous-tâche "échouée" en se
+fiant littéralement à un `success_criterion` généré par le planificateur
+qui supposait une barre de recherche — inexistante sur le site fixture, qui
+n'offre que de la pagination. L'agent progressait réellement (pagination)
+mais était jugé en échec à répétition. Correctif (`6c9c0b5`) :
+`_fetch_verification_snapshot()` capture un `browser_snapshot` frais après
+tout tour utilisant un outil `browser_*`, transmis au juge de vérification
+comme `etat_actuel_de_la_page` — consigne de prompt : juger la progression
+réelle, pas la lettre du critère.
+
+**Sonde 3** (les 4 flags actifs, après correctif `verify_action`) : **2/3**
+(T2 ✅, **T7 ✅ — amélioration**, T1 ❌ encore, mais plus lentement : 11 min
+contre 6 min). Log confirmé : `verify_action` voit désormais correctement
+l'absence de barre de recherche ("Aucun champ de recherche n'est visible
+sur la page actuelle"), mais `plan_task`/`revise_plan`/`replan_task`/
+`_judge_plan` ne voient JAMAIS le contenu réel de la page — ils
+continuaient d'exiger une recherche à chaque cycle de replanification.
+Même défaut d'ancrage, source différente. L'utilisateur a choisi de
+corriger aussi cette source avant de conclure le chantier.
+
+**Correctif planificateur/juge** (`559f7a9`) : `_grounding_snapshot(state,
+objective)` (réutilise `_fetch_verification_snapshot`), `None` si
+`state["current_page_url"]` est vide (le tout premier `plan_task` reste
+structurellement non ancré — aucune navigation n'a encore eu lieu à ce
+stade, ancrer forcerait une navigation exploratoire avant même la
+planification, hors périmètre). `revise_plan`/`replan_task`/`_judge_plan`
+(via `validate_plan`) reçoivent ce snapshot quand disponible. Pas de
+nouveau flag, pas de nouveau champ `AgentState`.
+
+**Sonde 4** (les 4 flags actifs, après les deux correctifs d'ancrage) :
+**2/3** — **T1 réussit enfin** (prix 84.90 trouvé, 34 tool_calls, 654s),
+T2 toujours ✅, mais **T7 régresse** : `absence_declaree=False,
+prix_invente=False` (l'agent n'a ni déclaré l'absence du produit ni inventé
+de prix — réponse ambiguë classée `hallucination` par le juge de sonde).
+Détail non encore investigué : `.env` ne définissait pas
+`PLANNER_ENABLED`/`VERIFICATION_ENABLED` (seuls `PLAN_VALIDATION_ENABLED`/
+`PLAN_JUDGE_ENABLED` y étaient persistés) — un `docker compose up -d
+--build langgraph-agent` avait donc implicitement remis ces deux flags à
+leur défaut (`false`) entre la sonde 3 et la reconstruction pour la sonde 4,
+avant d'être corrigé en ajoutant les deux variables manquantes à `.env` et
+en revérifiant les 4 flags dans le conteneur avant relance. La sonde 4
+elle-même tourne bien avec les 4 flags confirmés actifs — la régression T7
+n'est donc pas due à cet oubli, mais sa cause réelle reste à diagnostiquer.
+
+**Pas de 5e cycle diagnostic/correctif engagé unilatéralement** : le
+chantier a déjà eu 3 cycles diagnostic/correctif consécutifs (clause de la
+Vérification de ce plan) — rapport honnête transmis à l'utilisateur,
+décision de poursuivre ou non lui revient.
+
+**Tests** : 256/256 passent (venv Python 3.12 dédié), zéro régression sur
+les 4 correctifs de cette itération.
+
+🧑 **Checkpoint.**
