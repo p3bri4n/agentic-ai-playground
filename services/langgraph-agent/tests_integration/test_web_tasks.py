@@ -669,8 +669,21 @@ def _run_campaign():
     tasks.append(_t11_task())
 
     rows = []
-    for task_id, prompt, assert_fn in tasks:
+    for task_id, base_prompt, assert_fn in tasks:
         for rep in range(1, N_REPETITIONS + 1):
+            # Marqueur unique par répétition (voir _derive_thread_id,
+            # app/main.py : hachage du texte EXACT du 1er message humain) —
+            # même correctif que test_t7_noise_baseline/
+            # test_download_then_filesystem_read_roundtrip plus bas, jamais
+            # appliqué ici : sans lui, les N_REPETITIONS d'une même tâche
+            # partagent le MÊME thread_id (prompt fixe et identique), donc
+            # le MÊME état de checkpointer — une répétition qui bloque le
+            # thread avant toute sauvegarde de checkpoint (ex. dépassement
+            # de contexte) fait alors rejouer les répétitions suivantes sur
+            # ce même état bloqué, pas des essais indépendants. Trouvé sur
+            # la campagne finale Itération 4 (T8_wikipedia, voir HISTORY.md
+            # et BUGS.md).
+            prompt = f"{base_prompt} (essai {uuid.uuid4().hex[:8]})"
             _purge_downloads_volume()
             _reset_browser_session()
             result = run_task(prompt)
