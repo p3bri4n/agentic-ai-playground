@@ -258,6 +258,7 @@ async def _resolve_run(request: ChatCompletionRequest):
         "current_page_links": [],
         "fabricated_navigation_attempts": 0,
         "plan": [],
+        "replan_count": 0,
     }
     return config, run_input
 

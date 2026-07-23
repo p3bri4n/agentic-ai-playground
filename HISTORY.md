@@ -968,3 +968,66 @@ formatage pur). Suite rejouée dans l'environnement Python 3.12 dédié
 Pas de campagne live lancée pour cette itération : le juge "score ≥28/33"
 nécessite la stack réelle avec `PLANNER_ENABLED=true` explicitement
 activé (comportement par défaut inchangé sinon). 🧑 **Checkpoint.**
+
+## Phase 1 « cœur cognitif » — Itération 2 : vérification post-action + budget d'échec
+
+Suite directe de l'Itération 1. Deux clarifications obtenues avec
+l'utilisateur avant d'écrire du code :
+- **Source du critère** : le brief parle d'un critère "vivant dans le
+  raisonnement structuré du tour", mais aucun raisonnement structuré
+  n'existe dans ce graphe (texte libre `<think>` + tool_calls) — l'extraire
+  fiablement du texte serait fragile et impossible à tester unitairement.
+  La vérification compare donc le résultat au `success_criterion` de la
+  SOUS-TÂCHE ACTIVE du plan (Itération 1) — conséquence assumée :
+  `VERIFICATION_ENABLED` n'a d'effet que si `PLANNER_ENABLED` l'est aussi.
+- **Granularité** : vérification UNE FOIS PAR TOUR (même découpage que
+  `tool_iterations`), pas par tool_call individuel.
+
+**Ce qui est livré** (`app/graph.py`, `app/main.py`) :
+- `verify_action` (nouveau nœud, entre `call_tools`/`auto_call_tools` et
+  `call_llm`) : appelle `llm.ainvoke` avec un prompt vérificateur dédié
+  (`{"atteint": bool, "raison": str}`, validé par
+  `_validate_verification_json`, même pipeline que `_validate_plan_json` —
+  retire `<think>`/fences, bornes de type). Verdict positif → sous-tâche
+  `"fait"`, avance à la suivante. Verdict négatif → `attempts += 1`, reste
+  `"en_cours"` sous `SUBTASK_ATTEMPT_BUDGET` (défaut 3), sinon `"echoue"`.
+  Dégrade toujours sur verdict "non atteint" en cas d'erreur LLM/JSON —
+  jamais bloquant, même esprit que `plan_task`.
+- Garde-fou "stratégie différente" (`_execute_tool_calls`) : une fois un
+  échec constaté sur la sous-tâche active (`attempts > 0`), un tool_call
+  identique (nom+args, égalité stricte) à celui du tour précédent est
+  bloqué avec un feedback explicite, sans appeler mcp-client — même
+  structure que le garde-fou de fabrication d'URL. **A débusqué un vrai bug
+  pendant l'écriture des tests** : `_previous_turn_tool_calls(state["messages"])`
+  appelé tel quel dans `_execute_tool_calls` se comparait à LUI-MÊME
+  (`state["messages"][-1]` est déjà le tour courant dont les tool_calls
+  sont en cours d'exécution) — corrigé en excluant ce dernier message
+  (`state["messages"][:-1]`) avant de chercher le tour précédent.
+- `replan_task` : à réception d'une sous-tâche `"echoue"`, réutilise le
+  planificateur avec un prompt de contexte (objectif, sous-tâches déjà
+  `"fait"`, raison de l'échec). Sous-tâches `"fait"` préservées ; la suite
+  remplacée par la nouvelle décomposition. Repli SANS lever sur échec de
+  replanification (nouvelle tentative sur la même sous-tâche plutôt que de
+  planter). `replan_count` (nouveau champ `AgentState`, reset par tâche
+  comme `tool_iterations`) incrémenté dans tous les cas, plafonné par
+  `REPLAN_BUDGET` (défaut 2).
+- `report_failure` (terminal) : sous-tâche `"echoue"` ET budget de
+  replanification épuisé → rapport HONNÊTE de l'état atteint (statut de
+  chaque sous-tâche), jamais un faux succès, jamais une boucle infinie.
+- `route_after_verification` : routage continue/replan/give_up.
+
+Gated par `VERIFICATION_ENABLED` (défaut `false`, même convention que
+`PLANNER_ENABLED`) : désactivé, `verify_action` est un no-op strict et le
+graphe se comporte exactement comme avant cette itération.
+
+**Tests** : 192/192 passent (164 précédents inchangés + 28 nouveaux —
+`test_verify_action.py`, `test_repeated_strategy_guard.py`,
+`test_replan_and_failure.py`, `test_verification_integration.py`, ce
+dernier couvrant les deux scénarios bout-en-bout via le graphe complet :
+retry-puis-succès, et budget+replan épuisés jusqu'à `report_failure`).
+Suite rejouée dans l'environnement Python 3.12 dédié (voir Itération 0).
+
+Pas de campagne live lancée pour cette itération : les juges "compteur de
+fabrications en baisse", "tool_calls moyens en baisse", "T7 à 3/3", "score
+≥30/33" nécessitent la stack GPU réelle, avec `PLANNER_ENABLED=true` ET
+`VERIFICATION_ENABLED=true` activés ensemble. 🧑 **Checkpoint.**

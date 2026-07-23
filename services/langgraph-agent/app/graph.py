@@ -18,11 +18,18 @@ Flux :
      approuvé/refusé via l'état "approved"
   8. call_tools | auto_call_tools | reject_tools -> exécute l'outil via MCP
      Client (même logique partagée, voir _execute_tool_calls), ou synthétise
-     un refus si l'humain a refusé, puis reboucle sur call_llm. Seul
-     auto_call_tools journalise dans le journal d'audit (Phase 2, voir
-     app/audit_log.py) : call_tools est TOUJOURS atteint après un passage
-     humain par require_approval CE tour-ci, déjà tracé dans la conversation.
-  9. END                  -> réponse finale
+     un refus si l'humain a refusé. Seul auto_call_tools journalise dans le
+     journal d'audit (Phase 2, voir app/audit_log.py) : call_tools est
+     TOUJOURS atteint après un passage humain par require_approval CE
+     tour-ci, déjà tracé dans la conversation.
+  9. verify_action        -> si VERIFICATION_ENABLED (Itération 2, Phase 1
+     « cœur cognitif »), compare le résultat du tour au success_criterion de
+     la sous-tâche active du plan ; no-op sinon (reboucle direct sur
+     call_llm, comme avant cette itération) — voir route_after_verification.
+  10. replan_task | report_failure -> si une sous-tâche est marquée
+     "echoue" : replanifie (budget REPLAN_BUDGET) ou rapporte un échec
+     honnête à l'utilisateur (END) une fois ce budget épuisé.
+  11. END                  -> réponse finale
 
 Supervision humaine : par défaut, tout appel d'outil est soumis à
 approbation (voir require_approval/reject_tools ci-dessous), à l'exception
@@ -176,6 +183,21 @@ def _fabrication_feedback(fabricated_url: str, attempt_number: int, page_links: 
     return (
         "URL non observée sur cette page. Utilise un lien réellement présent dans le snapshot "
         "(l'inventaire complet des liens y figure déjà) — ne devine pas un chemin."
+    )
+
+
+def _repeated_strategy_feedback(tool_name: str) -> str:
+    """
+    Garde-fou "stratégie différente" (Itération 2, voir _execute_tool_calls) :
+    la tentative précédente sur cette sous-tâche a déjà échoué la
+    vérification post-action avec EXACTEMENT le même outil et les mêmes
+    arguments — répéter l'identique ne peut pas donner un résultat
+    différent.
+    """
+    return (
+        f"Nouvelle tentative refusée : `{tool_name}` avec exactement les mêmes arguments qu'à la "
+        "tentative précédente, déjà jugée insuffisante pour cette sous-tâche. Change de stratégie "
+        "(autre outil, autres arguments, autre approche) plutôt que de répéter la même action."
     )
 
 
@@ -428,6 +450,22 @@ IMAGE_RETENTION_PLACEHOLDER = "[screenshot antérieure supprimée]"
 # explicitement pour mesurer le mécanisme en conditions réelles.
 PLANNER_ENABLED = os.environ.get("PLANNER_ENABLED", "false").lower() == "true"
 
+# Vérification post-action + budget d'échec (Itération 2, Phase 1 « cœur
+# cognitif » — voir docs/briefs/phase-1-coeur-cognitif.md). N'A D'EFFET QUE
+# SI PLANNER_ENABLED EST AUSSI ACTIVÉ : la vérification compare le résultat
+# d'un tour d'outils au success_criterion de la sous-tâche ACTIVE du plan
+# (voir verify_action plus bas) — sans plan, rien à vérifier. Défaut
+# désactivé pour la même raison que PLANNER_ENABLED : un appel LLM juge
+# supplémentaire par tour d'outils casserait les tests existants qui
+# mockent une séquence fixe de réponses.
+VERIFICATION_ENABLED = os.environ.get("VERIFICATION_ENABLED", "false").lower() == "true"
+# Tentatives par sous-tâche avant de la marquer "echoue" (voir verify_action).
+SUBTASK_ATTEMPT_BUDGET = int(os.environ.get("SUBTASK_ATTEMPT_BUDGET", "3"))
+# Replanifications tolérées pour une même tâche avant d'abandonner
+# honnêtement (voir replan_task/report_failure) plutôt que de boucler à
+# l'infini ou de prétendre un faux succès.
+REPLAN_BUDGET = int(os.environ.get("REPLAN_BUDGET", "2"))
+
 # Qwen3.6 raisonne par défaut sur chaque tour (balises de pensée étendue) —
 # utile pour une décision initiale, coûteux en latence/tokens pour une
 # boucle perception-action rapide (capture -> clic -> capture...) où chaque
@@ -650,6 +688,40 @@ PLANNER_SYSTEM_PROMPT = (
 )
 
 
+class VerificationValidationError(ValueError):
+    """Levée par _validate_verification_json : verdict du vérificateur inexploitable."""
+
+
+def _validate_verification_json(raw: str) -> dict:
+    """
+    Schéma validé PROGRAMMATIQUEMENT (Itération 2, même pipeline que
+    _validate_plan_json) : retire <think>/fences, exige
+    {"atteint": bool, "raison": str}. `raison` absente/non-str -> chaîne
+    vide plutôt qu'une erreur (accessoire pour la visibilité, pas pour la
+    décision elle-même) ; `atteint` doit être un booléen JSON réel (pas une
+    chaîne "true"/"false") sans quoi le verdict est jugé inexploitable.
+    """
+    text = _strip_code_fence(_THINK_BLOCK_RE.sub("", raw or ""))
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise VerificationValidationError(f"JSON invalide : {exc}") from exc
+    if not isinstance(data, dict) or not isinstance(data.get("atteint"), bool):
+        raise VerificationValidationError("clé 'atteint' (bool) absente ou invalide")
+    raison = data.get("raison")
+    return {"atteint": data["atteint"], "raison": raison.strip() if isinstance(raison, str) else ""}
+
+
+VERIFIER_SYSTEM_PROMPT = (
+    "Tu es le vérificateur d'un agent. On te donne la description d'une "
+    "sous-tâche, son critère de succès, et le résultat obtenu après une "
+    "action. Détermine si le critère est atteint. Réponds UNIQUEMENT par un "
+    'JSON de la forme {"atteint": true|false, "raison": "..."}, rien '
+    "d'autre : pas de texte avant/après, pas de balise <think>, pas de bloc "
+    "de code."
+)
+
+
 class AgentState(TypedDict):
     messages: Annotated[list, add_messages]
     tool_iterations: int
@@ -738,9 +810,16 @@ class AgentState(TypedDict):
     # utilisateur top-level (voir run_input, app/main.py), comme
     # observed_urls. Aucune validation/tier/vérification post-action
     # branchée dessus pour l'instant (Itérations 2/3 à venir) : structure et
-    # visibilité seules. No-op tant que PLANNER_ENABLED est désactivé
-    # (défaut) : reste alors toujours [].
+    # visibilité seules à l'Itération 1 ; vérification post-action/budget
+    # d'échec branchés dessus depuis l'Itération 2 (voir verify_action,
+    # replan_task, report_failure plus bas). No-op tant que PLANNER_ENABLED
+    # est désactivé (défaut) : reste alors toujours [].
     plan: list
+    # Nombre de replanifications déjà effectuées pour CETTE tâche (Itération
+    # 2, voir replan_task/route_after_verification) — budget cumulé, comme
+    # tool_iterations, plafonné par REPLAN_BUDGET. Remis à 0 à chaque
+    # nouveau message utilisateur top-level (voir run_input, app/main.py).
+    replan_count: int
 
 
 # Plafond de tokens par TOUR (un seul appel LLM), pas pour la conversation
@@ -1007,6 +1086,31 @@ def _previous_turn_tool_calls(messages: list) -> Optional[list]:
         if getattr(message, "type", None) == "ai" and getattr(message, "tool_calls", None):
             return message.tool_calls
     return None
+
+
+def _previous_turn_tool_results(messages: list) -> list[str]:
+    """
+    Contenus des ToolMessage produits par le dernier tour de tool_calls
+    (Itération 2, voir verify_action plus bas) : repère la limite via le
+    dernier AIMessage avec tool_calls (même idiome que
+    _previous_turn_tool_calls), puis ne garde QUE les messages "tool" après
+    cette limite — ignore les messages image "user" que _split_image_blocks
+    peut intercaler (_execute_tool_calls) : le vérificateur ne raisonne que
+    sur du texte.
+    """
+    boundary = None
+    for i in range(len(messages) - 1, -1, -1):
+        if getattr(messages[i], "type", None) == "ai" and getattr(messages[i], "tool_calls", None):
+            boundary = i
+            break
+    if boundary is None:
+        return []
+    results = []
+    for message in messages[boundary + 1 :]:
+        if getattr(message, "type", None) == "tool":
+            content = message.content
+            results.append(content if isinstance(content, str) else json.dumps(content, ensure_ascii=False))
+    return results
 
 
 def _apply_adaptive_thinking(messages: list, session_grants) -> list:
@@ -1293,6 +1397,23 @@ async def _execute_tool_calls(state: AgentState, config: dict, *, audit: bool) -
     first_human = next((m for m in state["messages"] if getattr(m, "type", None) == "human"), None)
     objective = first_human.content if first_human and isinstance(first_human.content, str) else ""
 
+    # Garde-fou "stratégie différente" (Itération 2, voir
+    # _repeated_strategy_feedback) : ne s'applique QUE si un échec de
+    # vérification a déjà été constaté sur la sous-tâche active (attempts >
+    # 0) — un tout premier essai n'a rien à répéter. Comparaison par
+    # égalité stricte nom+args (pas de tolérance ε générique sur des
+    # schémas d'arguments arbitraires — simplification assumée).
+    plan = state.get("plan") or []
+    active_index = _active_subtask_index(plan)
+    active_attempts = plan[active_index].get("attempts", 0) if active_index is not None else 0
+    # state["messages"][-1] EST `last`, le tour COURANT dont les tool_calls
+    # sont en train d'être exécutés — exclu de la recherche (messages[:-1])
+    # pour que "previous_tool_calls" désigne vraiment le tour PRÉCÉDENT, pas
+    # celui-ci (sans quoi tout tool_call se comparerait à lui-même).
+    previous_tool_calls = (
+        (_previous_turn_tool_calls(state["messages"][:-1]) or []) if VERIFICATION_ENABLED else []
+    )
+
     async with httpx.AsyncClient(timeout=60) as client:
         for tool_call in last.tool_calls:
             audit_tier = None
@@ -1316,6 +1437,17 @@ async def _execute_tool_calls(state: AgentState, config: dict, *, audit: bool) -
                     tool_call["args"]["url"], attempt_number, page_links_for_feedback
                 )
                 result = {"content": [{"type": "text", "text": feedback}]}
+                images = []
+            elif (
+                VERIFICATION_ENABLED
+                and active_attempts > 0
+                and any(
+                    tc.get("name") == tool_call["name"] and tc.get("args") == tool_call.get("args")
+                    for tc in previous_tool_calls
+                )
+            ):
+                blocked = True
+                result = {"content": [{"type": "text", "text": _repeated_strategy_feedback(tool_call["name"])}]}
                 images = []
             else:
                 result, images = await _call_mcp_tool(client, tool_call["name"], tool_call["args"])
@@ -1406,6 +1538,171 @@ async def reject_tools(state: AgentState) -> dict:
         "tool_iterations": state["tool_iterations"] + 1,
         "approved": None,
     }
+
+
+_PLAN_STATUS_LABELS_GRAPH = {"a_faire": "à faire", "en_cours": "en cours", "fait": "fait", "echoue": "échoué"}
+
+
+def _active_subtask_index(plan: list) -> Optional[int]:
+    """Index de la sous-tâche "en_cours" du plan, ou None (aucune/plan vide) —
+    invariant du plan (Itération 1/2) : au plus une sous-tâche "en_cours" à la fois."""
+    return next((i for i, st in enumerate(plan) if st.get("status") == "en_cours"), None)
+
+
+async def verify_action(state: AgentState) -> dict:
+    """
+    Vérification post-action (Itération 2, Phase 1 « cœur cognitif »).
+    No-op (`{"messages": []}`) si VERIFICATION_ENABLED est désactivé
+    (défaut), s'il n'y a pas de sous-tâche "en_cours" (pas de plan, ou plan
+    terminé/PLANNER_ENABLED désactivé) ou si le tour qui vient de s'exécuter
+    n'a produit aucun résultat d'outil texte.
+
+    Critère vérifié = success_criterion de la sous-tâche ACTIVE du plan
+    (Itération 1), pas un critère reformulé à la volée dans le raisonnement
+    du tour — voir docs/briefs/phase-1-coeur-cognitif.md, clarification
+    obtenue avant cette itération : aucun raisonnement structuré n'existe
+    dans ce graphe pour en extraire un fiablement.
+
+    Comme plan_task, dégrade TOUJOURS (verdict "non atteint") plutôt que de
+    bloquer la tâche pour un souci de vérification annexe.
+    """
+    if not VERIFICATION_ENABLED:
+        return {"messages": []}
+    plan = state.get("plan") or []
+    active_index = _active_subtask_index(plan)
+    if active_index is None:
+        return {"messages": []}
+    tool_results = _previous_turn_tool_results(state["messages"])
+    if not tool_results:
+        return {"messages": []}
+
+    subtask = plan[active_index]
+    try:
+        response = await llm.ainvoke(
+            [
+                SystemMessage(content=VERIFIER_SYSTEM_PROMPT),
+                HumanMessage(
+                    content=json.dumps(
+                        {
+                            "sous_tache": subtask["description"],
+                            "critere_succes": subtask["success_criterion"],
+                            "resultat": "\n".join(tool_results)[:4000],
+                        },
+                        ensure_ascii=False,
+                    )
+                ),
+            ]
+        )
+        verdict = _validate_verification_json(response.content)
+    except Exception:
+        logger.warning("Vérification post-action échouée, tour considéré comme non concluant.", exc_info=True)
+        verdict = {"atteint": False, "raison": "vérification indisponible"}
+
+    new_plan = [dict(st) for st in plan]
+    if verdict["atteint"]:
+        new_plan[active_index]["status"] = "fait"
+        new_plan[active_index]["result"] = verdict["raison"]
+        if active_index + 1 < len(new_plan):
+            new_plan[active_index + 1]["status"] = "en_cours"
+        logger.info("Sous-tâche %d atteinte : %s", active_index, verdict["raison"])
+        return {"plan": new_plan}
+
+    attempts = new_plan[active_index]["attempts"] + 1
+    new_plan[active_index]["attempts"] = attempts
+    if attempts < SUBTASK_ATTEMPT_BUDGET:
+        logger.info(
+            "Sous-tâche %d non atteinte (tentative %d/%d) : %s",
+            active_index, attempts, SUBTASK_ATTEMPT_BUDGET, verdict["raison"],
+        )
+        return {"plan": new_plan}
+
+    new_plan[active_index]["status"] = "echoue"
+    new_plan[active_index]["result"] = verdict["raison"]
+    logger.warning(
+        "Sous-tâche %d échouée après %d tentatives : %s", active_index, attempts, verdict["raison"]
+    )
+    return {"plan": new_plan}
+
+
+async def replan_task(state: AgentState) -> dict:
+    """
+    Replanification (Itération 2) : atteinte quand verify_action a marqué
+    une sous-tâche "echoue". Réutilise PLANNER_SYSTEM_PROMPT/
+    _validate_plan_json (même schéma que plan_task) avec un prompt de
+    contexte (objectif, sous-tâches déjà "fait", raison de l'échec).
+    Sous-tâches "fait" préservées telles quelles ; la sous-tâche échouée et
+    tout ce qui suivait sont remplacées par la nouvelle décomposition.
+    Échec de replanification (LLM/JSON invalide) : repli SANS lever — remet
+    juste la sous-tâche échouée à "en_cours"/attempts=0 (nouvelle chance sur
+    LE MÊME plan plutôt que de planter). replan_count incrémenté dans tous
+    les cas (budget consommé même si la replanification elle-même échoue).
+    """
+    plan = state.get("plan") or []
+    failed_index = next((i for i, st in enumerate(plan) if st.get("status") == "echoue"), None)
+    replan_count = state.get("replan_count", 0) + 1
+    if failed_index is None:
+        return {"replan_count": replan_count}
+
+    first_human = next((m for m in state["messages"] if getattr(m, "type", None) == "human"), None)
+    objective = first_human.content if first_human and isinstance(first_human.content, str) else ""
+    done = "; ".join(st["description"] for st in plan[:failed_index] if st.get("status") == "fait")
+    failure_reason = plan[failed_index].get("result") or "critère non atteint après plusieurs tentatives"
+    context = (
+        f"Objectif original : {objective}\n"
+        f"Déjà accompli : {done or 'rien'}\n"
+        f"Sous-tâche en échec : {plan[failed_index]['description']} — raison : {failure_reason}\n"
+        "Replanifie le RESTE de la tâche à partir de maintenant, en tenant compte de cet échec."
+    )
+    try:
+        response = await llm.ainvoke([SystemMessage(content=PLANNER_SYSTEM_PROMPT), HumanMessage(content=context)])
+        new_subtasks = _validate_plan_json(response.content)
+    except Exception:
+        logger.warning("Replanification échouée, nouvelle tentative sur la même sous-tâche.", exc_info=True)
+        new_plan = [dict(st) for st in plan]
+        new_plan[failed_index]["status"] = "en_cours"
+        new_plan[failed_index]["attempts"] = 0
+        return {"plan": new_plan, "replan_count": replan_count}
+
+    rebuilt = [dict(st) for st in plan[:failed_index]]
+    for i, st in enumerate(new_subtasks):
+        rebuilt.append({**st, "status": "en_cours" if i == 0 else "a_faire", "attempts": 0, "result": None})
+    logger.info(
+        "Replanification #%d après échec de la sous-tâche %d : %d nouvelle(s) sous-tâche(s)",
+        replan_count, failed_index, len(new_subtasks),
+    )
+    return {"plan": rebuilt, "replan_count": replan_count}
+
+
+async def report_failure(state: AgentState) -> dict:
+    """
+    Terminal (Itération 2) : atteint quand une sous-tâche est "echoue" ET le
+    budget de replanification (REPLAN_BUDGET) est épuisé. Rapport HONNÊTE de
+    l'état atteint — jamais un faux succès, jamais une boucle infinie.
+    """
+    plan = state.get("plan") or []
+    lines = ["Je n'ai pas pu terminer la tâche avec le budget de tentatives/replanifications disponible."]
+    lines.append("État atteint :")
+    for st in plan:
+        label = _PLAN_STATUS_LABELS_GRAPH.get(st.get("status"), st.get("status", "?"))
+        detail = f" — {st['result']}" if st.get("result") else ""
+        lines.append(f"- [{label}] {st.get('description', '')}{detail}")
+    return {"messages": [{"role": "assistant", "content": "\n".join(lines)}]}
+
+
+def route_after_verification(state: AgentState) -> str:
+    """
+    Routage après verify_action (Itération 2). VERIFICATION_ENABLED
+    désactivé ou aucune sous-tâche "echoue" -> "continue" (flux normal,
+    identique à avant cette itération). Sous-tâche "echoue" -> "replan" tant
+    que le budget REPLAN_BUDGET n'est pas épuisé, sinon "give_up" (rapport
+    d'échec honnête plutôt qu'une boucle infinie de replanifications).
+    """
+    plan = state.get("plan") or []
+    if any(st.get("status") == "echoue" for st in plan):
+        if state.get("replan_count", 0) < REPLAN_BUDGET:
+            return "replan"
+        return "give_up"
+    return "continue"
 
 
 def _coerce_slash_arg_value(raw: str):
@@ -1600,6 +1897,9 @@ def build_graph(checkpointer=None):
     graph.add_node("require_approval", require_approval)
     graph.add_node("call_tools", call_tools)
     graph.add_node("auto_call_tools", auto_call_tools)
+    graph.add_node("verify_action", verify_action)
+    graph.add_node("replan_task", replan_task)
+    graph.add_node("report_failure", report_failure)
     graph.add_node("reject_tools", reject_tools)
     graph.add_node("retry_empty_answer", retry_empty_answer)
     graph.add_node("prepare_slash_command", prepare_slash_command)
@@ -1630,8 +1930,15 @@ def build_graph(checkpointer=None):
     graph.add_conditional_edges(
         "require_approval", route_after_approval, {"call_tools": "call_tools", "reject_tools": "reject_tools"}
     )
-    graph.add_edge("call_tools", "call_llm")
-    graph.add_edge("auto_call_tools", "call_llm")
+    graph.add_edge("call_tools", "verify_action")
+    graph.add_edge("auto_call_tools", "verify_action")
+    graph.add_conditional_edges(
+        "verify_action",
+        route_after_verification,
+        {"continue": "call_llm", "replan": "replan_task", "give_up": "report_failure"},
+    )
+    graph.add_edge("replan_task", "call_llm")
+    graph.add_edge("report_failure", END)
     graph.add_edge("reject_tools", "call_llm")
     graph.add_edge("retry_empty_answer", "call_llm")
 

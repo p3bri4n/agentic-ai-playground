@@ -57,6 +57,20 @@ services:
       # tête de chaque tâche, mesuré uniquement quand explicitement activé
       # pour une campagne dédiée (voir HISTORY.md, Itération 1).
       - PLANNER_ENABLED=${PLANNER_ENABLED:-false}
+      # Vérification post-action + budget d'échec (Itération 2 — voir
+      # docs/briefs/phase-1-coeur-cognitif.md et README, section "Plan
+      # explicite"). N'A D'EFFET QUE SI PLANNER_ENABLED EST AUSSI true.
+      # Désactivé par défaut : un appel LLM juge supplémentaire par tour
+      # d'outils vérifié, mesuré uniquement pour une campagne dédiée (voir
+      # HISTORY.md, Itération 2).
+      - VERIFICATION_ENABLED=${VERIFICATION_ENABLED:-false}
+      # Tentatives par sous-tâche avant de la marquer "echoue" (voir
+      # verify_action, app/graph.py).
+      - SUBTASK_ATTEMPT_BUDGET=${SUBTASK_ATTEMPT_BUDGET:-3}
+      # Replanifications tolérées pour une même tâche avant un rapport
+      # d'échec honnête plutôt qu'une boucle infinie (voir replan_task/
+      # report_failure, app/graph.py).
+      - REPLAN_BUDGET=${REPLAN_BUDGET:-2}
       # Filet de sécurité (voir README, tableau des bugs) : certains modèles
       # écrivent parfois leur appel d'outil en prose au lieu d'un tool_calls
       # structuré, piégé dans le raisonnement. Nombre de relances
