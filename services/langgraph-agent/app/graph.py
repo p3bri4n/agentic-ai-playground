@@ -754,19 +754,24 @@ def _validate_judge_json(raw: str) -> dict:
 
 PLAN_JUDGE_SYSTEM_PROMPT = (
     "Tu es le juge d'un agent qui accomplit des tâches web. On te donne un "
-    "objectif et un plan (liste de sous-tâches avec critère de succès et "
-    "outils prévus). Évalue s'il est réellement faisable et complet pour "
-    "atteindre l'objectif. Réponds UNIQUEMENT par un JSON de la forme "
-    '{"faisable": true|false, "risques": ["..."], "etapes_manquantes": '
-    '["..."]}, rien d\'autre : pas de texte avant/après, pas de balise '
-    "<think>, pas de bloc de code."
+    "objectif, un plan (liste de sous-tâches avec critère de succès et "
+    "outils prévus), et SI DISPONIBLE l'état ACTUEL de la page déjà visitée "
+    "pour cette tâche (etat_actuel_de_la_page). Évalue s'il est réellement "
+    "faisable et complet pour atteindre l'objectif. Si un état de page est "
+    "fourni, base ton jugement sur ce qui existe RÉELLEMENT dessus (ex. ne "
+    "reproche jamais l'absence d'une barre de recherche ou d'une "
+    "fonctionnalité qui n'apparaît pas dans l'état fourni). Réponds "
+    'UNIQUEMENT par un JSON de la forme {"faisable": true|false, "risques": '
+    '["..."], "etapes_manquantes": ["..."]}, rien d\'autre : pas de texte '
+    "avant/après, pas de balise <think>, pas de bloc de code."
 )
 
 
-async def _judge_plan(plan: list, objective: str) -> list:
+async def _judge_plan(plan: list, objective: str, page_snapshot: Optional[str] = None) -> list:
     """
-    Verdict du juge LLM (Itération 3) : liste des motifs de rejet (vide =
-    faisable). Dégrade en FAIL-OPEN sur erreur LLM/JSON invalide (aucun
+    Verdict du juge LLM (Itération 3, page_snapshot ajouté à l'Itération 4 —
+    correctif d'ancrage, voir HISTORY.md) : liste des motifs de rejet (vide
+    = faisable). Dégrade en FAIL-OPEN sur erreur LLM/JSON invalide (aucun
     motif renvoyé, pas de veto par défaut) — cohérent avec "jamais de
     boucle infinie" du brief : un juge indisponible ne doit jamais bloquer
     indéfiniment une tâche par ailleurs valide selon les heuristiques.
@@ -782,6 +787,7 @@ async def _judge_plan(plan: list, objective: str) -> list:
                 }
                 for st in plan
             ],
+            "etat_actuel_de_la_page": page_snapshot,
         },
         ensure_ascii=False,
     )
@@ -866,6 +872,25 @@ async def _fetch_verification_snapshot(objective: str) -> str:
     except Exception:
         logger.warning("Capture de vérification (browser_snapshot) indisponible, jugement sans elle.", exc_info=True)
         return ""
+
+
+async def _grounding_snapshot(state: dict, objective: str) -> Optional[str]:
+    """
+    Snapshot de la page courante pour ancrer une (re)planification/
+    validation sur ce qui existe RÉELLEMENT (Itération 4, suite du
+    correctif verify_action — voir HISTORY.md). `None` si aucune navigation
+    n'a encore eu lieu pour cette tâche (state["current_page_url"], Phase
+    1) : le TOUT PREMIER plan (plan_task) reste donc structurellement non
+    ancré — aucune page n'existe encore à capturer à ce stade, et forcer
+    une navigation exploratoire avant la planification soulèverait ses
+    propres questions de tier/approbation (browser_navigate est
+    TIER_SENSITIVE), hors périmètre ici. Les REPLANIFICATIONS
+    (revise_plan/replan_task), elles, sont toujours déclenchées APRÈS
+    qu'une navigation a eu lieu — c'est là que ce correctif s'applique.
+    """
+    if not state.get("current_page_url"):
+        return None
+    return await _fetch_verification_snapshot(objective) or None
 
 
 class AgentState(TypedDict):
@@ -1212,7 +1237,8 @@ async def validate_plan(state: AgentState) -> dict:
     if not reasons and PLAN_JUDGE_ENABLED:
         first_human = next((m for m in state["messages"] if getattr(m, "type", None) == "human"), None)
         objective = first_human.content if first_human and isinstance(first_human.content, str) else ""
-        reasons = await _judge_plan(plan, objective)
+        page_snapshot = await _grounding_snapshot(state, objective)
+        reasons = await _judge_plan(plan, objective, page_snapshot)
 
     if reasons:
         cycles = state.get("plan_validation_cycles", 0) + 1
@@ -1265,9 +1291,16 @@ async def revise_plan(state: AgentState) -> dict:
     first_human = next((m for m in state["messages"] if getattr(m, "type", None) == "human"), None)
     objective = first_human.content if first_human and isinstance(first_human.content, str) else ""
     motifs = "\n".join(f"- {r}" for r in reasons) or "(motif non précisé)"
+    page_snapshot = await _grounding_snapshot(state, objective)
+    snapshot_hint = (
+        f"\nÉtat actuel de la page (ce qui est RÉELLEMENT visible maintenant, base-toi dessus) :\n{page_snapshot}\n"
+        if page_snapshot
+        else ""
+    )
     context = (
         f"Objectif original : {objective}\n"
         f"Ta précédente proposition de plan a été rejetée pour les raisons suivantes :\n{motifs}\n"
+        f"{snapshot_hint}"
         "Propose un NOUVEAU plan qui corrige ces problèmes."
     )
     try:
@@ -2031,11 +2064,18 @@ async def replan_task(state: AgentState) -> dict:
     objective = first_human.content if first_human and isinstance(first_human.content, str) else ""
     done = "; ".join(st["description"] for st in plan[:failed_index] if st.get("status") == "fait")
     failure_reason = plan[failed_index].get("result") or "critère non atteint après plusieurs tentatives"
+    page_snapshot = await _grounding_snapshot(state, objective)
+    snapshot_hint = (
+        f"\nÉtat actuel de la page (ce qui est RÉELLEMENT visible maintenant, base-toi dessus) :\n{page_snapshot}\n"
+        if page_snapshot
+        else ""
+    )
     context = (
         f"Objectif original : {objective}\n"
         f"Déjà accompli : {done or 'rien'}\n"
         f"Sous-tâche en échec : {plan[failed_index]['description']} — raison : {failure_reason}\n"
-        "Replanifie le RESTE de la tâche à partir de maintenant, en tenant compte de cet échec."
+        f"{snapshot_hint}"
+        "Replanifie le RESTE de la tâche à partir de maintenant, en tenant compte de cet échec et de ce qui existe réellement."
     )
     try:
         tools_hint = await _available_tools_hint()

@@ -281,3 +281,77 @@ async def test_revise_plan_falls_back_on_llm_error():
     plan = result["plan"]
     assert len(plan) == 1
     assert plan[0]["description"] == "Trouve le prix"
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Correctif d'ancrage planificateur/juge (Itération 4) : _grounding_snapshot
+# et son branchement dans revise_plan (via current_page_url, Phase 1).
+# ─────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_grounding_snapshot_none_without_current_page_url():
+    import app.graph as g
+
+    with respx.mock(assert_all_called=False) as mock:
+        route = mock.post("http://fake-mcp-client/call")
+        result = await g._grounding_snapshot({"current_page_url": None}, "objectif")
+
+    assert result is None
+    assert route.call_count == 0
+
+
+@pytest.mark.asyncio
+async def test_grounding_snapshot_captures_when_current_page_url_set():
+    import app.graph as g
+
+    with respx.mock(assert_all_called=False) as mock:
+        mock.post("http://fake-mcp-client/call").mock(
+            return_value=httpx.Response(200, json={"content": [{"type": "text", "text": "pas de recherche visible"}]})
+        )
+        result = await g._grounding_snapshot({"current_page_url": "http://fixture-catalog/catalog/page-2.html"}, "objectif")
+
+    assert result == "pas de recherche visible"
+
+
+@pytest.mark.asyncio
+async def test_revise_plan_includes_page_snapshot_when_current_page_url_set(monkeypatch):
+    import app.graph as g
+
+    new_plan_json = json.dumps({"sous_taches": [{"description": "A", "critere_succes": "B", "outils": []}]})
+    with respx.mock(assert_all_called=False) as mock:
+        mock.get("http://fake-mcp-client/tools/schema").mock(return_value=httpx.Response(200, json={"tools": []}))
+        mock.post("http://fake-mcp-client/call").mock(
+            return_value=httpx.Response(200, json={"content": [{"type": "text", "text": "pagination uniquement"}]})
+        )
+        llm_route = mock.post("http://fake-vllm/v1/chat/completions").mock(
+            return_value=httpx.Response(200, json=non_streaming_response(new_plan_json))
+        )
+        state = {
+            "messages": [HumanMessage(content="Trouve le prix")],
+            "plan_validation_reasons": ["motif"],
+            "current_page_url": "http://fixture-catalog/catalog/page-2.html",
+        }
+        await g.revise_plan(state)
+
+    sent_content = llm_route.calls.last.request.content.decode()
+    assert "pagination uniquement" in sent_content
+
+
+@pytest.mark.asyncio
+async def test_revise_plan_skips_snapshot_without_current_page_url():
+    import app.graph as g
+
+    new_plan_json = json.dumps({"sous_taches": [{"description": "A", "critere_succes": "B", "outils": []}]})
+    with respx.mock(assert_all_called=False) as mock:
+        snapshot_route = mock.post("http://fake-mcp-client/call")
+        mock.post("http://fake-vllm/v1/chat/completions").mock(
+            return_value=httpx.Response(200, json=non_streaming_response(new_plan_json))
+        )
+        state = {
+            "messages": [HumanMessage(content="Trouve le prix")],
+            "plan_validation_reasons": ["motif"],
+        }
+        await g.revise_plan(state)
+
+    assert snapshot_route.call_count == 0

@@ -133,6 +133,40 @@ async def test_replan_task_noop_without_failed_subtask():
 
 
 # ─────────────────────────────────────────────────────────────────────────
+# Correctif d'ancrage (Itération 4) : replan_task inclut l'état de la page
+# quand current_page_url est renseigné (Phase 1).
+# ─────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_replan_task_includes_page_snapshot_when_current_page_url_set():
+    import app.graph as g
+
+    new_plan_json = json.dumps(
+        {"sous_taches": [{"description": "Nouvelle approche", "critere_succes": "trouvé autrement", "outils": []}]}
+    )
+    plan = [_subtask(description="Échouée", status="echoue", attempts=3, result="rien trouvé")]
+    with respx.mock(assert_all_called=False) as mock:
+        mock.get("http://fake-mcp-client/tools/schema").mock(return_value=httpx.Response(200, json={"tools": []}))
+        mock.post("http://fake-mcp-client/call").mock(
+            return_value=httpx.Response(200, json={"content": [{"type": "text", "text": "pagination uniquement"}]})
+        )
+        llm_route = mock.post("http://fake-vllm/v1/chat/completions").mock(
+            return_value=httpx.Response(200, json=non_streaming_response(new_plan_json))
+        )
+        state = {
+            "messages": [HumanMessage(content="Trouve le produit")],
+            "plan": plan,
+            "replan_count": 0,
+            "current_page_url": "http://fixture-catalog/catalog/page-2.html",
+        }
+        await g.replan_task(state)
+
+    sent_content = llm_route.calls.last.request.content.decode()
+    assert "pagination uniquement" in sent_content
+
+
+# ─────────────────────────────────────────────────────────────────────────
 # report_failure
 # ─────────────────────────────────────────────────────────────────────────
 

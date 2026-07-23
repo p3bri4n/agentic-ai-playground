@@ -90,6 +90,39 @@ async def test_judge_plan_returns_reasons_when_not_feasible():
 
 
 @pytest.mark.asyncio
+async def test_judge_plan_includes_page_snapshot_in_payload_when_provided():
+    """Correctif d'ancrage (Itération 4, voir HISTORY.md) : le juge reçoit
+    l'état réel de la page s'il est fourni, pour ne pas exiger une
+    fonctionnalité absente (ex. barre de recherche inexistante)."""
+    import app.graph as g
+
+    with respx.mock(assert_all_called=False) as mock:
+        route = mock.post("http://fake-vllm/v1/chat/completions").mock(
+            return_value=httpx.Response(200, json=non_streaming_response(json.dumps({"faisable": True})))
+        )
+        await g._judge_plan(_plan(), "Trouve le prix du produit", page_snapshot="aucun champ de recherche visible")
+
+    sent = json.loads(route.calls.last.request.content)
+    verifier_message = json.loads(sent["messages"][-1]["content"])
+    assert verifier_message["etat_actuel_de_la_page"] == "aucun champ de recherche visible"
+
+
+@pytest.mark.asyncio
+async def test_judge_plan_page_snapshot_absent_by_default():
+    import app.graph as g
+
+    with respx.mock(assert_all_called=False) as mock:
+        route = mock.post("http://fake-vllm/v1/chat/completions").mock(
+            return_value=httpx.Response(200, json=non_streaming_response(json.dumps({"faisable": True})))
+        )
+        await g._judge_plan(_plan(), "Trouve le prix du produit")
+
+    sent = json.loads(route.calls.last.request.content)
+    verifier_message = json.loads(sent["messages"][-1]["content"])
+    assert verifier_message["etat_actuel_de_la_page"] is None
+
+
+@pytest.mark.asyncio
 async def test_judge_plan_fails_open_on_llm_error():
     """Juge indisponible : AUCUN motif renvoyé (pas de veto par défaut) —
     ne doit jamais bloquer une tâche par ailleurs valide selon les
