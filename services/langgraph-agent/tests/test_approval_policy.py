@@ -23,6 +23,18 @@ def test_ocr_tools_are_tier_read():
         assert policy.is_auto_approved(name)
 
 
+def test_browser_extract_is_tier_read():
+    """Phase 1d-révisée (voir HISTORY.md "correctif extraction") :
+    browser_extract est une lecture pure malgré son implémentation interne
+    via browser_evaluate (mcp-client, template JS fixe) — le modèle ne
+    fournit qu'un texte à chercher, jamais de code. browser_evaluate/
+    browser_run_code_unsafe restent eux TIER_SENSITIVE (voir
+    NEVER_GRANTABLE_TOOLS)."""
+    assert policy.tool_tier("browser_extract") == policy.TIER_READ
+    assert policy.is_auto_approved("browser_extract")
+    assert policy.tool_tier("browser_evaluate") == policy.TIER_SENSITIVE
+
+
 def test_default_tier_reversible_tools_are_auto_approved():
     for name in ["mouse_click", "mouse_double_click", "key_press", "clipboard_set", "write_file", "git_commit"]:
         assert policy.tool_tier(name) == policy.TIER_REVERSIBLE

@@ -5,6 +5,9 @@ AUDIT_LOG_DIR pointe vers un répertoire temporaire dédié aux tests (voir
 tests/conftest.py, _reset_audit_log_dir), jamais vers /workspace/.audit.
 """
 
+import os
+from pathlib import Path
+
 import httpx
 import pytest
 import respx
@@ -14,6 +17,14 @@ from tests.fixtures.llm_sse import text_response, tool_call_response
 
 def _sse_response(body):
     return httpx.Response(200, content=body, headers={"content-type": "text/event-stream"})
+
+
+def _tool_call_entries(entries):
+    """Filtre les entrées tool_call (voir log_tool_call), en excluant les
+    messages assistant (voir log_message, kind="message") — nécessaire
+    depuis que call_llm journalise CHAQUE tour, tool_call ou non (voir
+    HISTORY.md "OBSERVABILITÉ")."""
+    return [e for e in entries if "tool" in e]
 
 
 CONFIG = {"configurable": {"thread_id": "test-thread-audit"}}
@@ -52,7 +63,7 @@ async def test_tier_reversible_auto_approved_call_is_audited(mock_side_services)
     state = {"messages": [{"role": "user", "content": "Clique là"}], "tool_iterations": 0, "approved": None}
     await g.agent_graph.ainvoke(state, CONFIG)
 
-    entries = audit_log.read_entries()
+    entries = _tool_call_entries(audit_log.read_entries())
     assert len(entries) == 1
     entry = entries[0]
     assert entry["thread_id"] == "test-thread-audit"
@@ -60,6 +71,9 @@ async def test_tier_reversible_auto_approved_call_is_audited(mock_side_services)
     assert entry["arguments"] == {"x": 1, "y": 2}
     assert entry["tier"] == "reversible"
     assert "timestamp" in entry
+    # Phase 1d-révisée : le résultat tel que renvoyé au modèle est archivé
+    # avec l'appel — voir app/audit_log.py, "l'observabilité d'abord".
+    assert entry["result"] == {"content": [{"type": "text", "text": "ok"}]}
 
 
 @pytest.mark.asyncio
@@ -79,7 +93,7 @@ async def test_tier_read_call_is_not_audited(mock_side_services):
     state = {"messages": [{"role": "user", "content": "pwd"}], "tool_iterations": 0, "approved": None}
     await g.agent_graph.ainvoke(state, CONFIG)
 
-    assert audit_log.read_entries() == []
+    assert _tool_call_entries(audit_log.read_entries()) == []
 
 
 @pytest.mark.asyncio
@@ -110,7 +124,7 @@ async def test_granted_sensitive_tool_is_audited_once_auto_approved(mock_side_se
     await g.agent_graph.aupdate_state(CONFIG, {"approved": True, "grant_session": True})
     await g.agent_graph.ainvoke(None, CONFIG)
 
-    entries = audit_log.read_entries()
+    entries = _tool_call_entries(audit_log.read_entries())
     assert len(entries) == 1  # seul le deuxième appel (auto-approuvé via le grant) est audité
     assert entries[0]["tool"] == "key_type"
     assert entries[0]["arguments"] == {"text": "Un second texte tout aussi long pour verifier le comportement"}
@@ -144,6 +158,84 @@ async def test_audit_endpoint_filters_by_thread_id(mock_side_services):
         other = await client.get("/audit", params={"thread_id": "un-autre-thread"})
         everything = await client.get("/audit")
 
-    assert len(matching.json()["entries"]) == 1
+    assert len(_tool_call_entries(matching.json()["entries"])) == 1
     assert other.json()["entries"] == []
-    assert len(everything.json()["entries"]) == 1
+    assert len(_tool_call_entries(everything.json()["entries"])) == 1
+
+
+@pytest.mark.asyncio
+async def test_call_llm_logs_assistant_message_every_turn(mock_side_services):
+    """
+    Observabilité (Phase 1d-révisée, voir HISTORY.md "correctif extraction"
+    -> "OBSERVABILITÉ") : call_llm journalise CHAQUE tour du modèle
+    (raisonnement + texte + tool_calls éventuels), contrairement au journal
+    des tool_calls qui reste volontairement partiel par tier — ici rien
+    n'est filtré, c'est le raisonnement de l'agent, pas un effet de bord.
+    """
+    import app.audit_log as audit_log
+    import app.graph as g
+
+    route = mock_side_services.post("http://fake-vllm/v1/chat/completions")
+    route.side_effect = [
+        _sse_response(tool_call_response("mouse_click", "call_1", '{"x": 1, "y": 2}')),
+        _sse_response(text_response(["Cliqué", "."])),
+    ]
+    mock_side_services.post("http://fake-mcp-client/call").mock(
+        return_value=httpx.Response(200, json={"content": [{"type": "text", "text": "ok"}]})
+    )
+    g.agent_graph = g.build_graph()
+
+    state = {"messages": [{"role": "user", "content": "Clique là"}], "tool_iterations": 0, "approved": None}
+    await g.agent_graph.ainvoke(state, CONFIG)
+
+    entries = audit_log.read_entries()
+    messages = [e for e in entries if e.get("kind") == "message"]
+    assert len(messages) == 2  # un par appel à call_llm dans ce tour (tool_call puis réponse finale)
+    assert all(e["thread_id"] == "test-thread-audit" for e in messages)
+    assert all(e["role"] == "assistant" for e in messages)
+    assert messages[0]["content"]["tool_calls"][0]["name"] == "mouse_click"
+    assert "Cliqué" in messages[1]["content"]["content"]
+    assert not messages[1]["content"]["tool_calls"]
+
+
+def test_log_message_roundtrip():
+    import app.audit_log as audit_log
+
+    audit_log.log_message("t1", "assistant", {"content": "<think>...</think>Réponse", "tool_calls": None})
+    entries = audit_log.read_entries("t1")
+    assert len(entries) == 1
+    assert entries[0]["kind"] == "message"
+    assert entries[0]["role"] == "assistant"
+    assert entries[0]["content"]["content"] == "<think>...</think>Réponse"
+    # Pas de champ "tool" : distinguable d'une entrée tool_call à la lecture
+    # (voir _tool_call_entries, tests ci-dessus).
+    assert "tool" not in entries[0]
+
+
+def test_rotation_archives_full_file_as_gzip_and_read_entries_still_sees_it():
+    """Phase 1d-révisée : la persistance des résultats gonfle le volume par
+    rapport à tool+arguments seuls — voir app/audit_log.py,
+    AUDIT_LOG_MAX_BYTES. Un fichier journalier qui dépasse le seuil est
+    compressé (.N.jsonl.gz) avant la prochaine écriture ; read_entries doit
+    rester capable de le relire de façon transparente."""
+    import app.audit_log as audit_log
+
+    audit_log.AUDIT_LOG_MAX_BYTES = 200  # seuil artificiellement bas pour ce test
+    try:
+        # La rotation se décide AVANT chaque écriture, sur la taille déjà sur
+        # disque (voir _rotate_if_needed) : cette première entrée (>200
+        # octets à elle seule) ne déclenche donc rien tout de suite, mais
+        # fait dépasser le seuil pour la PROCHAINE écriture.
+        audit_log.log_tool_call("t1", "write_file", {"path": "a.txt", "content": "x" * 300}, "reversible")
+        assert not list(Path(audit_log.AUDIT_LOG_DIR).glob("*.jsonl.gz"))
+
+        audit_log.log_tool_call("t1", "write_file", {"path": "b.txt", "content": "y"}, "reversible")
+        archives = list(Path(audit_log.AUDIT_LOG_DIR).glob("*.jsonl.gz"))
+        assert len(archives) == 1
+
+        entries = audit_log.read_entries("t1")
+        assert len(entries) == 2
+        assert entries[0]["arguments"]["path"] == "a.txt"
+        assert entries[1]["arguments"]["path"] == "b.txt"
+    finally:
+        audit_log.AUDIT_LOG_MAX_BYTES = int(os.environ.get("AUDIT_LOG_MAX_BYTES", str(20 * 1024 * 1024)))

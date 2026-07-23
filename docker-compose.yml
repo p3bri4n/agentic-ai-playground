@@ -29,7 +29,7 @@ services:
     container_name: langgraph-agent
     restart: unless-stopped
     environment:
-      - LLM_BASE_URL=${LLM_BASE_URL:-http://llama-server:8000/v1}
+      - LLM_BASE_URL=${LLM_BASE_URL:-http://tabbyapi:5000/v1}
       - SKILL_MANAGER_URL=http://skill-manager:8001
       - CONTEXT_MANAGER_URL=http://context-manager:8002
       - MCP_CLIENT_URL=http://mcp-client:8003
@@ -37,13 +37,13 @@ services:
       # section Supervision humaine) : /workspace/.audit, sur le même bind
       # mount que les autres serveurs MCP filesystem/git/terminal.
       - AUDIT_LOG_DIR=/workspace/.audit
-      # Décodage image natif du fork llama.cpp servi par llama-server (voir
-      # plus bas) : transmet le WebP brut de screen_shot GhostDesk plutôt que
-      # de le reconvertir en PNG côté agent (défaut historique, nécessaire
-      # avec Ollama dont le décodeur mtmd échoue sur le WebP — voir tableau
-      # des bugs). Repasser à "png" (ou vider) si LLM_BASE_URL pointe de
-      # nouveau vers ollama.
-      - IMAGE_FORMAT_PASSTHROUGH=${IMAGE_FORMAT_PASSTHROUGH:-webp}
+      # Conversion PNG par défaut (aucune valeur = passe par _to_png_data_uri) :
+      # le backend par défaut (TabbyAPI/ExLlamaV3) n'est pas connu pour décoder
+      # le WebP nativement (à vérifier empiriquement, voir plan d'implémentation
+      # tabbyapi). "webp" ne s'active que pour le backend alternatif
+      # llama-server, dont le fork llama.cpp décode le WebP nativement — voir
+      # tableau des bugs du README.
+      - IMAGE_FORMAT_PASSTHROUGH=${IMAGE_FORMAT_PASSTHROUGH:-}
       # Qwen3.6 raisonne par défaut sur chaque tour : coûteux pour la boucle
       # perception-action rapide capture/clic de GhostDesk. Injecte /no_think
       # dans le system prompt quand tous les tool_calls du tour précédent
@@ -51,6 +51,42 @@ services:
       # raisonnement normal sinon (première décision d'un tour, tool
       # sensible...). Voir app/graph.py, _adaptive_thinking_directive.
       - ADAPTIVE_THINKING=${ADAPTIVE_THINKING:-true}
+      # Plan explicite (Phase 1 « cœur cognitif », Itération 1 — voir
+      # docs/briefs/phase-1-coeur-cognitif.md et README, section "Plan
+      # explicite"). Désactivé par défaut : un appel LLM supplémentaire en
+      # tête de chaque tâche, mesuré uniquement quand explicitement activé
+      # pour une campagne dédiée (voir HISTORY.md, Itération 1).
+      - PLANNER_ENABLED=${PLANNER_ENABLED:-false}
+      # Vérification post-action + budget d'échec (Itération 2 — voir
+      # docs/briefs/phase-1-coeur-cognitif.md et README, section "Plan
+      # explicite"). N'A D'EFFET QUE SI PLANNER_ENABLED EST AUSSI true.
+      # Désactivé par défaut : un appel LLM juge supplémentaire par tour
+      # d'outils vérifié, mesuré uniquement pour une campagne dédiée (voir
+      # HISTORY.md, Itération 2).
+      - VERIFICATION_ENABLED=${VERIFICATION_ENABLED:-false}
+      # Tentatives par sous-tâche avant de la marquer "echoue" (voir
+      # verify_action, app/graph.py).
+      - SUBTASK_ATTEMPT_BUDGET=${SUBTASK_ATTEMPT_BUDGET:-3}
+      # Replanifications tolérées pour une même tâche avant un rapport
+      # d'échec honnête plutôt qu'une boucle infinie (voir replan_task/
+      # report_failure, app/graph.py).
+      - REPLAN_BUDGET=${REPLAN_BUDGET:-2}
+      # Pipeline de validation du plan (Itération 3 — voir
+      # docs/briefs/phase-1-coeur-cognitif.md et README, section "Plan
+      # explicite"). N'A D'EFFET QUE SI PLANNER_ENABLED EST AUSSI true.
+      - PLAN_VALIDATION_ENABLED=${PLAN_VALIDATION_ENABLED:-false}
+      # Juge LLM du plan (heuristiques déjà passées, coûteux). Clause de
+      # retrait mesurée (voir HISTORY.md, Itération 3) : désactivé par
+      # défaut, même convention que le reste de ce chantier.
+      - PLAN_JUDGE_ENABLED=${PLAN_JUDGE_ENABLED:-false}
+      # Budget de tokens dédié aux appels LLM auxiliaires (plan_task/
+      # verify_action/replan_task/revise_plan/_judge_plan), SÉPARÉ de
+      # LLM_MAX_TOKENS (boucle conversationnelle). Bug réel trouvé en
+      # conditions réelles (voir HISTORY.md, Itération 3) : Qwen3.6/TabbyAPI
+      # raisonne dans reasoning_content avant de répondre, ce raisonnement
+      # consommait à lui seul tout LLM_MAX_TOKENS (2048), tronquant la
+      # réponse JSON systématiquement.
+      - PLANNER_MAX_TOKENS=${PLANNER_MAX_TOKENS:-8192}
       # Filet de sécurité (voir README, tableau des bugs) : certains modèles
       # écrivent parfois leur appel d'outil en prose au lieu d'un tool_calls
       # structuré, piégé dans le raisonnement. Nombre de relances
@@ -59,6 +95,12 @@ services:
       # infructueuse. Budget cumulé pour toute la tâche, comme
       # MAX_TOOL_ITERATIONS.
       - MAX_EMPTY_ANSWER_RETRIES=${MAX_EMPTY_ANSWER_RETRIES:-1}
+      # Plafond de tours d'outils par tâche avant la notice de limite (voir
+      # app/graph.py). Pas de passthrough env avant le harnais
+      # tests_integration/test_web_tasks.py (Campagne B, budget relevé pour
+      # isoler l'effet du plafond des vraies capacités de navigation —
+      # voir BENCHMARK0.md).
+      - MAX_TOOL_ITERATIONS=${MAX_TOOL_ITERATIONS:-20}
       # Forfait de tokens par image dans la décomposition approximative du
       # contexte (POST /context, voir README section Observabilité) — un
       # compte exact dépendrait du tokenizer visuel du modèle servi, hors
@@ -70,7 +112,7 @@ services:
       - skill-manager
       - context-manager
       - mcp-client
-      - llama-server
+      - tabbyapi
     networks:
       - agent-net
     # pas de port publié : uniquement accessible via le réseau interne
@@ -91,9 +133,11 @@ services:
     restart: unless-stopped
     environment:
       # Overridable (contrairement aux autres URLs internes de ce compose,
-      # toujours en dur) : si LLM_BASE_URL bascule sur ollama (voir plus
-      # bas), le dashboard perd sa source /metrics/{slots} (llama-server
-      # spécifique) sauf à pointer explicitement LLAMA_SERVER_URL ailleurs.
+      # toujours en dur) : llama-server n'est plus démarré par défaut depuis
+      # la migration vers TabbyAPI (voir section Inférence plus bas) — cette
+      # source reste en best-effort (section `null` sans erreur, voir
+      # app/main.py) tant que llama-server n'est pas explicitement réactivé.
+      # Pas d'équivalent /metrics/{slots} pour TabbyAPI à ce jour.
       - LLAMA_SERVER_URL=${LLAMA_SERVER_URL:-http://llama-server:8000}
       - LANGGRAPH_AGENT_URL=http://langgraph-agent:8000
       # VRAM par GPU (nvidia-smi) : désactivé par défaut, nécessite le
@@ -147,7 +191,7 @@ services:
     restart: unless-stopped
     environment:
       - QDRANT_URL=http://qdrant:6333
-      - LLM_BASE_URL=${LLM_BASE_URL:-http://llama-server:8000/v1}
+      - LLM_BASE_URL=${LLM_BASE_URL:-http://tabbyapi:5000/v1}
     depends_on:
       qdrant:
         condition: service_healthy
@@ -184,13 +228,16 @@ services:
       # (transport stdio, conforme à l'usage officiel des images mcp/*)
       - MCP_FILESYSTEM_IMAGE=mcp/filesystem:latest
       - MCP_GIT_IMAGE=mcp/git:latest
-      - MCP_BROWSER_IMAGE=mcp/playwright:latest
       - MCP_TERMINAL_IMAGE=mcp-terminal:local   # construite localement, voir plus bas
       - WORKSPACE_HOST_PATH=${WORKSPACE_HOST_PATH}    # chemin HOTE requis par docker run -v
       # GhostDesk (serveur "desktop") : contrairement aux autres, c'est un
       # serveur HTTP persistant (bureau virtuel), pas un conteneur spawné à
       # la demande — mcp-client s'y connecte en Streamable HTTP.
       - MCP_GHOSTDESK_URL=http://ghostdesk:3000/mcp
+      # "browser" (Playwright) : serveur HTTP persistant lui aussi (service
+      # playwright-mcp ci-dessous), pas un spawn éphémère par appel — voir
+      # BUGS.md (perte de continuité d'état entre deux appels d'outils).
+      - MCP_PLAYWRIGHT_URL=http://playwright-mcp:8931/mcp
       - GHOSTDESK_AUTH_TOKEN=${GHOSTDESK_AUTH_TOKEN}
       # Requis par les modèles Qwen pour que leurs clics tombent sur la bonne
       # cible (voir .env.example) ; ${VAR:-1000} plutôt que ${VAR} pour
@@ -207,8 +254,12 @@ services:
                                                        # voir avertissement de sécurité dans le README
       - ./workspace:/workspace
     depends_on:
-      - ghostdesk
-      - ocr-service
+      ghostdesk:
+        condition: service_started
+      ocr-service:
+        condition: service_started
+      playwright-mcp:
+        condition: service_healthy
     networks:
       - agent-net
 
@@ -224,6 +275,66 @@ services:
     container_name: mcp-terminal-build
     profiles: ["build-only"]   # ce service ne se lance jamais, il sert juste à builder l'image
     command: ["true"]
+
+  # --- Playwright MCP : navigateur piloté par l'agent (serveur HTTP) --
+  # ⚠️ Anciennement spawné à la demande par mcp-client (`docker run --rm`
+  # par appel d'outil) : chaque appel repartait sur `about:blank` sans
+  # continuité d'état avec le précédent (voir BUGS.md). L'image officielle
+  # mcp/playwright supporte un mode serveur HTTP natif (`--port`, endpoint
+  # Streamable HTTP `/mcp`) ; on l'utilise ici comme service persistant,
+  # même patron que GhostDesk/OCR ci-dessous.
+  # Un volume nommé Docker est créé root:root par défaut ; l'image
+  # mcp/playwright tourne en "node" (uid 1000), qui ne peut donc PAS écrire
+  # dans /downloads sans ce correctif — constaté en conditions réelles
+  # (browser_navigate échouait systématiquement en EACCES en tentant
+  # d'écrire son propre snapshot de debug page-*.yml sous --output-dir,
+  # voir HISTORY.md "Phase 1d-révisée", vérification post-déploiement T5).
+  # Tourne une fois avant playwright-mcp (condition
+  # service_completed_successfully), jamais en continu.
+  agent-downloads-init:
+    image: busybox
+    container_name: agent-downloads-init
+    command: ["chown", "-R", "1000:1000", "/downloads"]
+    volumes:
+      - agent-downloads:/downloads
+    restart: "no"
+
+  playwright-mcp:
+    image: mcp/playwright:latest
+    container_name: playwright-mcp
+    restart: unless-stopped
+    depends_on:
+      agent-downloads-init:
+        condition: service_completed_successfully
+    command:
+      - --host=0.0.0.0
+      - --port=8931
+      # Host header attendu = nom DNS docker-compose du service : évite le
+      # 403 par défaut (l'image ne sert que "localhost:<port>" sinon), sans
+      # ouvrir à '*' puisque ce service n'est joignable que sur agent-net.
+      - --allowed-hosts=playwright-mcp:8931
+      - --isolated   # profil navigateur en mémoire, jamais persisté sur disque
+      - --headless
+      - --browser=chromium
+      # Chemin EXPLICITE (voir HISTORY.md "Phase 1d-révisée", T5) plutôt que
+      # le défaut implicite (~/.playwright-mcp du conteneur) — l'agent
+      # fabriquait régulièrement de mauvais chemins en devinant ce défaut
+      # (/app/.playwright-mcp, /.playwright-mcp...), jamais le vrai. Partagé
+      # en LECTURE SEULE avec le serveur MCP filesystem ci-dessous (volume
+      # agent-downloads) : on partage l'artefact téléchargé, jamais l'état du
+      # profil navigateur (--isolated reste actif).
+      - --output-dir=/downloads
+    volumes:
+      - agent-downloads:/downloads
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/localhost/8931' || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    networks:
+      - agent-net
+    # pas de port publié : uniquement accessible via le réseau interne (mcp-client)
 
   # --- GhostDesk : bureau virtuel complet piloté par l'agent ------
   # ⚠️ Surface d'attaque bien plus large que mcp-terminal : SYS_ADMIN +
@@ -291,113 +402,105 @@ services:
   # ──────────────────────────────────────────────────────────────
   # Inférence
   # ──────────────────────────────────────────────────────────────
-  # Backend par défaut : llama-server, buildé depuis le fork YV17labs/
-  # llama-cpp-turboquant-webp (branche feature/turboquant-webp — décodage
-  # WebP natif + cache KV "turbo3", voir services/llama-server/Dockerfile).
-  # vLLM a été retiré du projet (utilisait un format de poids HuggingFace
-  # natif incompatible avec les .gguf, et n'apportait rien que llama.cpp ne
-  # couvre pas ici) ; Ollama reste disponible comme backend alternatif
-  # (llama.cpp sous le capot lui aussi) plus bas, hors depends_on par défaut.
-  #
-  # ⚠️ Ni ce Dockerfile ni le modèle cible n'ont pu être réellement buildés
-  # / exécutés dans l'environnement de développement utilisé (pas d'accès
-  # réseau au fork, pas de GPU) — voir l'avertissement détaillé dans
-  # services/llama-server/Dockerfile, à valider avant mise en production.
-  llama-server:
-    build: ./services/llama-server
-    container_name: llama-server
+  # Backend par défaut : TabbyAPI (image officielle ghcr.io/theroyallab/
+  # tabbyapi, backend ExLlamaV3) servant Qwen3.6-27B en quantisation EXL3
+  # (variante VL, vision préservée pour GhostDesk/OCR) avec MTP natif
+  # (draft_mode: mtp dans services/tabbyapi/config.yml, pas de modèle de
+  # draft séparé). Remplace llama-server comme défaut : ce dernier restait
+  # bloqué par un bug de synchronisation inter-GPU confirmé dans son fork
+  # (voir tests_integration/CUDA-DIAGNOSTIC.md), nécessitant
+  # --ubatch-size 128 (~+34% de latence) en mitigation permanente.
+  # Multi-GPU (count: all, les deux cartes) : un mono-GPU a été tenté
+  # d'abord (contournait le tensor-split hétérogène du fork llama.cpp en le
+  # rendant sans objet plutôt que de le réparer) mais ce quant VL 3.50bpw
+  # (14,29 Gio de poids seuls + tour vision) ne rentre pas avec la vision
+  # activée sur un seul GPU 16 Go, même sur la Blackwell (marge ~822 Mio
+  # sans vision). ExLlamaV3 étant un code base différent du fork llama.cpp
+  # diagnostiqué, le bug de synchronisation inter-GPU documenté n'a pas de
+  # raison de s'y appliquer. llama-server reste disponible comme backend
+  # alternatif plus bas (même statut qu'Ollama).
+  tabbyapi:
+    # Build local minimal (voir services/tabbyapi/Dockerfile) au-dessus de
+    # l'image officielle épinglée par digest (":latest" est une rolling
+    # release qui ne fige rien dans le temps ; digest résolu et versions
+    # réelles constatées dans le conteneur consignées dans RESULTS.md) —
+    # ajoute python3-dev, absent de l'image officielle et requis par la
+    # compilation JIT Triton au chargement du modèle.
+    build: ./services/tabbyapi
+    container_name: tabbyapi
     restart: unless-stopped
-    environment:
-      # Modèle cible : Qwen3.6-35B-A3B, quantisation Q5_K_M. Fichiers
-      # attendus tels quels dans ./models (jamais téléchargés par ce
-      # service, voir entrypoint.sh) — adapter ces deux noms de fichier si
-      # les .gguf réellement présents diffèrent.
-      - LLAMA_MODEL_FILE=${LLAMA_MODEL_FILE:-Qwen3.6-35B-A3B-Q5_K_M.gguf}
-      - LLAMA_MMPROJ_FILE=${LLAMA_MMPROJ_FILE:-mmproj-F16.gguf}
     volumes:
+      - ./services/tabbyapi/config.yml:/app/config.yml:ro
       - ${MODELS_HOST_PATH:-./models}:/models
     deploy:
       resources:
         reservations:
           devices:
             - driver: nvidia
+              # Choix revu en cours de PoC : mono-GPU (Ada, puis Blackwell)
+              # insuffisant pour ce quant avec vision activée (14,29 Gio de
+              # poids seuls + tour vision + buffers — restait ~822 Mio de
+              # marge SANS vision même sur la Blackwell à cache_size=8192,
+              # largement insuffisant pour la tour vision). Passage en
+              # multi-GPU (les deux cartes, count: all) pour ce backend —
+              # ExLlamaV3, pas le fork llama.cpp diagnostiqué précédemment,
+              # le bug de synchronisation inter-GPU documenté dans
+              # tests_integration/CUDA-DIAGNOSTIC.md n'a pas de raison de
+              # s'appliquer ici (code base différent). gpu_split_auto
+              # (défaut TabbyAPI, voir config.yml) répartit automatiquement
+              # entre les deux GPU visibles.
               count: all
               capabilities: [gpu]
     networks:
       - agent-net
     # décommenter pour exposer l'API OpenAI-compatible directement sur l'hôte
     # ports:
-    #   - "8000:8000"
+    #   - "5000:5000"
 
-  # --- Backend alternatif : Ollama (GGUF, quants I-quants/K-quants inclus) --
-  # Non utilisé par défaut (voir LLM_BASE_URL, qui pointe sur llama-server par
-  # défaut) : pour l'activer, définir dans .env
-  #   LLM_BASE_URL=http://ollama:11434/v1
-  # puis démarrer ce service explicitement (il n'est pas dans les depends_on
-  # de langgraph-agent/context-manager, qui restent câblés sur llama-server) :
-  #   docker compose up -d ollama
-  # Après le pull, aliaser le modèle en "agent-llm" pour matcher le nom en
-  # dur dans le code (services/langgraph-agent/app/graph.py), avec les
-  # paramètres de sampling validés (voir ci-dessous) :
-  #   docker exec -it ollama ollama pull qwen3.6:35b
-  #   scripts/rebuild-agent-llm.sh qwen3.6:35b
-  #
-  # ⚠️ Avec un modèle fortement quantisé (ex. IQ2_M), des pénalités
-  # anti-répétition trop agressives (repeat_penalty/repeat_last_n/
-  # presence_penalty élevés) sont contre-productives : elles interdisent au
-  # modèle de réutiliser des mots sur une longue fenêtre, ce qui le force à
-  # piocher un vocabulaire toujours plus rare et le fait dériver vers de
-  # l'incohérence — sans jamais produire de tool_calls, jusqu'à saturer tout
-  # le contexte (voir README, tableau des bugs, où cette cause a été
-  # confirmée par comparaison d'horodatages puis rejeu de la tâche cassée).
-  # Ce réglage vit dans le store Ollama du conteneur (volume ollama-data),
-  # pas dans ce repo, et un `ollama pull`/`cp` refait à la main l'écrase :
-  # scripts/rebuild-agent-llm.sh fige la recette (repeat_penalty 1.05,
-  # repeat_last_n 256, presence_penalty 0) pour la réappliquer à l'identique
-  # quel que soit le modèle source, y compris après un changement de modèle
-  # puis un retour au modèle actuel.
-  #
-  # ⚠️ Testé aussi avec qwen3.6:35b-a3b (non quantisé, 21,45 Go) sur une GPU
-  # 16 Go : tient pour du texte pur, mais OOM (~248 Mio manquants) dès qu'une
-  # image (screen_shot GhostDesk) entre dans le contexte — le buffer de
-  # l'encodeur vision (mtmd) n'est alloué qu'à ce moment-là, après que poids
-  # + KV cache + compute buffer texte ont déjà quasi saturé la VRAM. Ni
-  # réduire `num_gpu` manuellement (contre-productif : casse le partage
-  # GPU/CPU automatique d'Ollama, qui gère déjà ~13 Go réels en VRAM sur les
-  # 21,45 Go du modèle), ni réduire `OLLAMA_CONTEXT_LENGTH` à 8192, ni
-  # flash-attention + cache K/V q8_0 n'ont suffi à combler ce déficit. À
-  # retester quand plus de VRAM sera disponible plutôt que de continuer à
-  # ajuster ces réglages sur 16 Go.
-  ollama:
-    image: ollama/ollama:latest
-    container_name: ollama
-    restart: unless-stopped
-    environment:
-      # Par défaut, Ollama choisit une taille de contexte selon la VRAM
-      # disponible (4096 tokens observé ici) — trop court dès qu'une image
-      # (tokens visuels) s'ajoute à l'historique : "request (4713 tokens)
-      # exceeds the available context size (4096 tokens)" en conditions
-      # réelles avec GhostDesk/screen_shot. Relevé explicitement.
-      - OLLAMA_CONTEXT_LENGTH=16384
-    volumes:
-      - ollama-data:/root/.ollama
-      # Réutilise un dossier de modèles Ollama existant sur l'hôte (blobs/ +
-      # manifests/ à la racine, structure attendue par Ollama sous .../models)
-      # au lieu de re-télécharger. Optionnel : si absent, Ollama stocke ses
-      # modèles dans le volume nommé ollama-models (déclaré plus bas).
-      - ${OLLAMA_MODELS_HOST_PATH:-ollama-models}:/root/.ollama/models
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
+  # ──────────────────────────────────────────────────────────────
+  # Fixtures Benchmark 0 (plan d'autonomie, voir PLAN.md et
+  # tests_integration/BENCHMARK0.md) : sites/app auto-hébergés à vérité
+  # terrain connue par construction, ciblés par le harnais
+  # test_web_tasks.py (T1-T7). Profil dédié : ne tournent jamais par défaut
+  # avec le reste de la stack, seulement quand on lance ce harnais.
+  #   docker compose --profile test-fixtures up -d fixture-catalog fixture-docs fixture-hr-app
+  # ──────────────────────────────────────────────────────────────
+  fixture-catalog:
+    build: ./services/langgraph-agent/tests_integration/fixtures/catalog
+    container_name: fixture-catalog
+    profiles: ["test-fixtures"]
     networks:
       - agent-net
-    # décommenter pour piloter Ollama (pull, etc.) depuis l'hôte sans docker exec
-    # ports:
-    #   - "11434:11434"
+    # pas de port publié : seul le conteneur playwright-mcp (agent-net) y accède
+
+  fixture-docs:
+    build: ./services/langgraph-agent/tests_integration/fixtures/docs
+    container_name: fixture-docs
+    profiles: ["test-fixtures"]
+    networks:
+      - agent-net
+
+  fixture-hr-app:
+    build: ./services/langgraph-agent/tests_integration/fixtures/hr-app
+    container_name: fixture-hr-app
+    profiles: ["test-fixtures"]
+    environment:
+      # court délibérément (voir T6, BENCHMARK0.md) : teste que l'agent reste
+      # efficace dans sa trajectoire plutôt que d'errer avant de répondre.
+      - HR_APP_SESSION_TIMEOUT_SECONDS=${HR_APP_SESSION_TIMEOUT_SECONDS:-90}
+    volumes:
+      # soumissions du formulaire de congé (T2) : écrites ici par l'app,
+      # lues par les assertions du harnais depuis l'hôte, jamais par l'app
+      # elle-même après écriture.
+      - ./workspace/hr-app-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://localhost:5000/health', timeout=3)\" || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    networks:
+      - agent-net
 
 networks:
   agent-net:
@@ -407,5 +510,24 @@ volumes:
   open-webui-data:
   qdrant-data:
   ghostdesk-home:
-  ollama-data:
-  ollama-models:
+  # Volume PARTAGÉ entre playwright-mcp (écriture) et le serveur MCP
+  # filesystem spawné par mcp-client (lecture seule) — voir playwright-mcp
+  # (--output-dir) et services/mcp-client/app/main.py (SERVERS["filesystem"])
+  # ci-dessous, HISTORY.md "Phase 1d-révisée" (T5). On partage les
+  # ARTEFACTS de téléchargement, jamais l'état du navigateur : playwright-mcp
+  # reste --isolated (profil en mémoire, jamais persisté).
+  #
+  # `name:` FIXE (pas de préfixe de projet compose) : mcp-client spawne le
+  # serveur filesystem via `docker run` BRUT sur le socket hôte (voir
+  # services/mcp-client/app/main.py), un appel totalement extérieur à ce
+  # fichier compose — le préfixage automatique "<projet>_agent-downloads"
+  # ne s'applique QUE quand Docker Compose résout lui-même le nom depuis ce
+  # fichier (ex. le volume de playwright-mcp ci-dessus). Sans ce `name:`
+  # explicite, les deux services pointaient vers deux volumes DIFFÉRENTS
+  # (celui, vide, que `docker run` créait implicitement sous le nom littéral
+  # "agent-downloads") — bug constaté en conditions réelles : le fichier
+  # téléchargé existait bien côté playwright-mcp mais `read_file` échouait
+  # en ENOENT côté filesystem-MCP (voir HISTORY.md, vérification
+  # post-déploiement T5).
+  agent-downloads:
+    name: agent-downloads

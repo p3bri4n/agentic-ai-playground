@@ -53,6 +53,13 @@ _DEFAULT_TIER_READ = {
     "mouse_move",
     "find_text",  # OCR d'appoint (ocr-service) : lecture pure, aucun effet de bord
     "read_screen",
+    # Localisation/extraction ciblée dans la page (Phase 1d-révisée, voir
+    # HISTORY.md "correctif extraction") : lecture pure malgré son
+    # implémentation interne via browser_evaluate (mcp-client) — le modèle ne
+    # fournit qu'un texte à chercher, jamais de code (voir
+    # services/mcp-client/app/main.py, _build_extract_function : template JS
+    # FIXE, requête interpolée via json.dumps).
+    "browser_extract",
     "clipboard_get",  # lecture au sens outil, mais reste TIER_SENSITIVE : voir override ci-dessous
     "run_command",
     "read_file",
@@ -62,13 +69,20 @@ _DEFAULT_TIER_READ = {
     "search_files",
     "get_file_info",
     "list_allowed_directories",
+    # "git_branch" a été retiré d'ici (trouvé et corrigé pendant la sonde
+    # live de l'Itération 4, Phase 1 « cœur cognitif ») : ce nom n'a jamais
+    # correspondu à un outil réel du serveur MCP git officiel (12 outils
+    # vérifiés via GET /tools/schema, mcp-client ET langgraph-agent
+    # d'accord) — seul "git_create_branch" (déjà dans _DEFAULT_TIER_REVERSIBLE
+    # ci-dessous) existe pour la gestion des branches. Resté inoffensif en
+    # usage réel (un outil jamais proposé au modèle n'est jamais appelé),
+    # mais faussait tests_integration/campaign_preflight.py:EXPECTED_TOOLS.
     "git_status",
     "git_diff_unstaged",
     "git_diff_staged",
     "git_diff",
     "git_log",
     "git_show",
-    "git_branch",
 }
 
 # Effet de bord réversible et confiné : souris/clavier GhostDesk (hors saisie
@@ -101,6 +115,17 @@ _DEFAULT_TIER_REVERSIBLE = {
 # TIER_READ reste lisible comme "tout ce qui ressemble à de la lecture" et
 # que cette exception saute aux yeux à la relecture.
 _DEFAULT_TIER_READ.discard("clipboard_get")
+
+# Jamais accordable pour la session (Phase 1d-révisée, voir HISTORY.md, T5) :
+# exécution de code arbitraire dans la page (JS non contraint) — une
+# élévation, pas une primitive de lecture, quel que soit le nombre de fois
+# où un humain l'a déjà approuvée dans ce thread. Ces deux outils restent
+# TIER_SENSITIVE par défaut (absents de toute liste ci-dessus) ; ce
+# qu'ajoute NEVER_GRANTABLE_TOOLS est l'interdiction de l'assouplissement
+# normalement permis par un grant de session (voir effective_tier) —
+# "approuver pour la session" reste sans effet sur ces deux-là : chaque
+# appel requiert une approbation explicite, individuelle.
+NEVER_GRANTABLE_TOOLS = {"browser_run_code_unsafe", "browser_evaluate"}
 
 
 def _load_tier_override(env_var: str, default: set) -> set:
@@ -153,7 +178,12 @@ def effective_tier(tool_name: str, args=None, session_grants=None) -> str:
     """
     rule_tier = _match_rules(tool_name, args or {})
     resolved = rule_tier if rule_tier is not None else tool_tier(tool_name)
-    if resolved == TIER_SENSITIVE and session_grants and tool_name in session_grants:
+    if (
+        resolved == TIER_SENSITIVE
+        and session_grants
+        and tool_name in session_grants
+        and tool_name not in NEVER_GRANTABLE_TOOLS
+    ):
         return TIER_REVERSIBLE
     return resolved
 

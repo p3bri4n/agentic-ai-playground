@@ -64,6 +64,161 @@ async def test_non_streaming_endpoint_returns_full_answer(mock_side_services):
 
 
 @pytest.mark.asyncio
+async def test_streaming_endpoint_returns_slash_command_result_not_empty_answer_notice(mock_side_services):
+    """
+    Non-régression (bug réel observé via Open WebUI, qui streame toujours) :
+    une commande slash (app/graph.py, run_slash_command_direct) n'invoque
+    jamais le LLM, donc aucun événement on_chat_model_stream n'est jamais
+    émis pendant la boucle de _stream_response — sans le correctif, le
+    message final PERSISTÉ (qui contient bien la vraie réponse) était
+    ignoré, remplacé à tort par la notice "réponse non exploitable" (le code
+    ne vérifiait que ce qui avait été streamé, jamais l'état persisté). Le
+    mode non-streaming (test_non_streaming_endpoint_returns_full_answer,
+    _current_answer) ne souffrait pas de ce bug, qui n'affecte QUE le
+    streaming — d'où sa découverte tardive, Open WebUI streamant toujours.
+    """
+    import app.graph as g
+    import app.main as main_mod
+
+    mock_side_services.get("http://fake-mcp-client/tools/schema").mock(
+        return_value=httpx.Response(
+            200,
+            json={"tools": [{"type": "function", "function": {"name": "app_list", "parameters": {}}}]},
+        )
+    )
+    mock_side_services.post("http://fake-mcp-client/call").mock(
+        return_value=httpx.Response(200, json={"content": [{"type": "text", "text": "Firefox\nFoot"}]})
+    )
+    g.agent_graph = g.build_graph()
+    main_mod.agent_graph = g.agent_graph
+
+    transport = httpx.ASGITransport(app=main_mod.app)
+    lines = []
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        async with client.stream(
+            "POST",
+            "/v1/chat/completions",
+            json={"model": "agent-llm", "messages": [{"role": "user", "content": "/app_list"}], "stream": True},
+        ) as resp:
+            assert resp.status_code == 200
+            async for line in resp.aiter_lines():
+                if line:
+                    lines.append(line)
+
+    payloads = [json.loads(line[len("data: "):]) for line in lines if line.startswith("data: {")]
+    contents = [p["choices"][0]["delta"].get("content", "") for p in payloads]
+    full_text = "".join(contents)
+    assert full_text == "Firefox\nFoot"
+    assert "réponse non exploitable" not in full_text
+
+
+@pytest.mark.asyncio
+async def test_streaming_endpoint_splits_large_content_into_multiple_sse_lines(mock_side_services):
+    """
+    Non-régression (erreur réelle observée via Open WebUI : "Got more than
+    131072 bytes when reading" — limite de taille de ligne d'aiohttp côté
+    client) : un contenu volumineux (ex. une image en data URI base64 pour
+    une commande slash sur screen_shot, voir app/graph.py,
+    run_slash_command_direct) envoyé en UNE seule ligne SSE dépasse cette
+    limite. app/main.py, _sse_content_chunks doit le découper en plusieurs
+    petites lignes SSE, comme le ferait un vrai streaming token-par-token.
+    """
+    import app.graph as g
+    import app.main as main_mod
+
+    big_content = "x" * 300_000  # > 131072 octets, > plusieurs fois _SSE_CONTENT_CHUNK_SIZE
+
+    mock_side_services.get("http://fake-mcp-client/tools/schema").mock(
+        return_value=httpx.Response(
+            200,
+            json={"tools": [{"type": "function", "function": {"name": "app_list", "parameters": {}}}]},
+        )
+    )
+    mock_side_services.post("http://fake-mcp-client/call").mock(
+        return_value=httpx.Response(200, json={"content": [{"type": "text", "text": big_content}]})
+    )
+    g.agent_graph = g.build_graph()
+    main_mod.agent_graph = g.agent_graph
+
+    transport = httpx.ASGITransport(app=main_mod.app)
+    lines = []
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        async with client.stream(
+            "POST",
+            "/v1/chat/completions",
+            json={"model": "agent-llm", "messages": [{"role": "user", "content": "/app_list"}], "stream": True},
+        ) as resp:
+            assert resp.status_code == 200
+            async for line in resp.aiter_lines():
+                if line:
+                    lines.append(line)
+
+    data_lines = [line for line in lines if line.startswith("data: {")]
+    assert all(len(line.encode("utf-8")) < 131072 for line in data_lines)
+    assert len(data_lines) > 1  # bien découpé en plusieurs morceaux, pas un seul bloc géant
+
+    payloads = [json.loads(line[len("data: "):]) for line in data_lines]
+    full_text = "".join(p["choices"][0]["delta"].get("content", "") for p in payloads)
+    assert full_text == big_content
+
+
+@pytest.mark.asyncio
+async def test_non_streaming_endpoint_renders_slash_command_image_without_persisting_it(mock_side_services):
+    """
+    Non-régression bout en bout (bug réel via Open WebUI) : /screen_shot doit
+    afficher l'image dans LA réponse HTTP de ce tour (_render_visible_answer,
+    app/main.py), sans que le message assistant PERSISTÉ ne contienne le
+    base64 — sans quoi un second tour normal sur ce même thread fait exploser
+    le contexte du LLM en le retokenisant comme texte brut (voir
+    app/graph.py, run_slash_command_direct, et
+    tests/test_slash_commands.py::
+    test_slash_command_image_only_result_persists_light_text_only pour la
+    partie graphe de cette même non-régression).
+    """
+    import base64
+    import io
+
+    from PIL import Image
+
+    import app.graph as g
+    import app.main as main_mod
+
+    png_buf = io.BytesIO()
+    Image.new("RGB", (2, 2), color="green").save(png_buf, format="PNG")
+    png_b64 = base64.b64encode(png_buf.getvalue()).decode()
+
+    mock_side_services.get("http://fake-mcp-client/tools/schema").mock(
+        return_value=httpx.Response(
+            200,
+            json={"tools": [{"type": "function", "function": {"name": "screen_shot", "parameters": {}}}]},
+        )
+    )
+    mock_side_services.post("http://fake-mcp-client/call").mock(
+        return_value=httpx.Response(
+            200, json={"content": [{"type": "image", "data": png_b64, "mimeType": "image/png"}]}
+        )
+    )
+    g.agent_graph = g.build_graph()
+    main_mod.agent_graph = g.agent_graph
+
+    transport = httpx.ASGITransport(app=main_mod.app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.post(
+            "/v1/chat/completions",
+            json={"model": "agent-llm", "messages": [{"role": "user", "content": "/screen_shot"}], "stream": False},
+        )
+
+    assert resp.status_code == 200
+    content = resp.json()["choices"][0]["message"]["content"]
+    assert f"data:image/png;base64,{png_b64}" in content  # visible dans CETTE réponse
+
+    # Mais le message persisté par le graphe reste léger, sans le base64.
+    config = {"configurable": {"thread_id": main_mod._derive_thread_id([main_mod.ChatMessage(role="user", content="/screen_shot")])}}
+    snapshot = await g.agent_graph.aget_state(config)
+    assert png_b64 not in snapshot.values["messages"][-1].content
+
+
+@pytest.mark.asyncio
 async def test_streaming_endpoint_yields_sse_chunks_and_done(mock_side_services):
     import app.graph as g
     import app.main as main_mod
@@ -372,7 +527,7 @@ async def test_non_streaming_endpoint_resumes_after_approval_reply(mock_side_ser
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         first = await client.post(
             "/v1/chat/completions",
-            json={"model": "agent-llm", "messages": [{"role": "user", "content": "Question ?"}], "stream": False},
+            json={"model": "agent-llm", "messages": [{"role": "user", "content": "Question ? Site : http://example.com"}], "stream": False},
         )
         assert "Approbation requise" in first.json()["choices"][0]["message"]["content"]
 
@@ -383,7 +538,7 @@ async def test_non_streaming_endpoint_resumes_after_approval_reply(mock_side_ser
             json={
                 "model": "agent-llm",
                 "messages": [
-                    {"role": "user", "content": "Question ?"},
+                    {"role": "user", "content": "Question ? Site : http://example.com"},
                     {"role": "assistant", "content": first.json()["choices"][0]["message"]["content"]},
                     {"role": "user", "content": "approuver"},
                 ],
@@ -423,7 +578,7 @@ async def test_approve_endpoint_resumes_without_text_reply(mock_side_services):
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         first = await client.post(
             "/v1/chat/completions",
-            json={"model": "agent-llm", "messages": [{"role": "user", "content": "Question ?"}], "stream": False},
+            json={"model": "agent-llm", "messages": [{"role": "user", "content": "Question ? Site : http://example.com"}], "stream": False},
         )
         approval_text = first.json()["choices"][0]["message"]["content"]
         assert "Approbation requise" in approval_text
@@ -432,7 +587,7 @@ async def test_approve_endpoint_resumes_without_text_reply(mock_side_services):
             "/approve",
             json={
                 "messages": [
-                    {"role": "user", "content": "Question ?"},
+                    {"role": "user", "content": "Question ? Site : http://example.com"},
                     {"role": "assistant", "content": approval_text},
                 ],
                 "approved": True,
@@ -450,7 +605,7 @@ async def test_approve_endpoint_resumes_without_text_reply(mock_side_services):
             json={
                 "model": "agent-llm",
                 "messages": [
-                    {"role": "user", "content": "Question ?"},
+                    {"role": "user", "content": "Question ? Site : http://example.com"},
                     {"role": "assistant", "content": "Resultat: 42."},
                     {"role": "user", "content": "Autre question ?"},
                 ],
@@ -460,7 +615,7 @@ async def test_approve_endpoint_resumes_without_text_reply(mock_side_services):
 
     assert second.json()["choices"][0]["message"]["content"] == "Autre reponse."
 
-    thread_id = main_mod._derive_thread_id([type("M", (), {"role": "user", "content": "Question ?"})()])
+    thread_id = main_mod._derive_thread_id([type("M", (), {"role": "user", "content": "Question ? Site : http://example.com"})()])
     snapshot = await g.agent_graph.aget_state({"configurable": {"thread_id": thread_id}})
     # human1, AI(tool_call), tool, AI(final), human2, AI(autre) : exactement 6, aucun doublon
     assert len(snapshot.values["messages"]) == 6
@@ -663,11 +818,11 @@ async def test_streaming_endpoint_resumes_after_approval_reply(mock_side_service
 
     transport = httpx.ASGITransport(app=main_mod.app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        approval_text = await _stream_contents(client, [{"role": "user", "content": "Question ?"}])
+        approval_text = await _stream_contents(client, [{"role": "user", "content": "Question ? Site : http://example.com"}])
         final_text = await _stream_contents(
             client,
             [
-                {"role": "user", "content": "Question ?"},
+                {"role": "user", "content": "Question ? Site : http://example.com"},
                 {"role": "assistant", "content": approval_text},
                 {"role": "user", "content": "approuver"},
             ],
@@ -708,11 +863,11 @@ async def test_streaming_endpoint_reopens_think_tag_after_approval_resume(mock_s
 
     transport = httpx.ASGITransport(app=main_mod.app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        approval_text = await _stream_contents(client, [{"role": "user", "content": "Question ?"}])
+        approval_text = await _stream_contents(client, [{"role": "user", "content": "Question ? Site : http://example.com"}])
         final_text = await _stream_contents(
             client,
             [
-                {"role": "user", "content": "Question ?"},
+                {"role": "user", "content": "Question ? Site : http://example.com"},
                 {"role": "assistant", "content": approval_text},
                 {"role": "user", "content": "approuver"},
             ],

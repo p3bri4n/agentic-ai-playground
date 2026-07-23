@@ -27,7 +27,14 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from app import audit_log
-from app.graph import MAX_TOOL_ITERATIONS, agent_graph, describe_context, has_visible_answer
+from app.graph import (
+    MAX_TOOL_ITERATIONS,
+    _get_tools_schema,
+    _plan_tier,
+    agent_graph,
+    describe_context,
+    has_visible_answer,
+)
 
 app = FastAPI(title="LangGraph Agent")
 logger = logging.getLogger(__name__)
@@ -106,13 +113,81 @@ def _touch_thread(thread_id: str) -> None:
     _recent_threads[thread_id] = datetime.now(timezone.utc).isoformat()
 
 
-def _format_approval_request(tool_calls: list) -> str:
+_PLAN_STATUS_LABELS = {"a_faire": "à faire", "en_cours": "en cours", "fait": "fait", "echoue": "échoué"}
+
+
+def _format_plan_summary(plan: Optional[list]) -> str:
+    """
+    Résumé du plan (Itération 1, Phase 1 « cœur cognitif » — voir
+    docs/briefs/phase-1-coeur-cognitif.md et app/graph.py:plan_task) pour le
+    message d'approbation. `plan` vide/None -> chaîne vide (PLANNER_ENABLED
+    désactivé par défaut, voir app/graph.py) : ne change alors RIEN au texte
+    existant, pour ne casser aucun test qui vérifie ce message aujourd'hui.
+    """
+    if not plan:
+        return ""
+    lignes = ["Plan de la tâche :"]
+    for i, sous_tache in enumerate(plan, 1):
+        label = _PLAN_STATUS_LABELS.get(sous_tache.get("status"), sous_tache.get("status", "?"))
+        lignes.append(
+            f"{i}. [{label}] {sous_tache.get('description', '')} "
+            f"(critère : {sous_tache.get('success_criterion', '')})"
+        )
+    return "\n".join(lignes)
+
+
+def _format_approval_request(tool_calls: list, plan: Optional[list] = None) -> str:
     demandes = ", ".join(f'`{tc["name"]}`({tc["args"]})' for tc in tool_calls)
-    return (
+    base = (
         f'⚠️ Approbation requise pour : {demandes}. Réponds "approuver" (une fois), '
         f'"approuver pour la session" (pour ne plus être sollicité sur ce(s) outil(s) '
         f"tant que dure cette conversation) ou \"refuser\" pour continuer."
     )
+    plan_summary = _format_plan_summary(plan)
+    return f"{base}\n\n{plan_summary}" if plan_summary else base
+
+
+def _format_plan_approval_request(plan: list, tier: str, reasons: Optional[list] = None) -> str:
+    """
+    Message d'approbation du PLAN (Itération 3, app/graph.py:
+    require_plan_approval) — distinct de _format_approval_request
+    (approbation d'un tool_call précis). Deux cas : approbation normale par
+    tier (`reasons` vide, le plan a passé la validation) ou escalade
+    humaine après échec répété de la validation automatique (`reasons`
+    non vide — motifs affichés, voir route_after_validation).
+    """
+    if reasons:
+        header = (
+            "⚠️ Le plan proposé a été rejeté par la validation automatique après "
+            "plusieurs tentatives — décision humaine requise. Motifs :\n"
+            + "\n".join(f"- {r}" for r in reasons)
+        )
+    else:
+        header = f"⚠️ Approbation du plan requise (tier : {tier})."
+    footer = 'Réponds "approuver" (une fois), "approuver pour la session" ou "refuser".'
+    summary = _format_plan_summary(plan)
+    return f"{header}\n\n{summary}\n\n{footer}" if summary else f"{header}\n\n{footer}"
+
+
+def _pending_approval_text(snapshot) -> Optional[str]:
+    """
+    Texte de la pause d'approbation en cours pour ce snapshot, ou None s'il
+    n'y en a pas. Centralise la distinction pause PLAN
+    (require_plan_approval, Itération 3) vs pause OUTIL (require_approval,
+    existant) déjà introduite dans _resolve_run — évite de la dupliquer aux
+    4 endroits qui affichent ce texte (streaming, _current_answer,
+    /pending, /context).
+    """
+    if not snapshot.next:
+        return None
+    if "require_plan_approval" in snapshot.next:
+        plan = snapshot.values.get("plan") or []
+        reasons = snapshot.values.get("plan_validation_reasons") or []
+        return _format_plan_approval_request(plan, _plan_tier(plan), reasons)
+    messages = snapshot.values.get("messages") or []
+    if not messages or not getattr(messages[-1], "tool_calls", None):
+        return None
+    return _format_approval_request(messages[-1].tool_calls, snapshot.values.get("plan"))
 
 
 def _parse_approval_reply(text: str) -> tuple:
@@ -126,6 +201,9 @@ def _parse_approval_reply(text: str) -> tuple:
     approved = "approuver" in lowered
     grant_session = approved and "session" in lowered
     return approved, grant_session
+
+
+_INTERNAL_ERROR_NOTICE = "⚠️ Erreur interne pendant la génération, réessayez."
 
 
 def _format_iteration_limit_notice(tool_calls: list) -> str:
@@ -198,10 +276,25 @@ async def _resolve_run(request: ChatCompletionRequest):
             (m.content for m in reversed(request.messages) if m.role == "user"), ""
         )
         approved, grant_session = _parse_approval_reply(last_human)
-        await agent_graph.aupdate_state(
-            config,
-            {"approved": approved, "grant_session": grant_session, "owui_message_count": owui_message_count},
-        )
+        # Deux raisons de pause possibles depuis l'Itération 3 (pipeline de
+        # validation du plan) : require_plan_approval (le PLAN) ou
+        # require_approval (un tool_call), jamais les deux en même temps
+        # (des nœuds distincts du graphe) — snapshot.next contient le nom du
+        # nœud interrompu, assez pour les distinguer sans état supplémentaire.
+        if "require_plan_approval" in snapshot.next:
+            await agent_graph.aupdate_state(
+                config,
+                {
+                    "plan_approved": approved,
+                    "plan_grant_session": grant_session,
+                    "owui_message_count": owui_message_count,
+                },
+            )
+        else:
+            await agent_graph.aupdate_state(
+                config,
+                {"approved": approved, "grant_session": grant_session, "owui_message_count": owui_message_count},
+            )
         return config, None
 
     already_seen = snapshot.values.get("owui_message_count", 0) if snapshot.values else 0
@@ -218,6 +311,18 @@ async def _resolve_run(request: ChatCompletionRequest):
         "session_grants": [],
         "grant_session": False,
         "empty_answer_retries": 0,
+        "slash_command_image_shown": False,
+        "observed_urls": [],
+        "current_page_url": None,
+        "current_page_links": [],
+        "fabricated_navigation_attempts": 0,
+        "plan": [],
+        "replan_count": 0,
+        "plan_validation_reasons": [],
+        "plan_validation_cycles": 0,
+        "plan_approved": None,
+        "plan_grant_session": False,
+        "plan_grant": False,
     }
     return config, run_input
 
@@ -245,6 +350,28 @@ def _sse_chunk(completion_id: str, model: str, delta: dict, finish_reason: Optio
         "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
     }
     return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
+# Taille max d'un morceau de contenu par chunk SSE. Nécessaire depuis que
+# certains contenus envoyés d'un seul bloc (notices, et surtout une image en
+# data URI base64 pour une commande slash sur un outil comme screen_shot —
+# voir app/graph.py, run_slash_command_direct) peuvent dépasser largement la
+# taille d'un token de streaming LLM normal. Sans ce découpage, un client
+# HTTP avec une limite de taille de ligne (ex. aiohttp côté Open WebUI,
+# 131072 octets par défaut) rejette la réponse en bloc avec une erreur peu
+# parlante ("Got more than 131072 bytes when reading") plutôt que de la
+# recevoir en plusieurs petits morceaux comme le ferait un vrai streaming
+# token-par-token.
+_SSE_CONTENT_CHUNK_SIZE = 8192
+
+
+def _sse_content_chunks(completion_id: str, model: str, content: str):
+    if not content:
+        return
+    for i in range(0, len(content), _SSE_CONTENT_CHUNK_SIZE):
+        piece = content[i : i + _SSE_CONTENT_CHUNK_SIZE]
+        delta = {"role": "assistant", "content": piece} if i == 0 else {"content": piece}
+        yield _sse_chunk(completion_id, model, delta)
 
 
 async def _stream_response(config: dict, run_input: Optional[dict], model: str):
@@ -299,8 +426,9 @@ async def _stream_response(config: dict, run_input: Optional[dict], model: str):
 
         snapshot = await agent_graph.aget_state(config)
         if snapshot.next:
-            pending = closing_prefix + _format_approval_request(snapshot.values["messages"][-1].tool_calls)
-            yield _sse_chunk(completion_id, model, {"role": "assistant", "content": pending})
+            pending = closing_prefix + _pending_approval_text(snapshot)
+            for chunk in _sse_content_chunks(completion_id, model, pending):
+                yield chunk
         else:
             last_message = snapshot.values["messages"][-1]
             if getattr(last_message, "tool_calls", None):
@@ -310,13 +438,34 @@ async def _stream_response(config: dict, run_input: Optional[dict], model: str):
                 # sans qu'aucune erreur ni pause d'approbation ne l'explique
                 # (voir MAX_TOOL_ITERATIONS, app/graph.py).
                 notice = closing_prefix + _format_iteration_limit_notice(last_message.tool_calls)
-                yield _sse_chunk(completion_id, model, {"role": "assistant", "content": notice})
+                for chunk in _sse_content_chunks(completion_id, model, notice):
+                    yield chunk
             elif not has_visible_answer(full_streamed + closing_prefix):
-                # Voir _format_empty_answer_notice : aucun tool_calls en attente
-                # ET rien de visible hors <think> — même symptôme "agent
-                # silencieux" que ci-dessus, cause différente.
-                notice = closing_prefix + _format_empty_answer_notice()
-                yield _sse_chunk(completion_id, model, {"role": "assistant", "content": notice})
+                if has_visible_answer(last_message.content):
+                    # Le message final PERSISTÉ a bien une réponse visible,
+                    # mais elle n'a jamais transité par on_chat_model_stream
+                    # ci-dessus (ex. commande slash — app/graph.py,
+                    # run_slash_command_direct — qui n'invoque jamais le LLM
+                    # et ne produit donc aucun chunk de contenu ici). Sans ce
+                    # cas, cette réponse pourtant bien présente en base serait
+                    # remplacée à tort par la notice "réponse non
+                    # exploitable" ci-dessous, qui suppose que rien n'a
+                    # streamé ET que rien n'existe. Découpée en plusieurs
+                    # chunks (_sse_content_chunks) : peut contenir une image
+                    # en data URI base64 (screen_shot via commande slash),
+                    # largement au-dessus de la limite de taille de ligne de
+                    # certains clients HTTP (aiohttp côté Open WebUI).
+                    visible = _render_visible_answer(snapshot.values)
+                    for chunk in _sse_content_chunks(completion_id, model, visible):
+                        yield chunk
+                else:
+                    # Voir _format_empty_answer_notice : aucun tool_calls en
+                    # attente ET rien de visible hors <think>, ni ici ni dans
+                    # le message persisté — même symptôme "agent silencieux"
+                    # que ci-dessus, cause différente.
+                    notice = closing_prefix + _format_empty_answer_notice()
+                    for chunk in _sse_content_chunks(completion_id, model, notice):
+                        yield chunk
     except Exception:
         # Sans ce filet, une erreur ici (llama-server qui coupe la connexion
         # en plein streaming, checkpointer indisponible...) fait mourir ce
@@ -333,23 +482,55 @@ async def _stream_response(config: dict, run_input: Optional[dict], model: str):
         yield _sse_chunk(
             completion_id,
             model,
-            {"role": "assistant", "content": "⚠️ Erreur interne pendant la génération, réessayez."},
+            {"role": "assistant", "content": _INTERNAL_ERROR_NOTICE},
         )
 
     yield _sse_chunk(completion_id, model, {}, finish_reason="stop")
     yield "data: [DONE]\n\n"
 
 
+def _render_visible_answer(snapshot_values: dict) -> str:
+    """
+    Reconstruit le texte final visible pour CE tour à partir de l'état
+    persisté — si slash_command_image_shown est vrai (voir app/graph.py,
+    run_slash_command_direct : commande slash sur un outil image-only, ex.
+    /screen_shot), ajoute l'image du message "human" juste avant en markdown
+    à la réponse renvoyée ICI UNIQUEMENT. Jamais persisté sous cette forme :
+    le message assistant stocké reste léger (texte seul), pour ne pas
+    retokeniser le base64 comme du texte brut lors d'un futur tour LLM sur
+    ce thread — sans cette séparation, une seule capture d'écran
+    (MAX_IMAGES_IN_CONTEXT=1 ne trimme jamais LA dernière image) suffisait à
+    elle seule à dépasser 32768 tokens dès le tour LLM suivant (bug réel
+    observé via Open WebUI). Le signal explicite slash_command_image_shown
+    (plutôt que deviner depuis la forme des messages) est nécessaire : un
+    tour LLM normal qui a lui-même analysé une image via vision produit
+    aussi un AIMessage juste après un message image, sans qu'il faille lui
+    rajouter l'image une seconde fois (elle est déjà correctement décrite).
+    """
+    messages = snapshot_values["messages"]
+    text = messages[-1].content
+    if snapshot_values.get("slash_command_image_shown") and len(messages) >= 2:
+        prev = messages[-2]
+        if getattr(prev, "type", None) == "human" and isinstance(prev.content, list):
+            image_urls = [
+                b["image_url"]["url"] for b in prev.content if isinstance(b, dict) and b.get("type") == "image_url"
+            ]
+            if image_urls:
+                images_md = "\n".join(f"![résultat outil]({url})" for url in image_urls)
+                text = f"{text}\n\n{images_md}" if text else images_md
+    return text
+
+
 async def _current_answer(config: dict) -> str:
     snapshot = await agent_graph.aget_state(config)
     if snapshot.next:
-        return _format_approval_request(snapshot.values["messages"][-1].tool_calls)
+        return _pending_approval_text(snapshot)
     last_message = snapshot.values["messages"][-1]
     if getattr(last_message, "tool_calls", None):
         return _format_iteration_limit_notice(last_message.tool_calls)
     if not has_visible_answer(last_message.content):
         return _format_empty_answer_notice()
-    return last_message.content
+    return _render_visible_answer(snapshot.values)
 
 
 @app.post("/pending")
@@ -359,7 +540,27 @@ async def pending(request: PendingCheckRequest):
     snapshot = await agent_graph.aget_state(config)
     if not snapshot.next:
         return {"pending": False}
-    return {"pending": True, "text": _format_approval_request(snapshot.values["messages"][-1].tool_calls)}
+    return {"pending": True, "text": _pending_approval_text(snapshot)}
+
+
+@app.get("/tools/schema")
+async def tools_schema():
+    """
+    Lecture seule (même convention que /pending) : noms d'outils tels
+    qu'EFFECTIVEMENT vus par ce process langgraph-agent (_tools_schema_cache,
+    voir app/graph.py), pas ceux servis par mcp-client au moment de l'appel —
+    la distinction a mordu en conditions réelles (Phase 1d-révisée, voir
+    HISTORY.md "bug de cache de schéma d'outils") : _tools_schema_cache est
+    rempli une fois pour la durée du process et jamais invalidé, donc un
+    redémarrage de mcp-client seul (schéma mis à jour côté serveur) peut
+    laisser cet endpoint répondre un schéma périmé tant que langgraph-agent
+    lui-même n'a pas redémarré. Existe pour permettre à un appelant externe
+    (harnais de tests, dashboard) de détecter cet écart plutôt que de le
+    découvrir après coup dans un run raté.
+    """
+    schema = await _get_tools_schema()
+    names = sorted({t.get("function", {}).get("name") for t in schema if t.get("function", {}).get("name")})
+    return {"tools": names}
 
 
 @app.post("/context")
@@ -381,9 +582,7 @@ async def context(request: ContextRequest):
     snapshot = await agent_graph.aget_state(config)
     messages = snapshot.values.get("messages", []) if snapshot.values else []
 
-    pending_text = None
-    if snapshot.next and messages and getattr(messages[-1], "tool_calls", None):
-        pending_text = _format_approval_request(messages[-1].tool_calls)
+    pending_text = _pending_approval_text(snapshot)
 
     blocks = describe_context(messages, pending_text)
     return {
@@ -448,15 +647,43 @@ async def approve(request: ApprovalDecisionRequest):
         raise HTTPException(status_code=409, detail="Aucune approbation en attente pour ce thread.")
 
     owui_message_count = len(request.messages)
-    await agent_graph.aupdate_state(
-        config,
-        {
-            "approved": request.approved,
-            "grant_session": request.approved and request.grant_session,
-            "owui_message_count": owui_message_count,
-        },
-    )
-    await agent_graph.ainvoke(None, config)
+    # Même distinction plan vs outil qu'en _resolve_run (Itération 3, voir
+    # commentaire là-bas) — bug réel trouvé en conditions réelles pendant
+    # la campagne live de l'Itération 3 : ce endpoint mettait
+    # inconditionnellement à jour "approved"/"grant_session", laissant une
+    # pause require_plan_approval indéfiniment bloquée (plan_approved
+    # jamais renseigné) puisque approuvée via /approve plutôt que via le
+    # message texte "approuver".
+    if "require_plan_approval" in snapshot.next:
+        await agent_graph.aupdate_state(
+            config,
+            {
+                "plan_approved": request.approved,
+                "plan_grant_session": request.approved and request.grant_session,
+                "owui_message_count": owui_message_count,
+            },
+        )
+    else:
+        await agent_graph.aupdate_state(
+            config,
+            {
+                "approved": request.approved,
+                "grant_session": request.approved and request.grant_session,
+                "owui_message_count": owui_message_count,
+            },
+        )
+    try:
+        await agent_graph.ainvoke(None, config)
+    except Exception:
+        # Parité avec _stream_response (chemin streaming) : sans ce filet,
+        # une erreur ici (ex. dépassement de contexte LLM, `llama-server`/
+        # TabbyAPI qui coupe la connexion...) remontait en 500 brut au lieu
+        # d'une notice propre — constaté en conditions réelles pendant le
+        # harnais tests_integration/test_web_tasks.py (T8/T11, pages web
+        # réelles volumineuses). `_current_answer` n'est PAS appelé ici : le
+        # graphe a pu s'arrêter en plein milieu sans état cohérent à relire.
+        logger.exception("Erreur pendant /approve (thread_id=%s)", thread_id)
+        return {"content": _INTERNAL_ERROR_NOTICE}
 
     return {"content": await _current_answer(config)}
 
@@ -470,7 +697,28 @@ async def chat_completions(request: ChatCompletionRequest):
             _stream_response(config, run_input, request.model), media_type="text/event-stream"
         )
 
-    await agent_graph.ainvoke(run_input, config)
+    try:
+        await agent_graph.ainvoke(run_input, config)
+    except Exception:
+        # Voir la même parenthèse dans /approve ci-dessus : même filet que
+        # le chemin streaming (_stream_response), absent ici jusqu'ici.
+        logger.exception(
+            "Erreur pendant /v1/chat/completions non-streaming (thread_id=%s)",
+            config["configurable"]["thread_id"],
+        )
+        return {
+            "id": f"chatcmpl-{uuid.uuid4().hex[:12]}",
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": request.model,
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": _INTERNAL_ERROR_NOTICE},
+                    "finish_reason": "stop",
+                }
+            ],
+        }
 
     return {
         "id": f"chatcmpl-{uuid.uuid4().hex[:12]}",

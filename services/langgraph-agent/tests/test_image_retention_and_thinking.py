@@ -145,9 +145,12 @@ def test_adaptive_thinking_injects_no_think_after_auto_approved_turn(monkeypatch
 
     result = g._apply_adaptive_thinking(messages, [])
 
+    # Ajouté en position 0 (pas en fin de liste) : un message système doit
+    # être en tête pour rester compatible avec des backends à template
+    # Jinja strict (voir docstring de _apply_adaptive_thinking).
     assert len(result) == len(messages) + 1
-    assert isinstance(result[-1], SystemMessage)
-    assert result[-1].content == g.NO_THINK_DIRECTIVE
+    assert isinstance(result[0], SystemMessage)
+    assert result[0].content == g.NO_THINK_DIRECTIVE
 
 
 def test_adaptive_thinking_skips_when_previous_turn_has_sensitive_tool(monkeypatch):
@@ -185,7 +188,7 @@ def test_adaptive_thinking_respects_session_grants(monkeypatch):
 
     result = g._apply_adaptive_thinking(messages, ["key_type"])
 
-    assert isinstance(result[-1], SystemMessage)
+    assert isinstance(result[0], SystemMessage)
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -344,8 +347,12 @@ async def test_no_think_injected_in_llm_request_after_auto_approved_tool_call(mo
     state = {"messages": [{"role": "user", "content": "Clique là"}], "tool_iterations": 0, "approved": None}
     await g.agent_graph.ainvoke(state, CONFIG)
 
+    # Fusionné dans le message système de tête (GROUNDING_DIRECTIVE) plutôt
+    # qu'ajouté en fin de liste : voir docstring de _apply_adaptive_thinking.
     second_request_body = json.loads(route.calls[1].request.content)
-    assert second_request_body["messages"][-1] == {"role": "system", "content": "/no_think"}
+    head = second_request_body["messages"][0]
+    assert head["role"] == "system"
+    assert head["content"].endswith("/no_think")
 
 
 @pytest.mark.asyncio
@@ -368,7 +375,8 @@ async def test_no_think_not_injected_when_adaptive_thinking_disabled(mock_side_s
     await g.agent_graph.ainvoke(state, CONFIG)
 
     second_request_body = json.loads(route.calls[1].request.content)
-    assert second_request_body["messages"][-1]["content"] != "/no_think"
+    head = second_request_body["messages"][0]
+    assert not (head["role"] == "system" and head["content"].endswith("/no_think"))
 
 
 @pytest.mark.asyncio
@@ -406,4 +414,5 @@ async def test_no_think_not_injected_when_previous_tool_call_is_sensitive(mock_s
     await g.agent_graph.ainvoke(None, CONFIG)
 
     second_request_body = json.loads(route.calls[1].request.content)
-    assert second_request_body["messages"][-1]["content"] != "/no_think"
+    head = second_request_body["messages"][0]
+    assert not (head["role"] == "system" and head["content"].endswith("/no_think"))

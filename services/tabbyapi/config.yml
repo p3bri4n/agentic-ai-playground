@@ -1,0 +1,51 @@
+# Config TabbyAPI/ExLlamaV3 — backend d'inférence par défaut (voir README,
+# section Backend d'inférence).
+#
+# Schéma vérifié contre config_sample.yml de l'image réellement utilisée
+# (voir RESULTS.md pour le digest exact) — ne pas deviner les noms/sections
+# de clés sans le vérifier, cf. draft_mode ci-dessous qui a d'abord été
+# placé par erreur sous `model:` (silencieusement ignoré, log "Draft model
+# is disabled because a model name wasn't provided") avant d'être déplacé
+# sous sa vraie section `draft_model:`.
+#
+# Déviations volontaires par rapport aux défauts TabbyAPI, documentées ici
+# comme le reste du projet documente ses choix d'entrypoint/Dockerfile :
+# - disable_auth: true — réseau interne agent-net uniquement, aucun autre
+#   service de ce projet (llama-server, ollama) n'exige d'auth non plus.
+# - reasoning: true — désactivé par défaut chez TabbyAPI, mais requis ici
+#   pour que les blocs <think> de Qwen soient effectivement parsés.
+# - vision: true — désactivé par défaut même si le modèle a des capacités
+#   vision ; requis pour préserver screen_shot GhostDesk/OCR.
+# - draft_model.draft_mode: mtp — utilise la tête MTP native du modèle
+#   (39 tenseurs mtp.* confirmés dans model.safetensors.index.json), pas de
+#   draft_model_name séparé à charger.
+# - cache_size/max_seq_len explicites (au lieu du défaut qui retombe sur
+#   max_position_embeddings du modèle, 262144 ici).
+#
+# HISTORIQUE VRAM (PoC) : poids seuls 14,29 Gio (variante VL 3.50bpw).
+# Mono-GPU (Ada puis Blackwell) insuffisant avec vision activée — sans
+# vision, ~822 Mio de marge seulement sur la Blackwell 16 Go à
+# cache_size=8192, largement inférieur au besoin réel de la tour vision.
+# Passage en multi-GPU (docker-compose.yml, count: all — gpu_split_auto
+# répartit automatiquement) pour disposer d'assez de VRAM cumulée. 32768
+# reprend la valeur qui a fait ses preuves côté llama-server, à affiner
+# encore si besoin selon la marge VRAM réelle constatée.
+
+network:
+  host: 0.0.0.0
+  port: 5000
+  disable_auth: true
+
+model:
+  model_dir: /models
+  model_name: agent-llm
+  backend: exllamav3
+  max_seq_len: 32768
+  cache_size: 32768
+  cache_mode: Q6
+  vision: true
+  tool_format: qwen3_coder
+  reasoning: true
+
+draft_model:
+  draft_mode: mtp

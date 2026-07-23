@@ -1,8 +1,14 @@
 FROM python:3.12-slim
 
-# client Docker CLI nécessaire pour spawn les conteneurs MCP via le socket monté
-RUN apt-get update && apt-get install -y --no-install-recommends docker.io \
-    && rm -rf /var/lib/apt/lists/*
+# Client Docker CLI nécessaire pour spawn les conteneurs MCP via le socket
+# monté (voir app/main.py, _run_on_server, command="docker"). Copié depuis
+# l'image officielle docker:cli plutôt qu'installé via apt : le paquet
+# docker.io du dépôt Debian (trixie) n'installe que le démon (dockerd) et
+# docker-proxy, PAS le binaire client /usr/bin/docker lui-même (découpage de
+# paquet incomplet constaté empiriquement — which docker échouait malgré une
+# installation apt "réussie" sans erreur). Cette image ne fait tourner aucun
+# démon Docker, seulement le client contre le socket hôte monté.
+COPY --from=docker:27-cli /usr/local/bin/docker /usr/local/bin/docker
 
 WORKDIR /app
 

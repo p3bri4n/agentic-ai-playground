@@ -16,6 +16,7 @@ import respx
 from tests.fixtures.llm_sse import (
     multi_tool_call_response,
     reasoning_response,
+    reasoning_response_combined_final_chunk,
     text_response,
     tool_call_response,
 )
@@ -328,7 +329,7 @@ async def test_approval_resumes_and_calls_mcp_client(mock_side_services):
     )
     g.agent_graph = g.build_graph()
 
-    state = {"messages": [{"role": "user", "content": "Question ?"}], "tool_iterations": 0, "approved": None}
+    state = {"messages": [{"role": "user", "content": "Question ? Site : http://example.com"}], "tool_iterations": 0, "approved": None}
     await g.agent_graph.ainvoke(state, CONFIG)
 
     await g.agent_graph.aupdate_state(CONFIG, {"approved": True})
@@ -386,7 +387,7 @@ async def test_tool_call_loop_resolves_and_does_not_duplicate_messages(mock_side
     ]
     g.agent_graph = g.build_graph()
 
-    state = {"messages": [{"role": "user", "content": "Question ?"}], "tool_iterations": 0, "approved": None}
+    state = {"messages": [{"role": "user", "content": "Question ? Site : http://example.com"}], "tool_iterations": 0, "approved": None}
     await g.agent_graph.ainvoke(state, CONFIG)
     await g.agent_graph.aupdate_state(CONFIG, {"approved": True})
     result = await g.agent_graph.ainvoke(None, CONFIG)
@@ -551,6 +552,37 @@ async def test_reasoning_content_field_is_folded_into_think_tags(mock_side_servi
     result = await g.agent_graph.ainvoke(state, CONFIG)
 
     assert result["messages"][-1].content == "<think>12*7=84</think>\n\nÇa fait 84."
+
+
+@pytest.mark.asyncio
+async def test_reasoning_and_content_combined_in_same_chunk_still_yields_visible_answer(mock_side_services):
+    """
+    Non-régression (bug réel observé avec TabbyAPI/ExLlamaV3 servant
+    Qwen3.6-27B EXL3, découvert en usage réel via Open WebUI/API après la
+    migration depuis llama-server) : contrairement à llama-server/Ollama,
+    qui séparent toujours le raisonnement et la réponse finale en chunks
+    SSE distincts, TabbyAPI peut regrouper la fin du raisonnement et le
+    début de la réponse dans le MÊME delta ({"reasoning_content": "...",
+    "content": "..."}). Le patch _convert_delta_with_reasoning écrasait
+    alors chunk.content avec le seul raisonnement, jetant silencieusement
+    la vraie réponse — le tour se terminait sans contenu visible, un
+    symptôme identique au bug "empty answer" déjà documenté pour
+    llama-server (tool_calls piégé en prose) mais sans rapport avec lui :
+    ici il n'y a même pas de tool_calls, juste une réponse texte perdue.
+    """
+    import app.graph as g
+
+    mock_side_services.post("http://fake-vllm/v1/chat/completions").mock(
+        return_value=_sse_response(
+            reasoning_response_combined_final_chunk(["Aucune action requise."], "Bonjour !")
+        )
+    )
+    g.agent_graph = g.build_graph()
+
+    state = {"messages": [{"role": "user", "content": "Dis bonjour."}], "tool_iterations": 0, "approved": None}
+    result = await g.agent_graph.ainvoke(state, CONFIG)
+
+    assert result["messages"][-1].content == "<think>Aucune action requise.</think>\n\nBonjour !"
 
 
 @pytest.mark.asyncio
