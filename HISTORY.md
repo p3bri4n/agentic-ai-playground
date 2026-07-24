@@ -2232,3 +2232,63 @@ d'échec. Hypothèse confirmée : le correctif T1 corrige T7 par ricochet.
 Backlog restant : T9 uniquement — non traité, comme convenu (rendement
 jugé incertain ou nul, blocage anti-bot externe hors de notre contrôle).
 Plus aucun bug ouvert avant Phase 2 (PLAN.md, discipline de contexte).
+
+## Investigation T9 : deux causes internes trouvées, un correctif appliqué, un faux positif corrigé avec précaution
+
+**Ré-ouverture de T9** après avoir constaté (archives) que le modèle utilise
+indifféremment `browser_*` (Playwright) et GhostDesk (souris/clavier sur un
+vrai bureau) selon les runs, sans que rien ne l'y contraigne. Deux causes
+internes trouvées, distinctes du blocage anti-bot Google déjà connu :
+
+**(1) Contamination GhostDesk inter-tâches (corrigée).** `app_launch`
+(GhostDesk) ouvre une fenêtre sur le bureau du conteneur `ghostdesk`, à
+l'échelle de la MACHINE — sans rapport avec le thread langgraph-agent en
+cours ni avec la session Playwright déjà isolée (`_reset_browser_session`).
+Constaté en conditions réelles : un Firefox ouvert par un thread T9 des
+heures plus tôt (10h+ d'uptime) restait accessible ; un thread T9 ultérieur,
+bloqué par le garde-fou anti-fabrication sur `browser_navigate`, a pris un
+`screen_shot` et lu ce Firefox résiduel déjà sur insee.fr — un « succès » qui
+ne prouvait rien sur la capacité de l'agent à refaire la tâche à froid.
+Correctif : `_reset_ghostdesk_desktop()` (`test_web_tasks.py`) —
+`pkill -f firefox` sur le conteneur `ghostdesk` avant CHAQUE répétition,
+même garantie que les deux resets déjà en place. Harnais de test uniquement,
+aucun redémarrage de service requis.
+
+**(2) Garde-fou "premier hop" bloquant la navigation vers Google : FAUX
+POSITIF, corrigé par PRÉCAUTION avant tout patch.** Les 13 threads T9
+archivés montraient TOUS un blocage sur le tout premier `browser_navigate`
+vers google.com — semblant indiquer que l'exemption "premier hop" (déjà
+livrée pour T8/T11, voir plus haut) ne s'appliquait pas à T9. Plutôt que de
+patcher `graph.py` sur cette seule preuve, vérification faite : (a) tous
+ces threads archivés PRÉCÈDENT le commit du correctif "premier hop"
+(bb72753, 24/07 14h32 UTC) — donnée simplement périmée ; (b) l'auto-
+narration du modèle sur ce premier appel ("il semble que Google ait
+bloqué la requête") s'est révélée fausse une fois le VRAI résultat
+d'outil obtenu ; (c) ce vrai résultat était invisible dans le journal
+d'audit à cause d'un angle mort découvert au passage : `_execute_tool_calls`
+n'audite JAMAIS un tour passé par une approbation humaine (`call_tools`,
+`audit=False`) — seuls les tours auto-approuvés (`auto_call_tools`,
+`audit=True`) sont journalisés, par construction (« un humain vient de le
+voir, inutile de dupliquer »). En campagne automatisée, ce tour EST
+pourtant auto-approuvé par le harnais (`_approve(..., grant_session=True)`),
+pas par un vrai humain — l'angle mort s'applique quand même, cachant
+justement la toute première tentative de chaque outil, la plus utile à
+l'investigation. Instrumentation temporaire (`logger.warning` ajouté puis
+entièrement retiré, diff vide vérifié après coup) posée pour lever le doute :
+confirmé sur un run réel que `has_prior_navigation=False`/`observed_urls=[]`
+sur le tout premier `browser_navigate`, navigation vers Google AUTORISÉE
+comme prévu ; le blocage suivant (tentative de saut direct vers
+`https://www.insee.fr` sans lien réel observé sur la SERP) est un vrai
+anti-fabrication légitime, pas un bug. **Conclusion : aucun changement de
+`graph.py` nécessaire** — le garde-fou fonctionne correctement sur le code
+actuel.
+
+**Smoke T9 ×3 après le seul correctif GhostDesk** : 2/3 (1 échec classé
+`infra`, blocage anti-bot Google réel confirmé dans l'audit — page
+`/sorry/index` de Google atteinte). Cohérent avec la nature intrinsèquement
+variable de ce blocage externe, hors de notre contrôle.
+
+Angle mort d'audit (point (2)(c) ci-dessus) noté pour référence future, non
+corrigé ici (hors périmètre de cette investigation) : toute investigation
+sur archives doit garder à l'esprit que le TOUT PREMIER appel de chaque
+outil par thread est invisible dans `/audit`, même en campagne automatisée.

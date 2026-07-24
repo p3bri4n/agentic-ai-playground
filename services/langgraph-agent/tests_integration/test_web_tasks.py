@@ -704,6 +704,31 @@ def _purge_downloads_volume() -> None:
     )
 
 
+GHOSTDESK_CONTAINER = os.environ.get("GHOSTDESK_CONTAINER", "ghostdesk")
+
+
+def _reset_ghostdesk_desktop() -> None:
+    """
+    Isolation entre tâches, deuxième canal (voir HISTORY.md, investigation
+    T9) : `app_launch` (GhostDesk) ouvre une VRAIE fenêtre sur le bureau du
+    conteneur `ghostdesk`, à l'échelle de la MACHINE, sans aucun rapport
+    avec la session Playwright déjà isolée par `_reset_browser_session` ni
+    avec le thread langgraph-agent en cours. Constaté en conditions
+    réelles : un Firefox lancé par un thread T9 des heures plus tôt restait
+    ouvert sur insee.fr ; un thread T9 ultérieur, bloqué par le garde-fou
+    anti-fabrication sur browser_navigate, a pris un `screen_shot` et lu ce
+    Firefox résiduel — "réussite" qui ne prouve rien sur la capacité de
+    l'agent à refaire la tâche à froid. `pkill -f firefox` (best-effort,
+    check=False) avant CHAQUE répétition, même garantie que les deux resets
+    déjà en place.
+    """
+    subprocess.run(
+        ["docker", "exec", GHOSTDESK_CONTAINER, "pkill", "-f", "firefox"],
+        check=False,
+        capture_output=True,
+    )
+
+
 def _reset_browser_session() -> None:
     """
     Isolation entre tâches (Phase 1d-révisée, voir HISTORY.md "isolation
@@ -799,6 +824,7 @@ def _run_campaign():
             prompt = f"{base_prompt} (essai {uuid.uuid4().hex[:8]})"
             _purge_downloads_volume()
             _reset_browser_session()
+            _reset_ghostdesk_desktop()
             result = run_task(prompt)
             ok, detail = (False, result.error) if result.error else assert_fn(result.final_text, prompt)
             cause = _classify_failure_cause(task_id, result, ok, detail)
@@ -1008,6 +1034,7 @@ def test_t7_noise_baseline():
         # pas une mesure indépendante).
         prompt = f"{base_prompt} (essai {uuid.uuid4().hex[:8]})"
         _reset_browser_session()
+        _reset_ghostdesk_desktop()
         result = run_task(prompt)
         ok, detail = (False, result.error) if result.error else assert_fn(result.final_text, prompt)
         rows.append(
