@@ -809,6 +809,14 @@ cache (le prochain appel en rouvre une neuve) ; le harnais de tâches web
 l'appelle avant chaque répétition (voir `tests_integration/
 test_web_tasks.py`, `_reset_browser_session`).
 
+Même problème, canal différent (investigation T9, voir HISTORY.md) :
+GhostDesk pilote un vrai bureau à l'échelle de la MACHINE (`app_launch`),
+sans aucun rapport avec la session Playwright ci-dessus ni avec le thread
+en cours — une fenêtre laissée ouverte par une tâche reste lisible (via
+`screen_shot`) par une tâche suivante des heures plus tard. `_reset_
+ghostdesk_desktop()` (`pkill -f firefox` sur le conteneur `ghostdesk`)
+appelé avant chaque répétition, même garantie que le reset Playwright.
+
 **Approbation par bouton d'UI, sans passer par un message texte** : deux
 endpoints complètent le flux texte "approuver"/"approuver pour la
 session"/"refuser" —
