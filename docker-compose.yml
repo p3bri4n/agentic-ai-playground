@@ -249,7 +249,7 @@ services:
       - MCP_GHOSTDESK_URL=http://ghostdesk:3000/mcp
       # "browser" (Playwright) : serveur HTTP persistant lui aussi (service
       # playwright-mcp ci-dessous), pas un spawn éphémère par appel — voir
-      # BUGS.md (perte de continuité d'état entre deux appels d'outils).
+      # RESOLVED_BUGS.md (perte de continuité d'état entre deux appels d'outils).
       - MCP_PLAYWRIGHT_URL=http://playwright-mcp:8931/mcp
       - GHOSTDESK_AUTH_TOKEN=${GHOSTDESK_AUTH_TOKEN}
       # Requis par les modèles Qwen pour que leurs clics tombent sur la bonne
@@ -292,7 +292,7 @@ services:
   # --- Playwright MCP : navigateur piloté par l'agent (serveur HTTP) --
   # ⚠️ Anciennement spawné à la demande par mcp-client (`docker run --rm`
   # par appel d'outil) : chaque appel repartait sur `about:blank` sans
-  # continuité d'état avec le précédent (voir BUGS.md). L'image officielle
+  # continuité d'état avec le précédent (voir RESOLVED_BUGS.md). L'image officielle
   # mcp/playwright supporte un mode serveur HTTP natif (`--port`, endpoint
   # Streamable HTTP `/mcp`) ; on l'utilise ici comme service persistant,
   # même patron que GhostDesk/OCR ci-dessous.

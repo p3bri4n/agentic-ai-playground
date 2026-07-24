@@ -1,7 +1,7 @@
 # Instruction particulières pour ce projet
 
 1. lis le README.md en début de session
-2. les bugs résolus doivent être inscrits dans BUGS.md
+2. les bugs résolus doivent être inscrits dans RESOLVED_BUGS.md
 3. l'historique des avancées doit être inscrit dans HISTORY.md
 4. toujours informer l'utilisateur des commandes qu'il doit tapper si besoin de redémarrer/rebuild un service docker
 5. une phase = une PR.

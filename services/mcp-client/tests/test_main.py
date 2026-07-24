@@ -302,7 +302,7 @@ def _patch_open_session(main_mod, monkeypatch):
 def test_persistent_session_reused_across_calls(monkeypatch):
     """
     Le serveur "browser" (Playwright) scope son état navigateur à la SESSION
-    MCP, pas au process serveur (voir BUGS.md) : mcp-client doit donc réutiliser
+    MCP, pas au process serveur (voir RESOLVED_BUGS.md) : mcp-client doit donc réutiliser
     la même session entre deux appels d'outils plutôt que d'en rouvrir une à
     chaque fois, sans quoi l'état (page visitée...) serait perdu entre deux
     appels malgré un serveur HTTP persistant.

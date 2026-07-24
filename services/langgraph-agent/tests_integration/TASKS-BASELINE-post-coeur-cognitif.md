@@ -3,7 +3,7 @@
 Générée automatiquement le 2026-07-23T15:10:11.849770+00:00 (3 répétitions/tâche). Voir BENCHMARK0.md pour la spec complète et les limites connues de chaque assertion, et la docstring de test_web_tasks.py pour la méthode de sous-classification boucle_fabrication/boucle_budget.
 **Score de campagne (brut, avant correctif du bug de thread partagé — voir ci-dessous) : 28/33 passages réussis.**
 
-## Repêchage T8 après correctif du bug de thread partagé (voir HISTORY.md/BUGS.md)
+## Repêchage T8 après correctif du bug de thread partagé (voir HISTORY.md/RESOLVED_BUGS.md)
 
 Les 3 répétitions T8 ci-dessous partageaient en réalité le MÊME thread_id
 (`_derive_thread_id` hachait un prompt fixe, identique entre répétitions) —

@@ -795,7 +795,7 @@ def _run_campaign():
             # de contexte) fait alors rejouer les répétitions suivantes sur
             # ce même état bloqué, pas des essais indépendants. Trouvé sur
             # la campagne finale Itération 4 (T8_wikipedia, voir HISTORY.md
-            # et BUGS.md).
+            # et RESOLVED_BUGS.md).
             prompt = f"{base_prompt} (essai {uuid.uuid4().hex[:8]})"
             _purge_downloads_volume()
             _reset_browser_session()

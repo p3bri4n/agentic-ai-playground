@@ -71,7 +71,7 @@ SERVERS = {
         # serveur HTTP persistant (comme "desktop"/"ocr" plus bas) : un spawn
         # éphémère (`docker run --rm` par appel) redémarrait un navigateur
         # tout neuf à CHAQUE appel d'outil, sans continuité d'état entre
-        # `browser_navigate` et l'appel suivant — voir BUGS.md. L'image
+        # `browser_navigate` et l'appel suivant — voir RESOLVED_BUGS.md. L'image
         # mcp/playwright officielle supporte un mode serveur HTTP natif
         # (`--port`, endpoint Streamable HTTP `/mcp`), utilisé ici via le
         # service docker-compose dédié `playwright-mcp`.

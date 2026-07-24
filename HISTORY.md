@@ -193,7 +193,7 @@ Open WebUI (extension Chrome non connectée) — tout validé via l'API
 En préparant le harnais de tâches web de la Phase 0 (`PLAN.md`), la
 question s'est posée directement : le serveur "browser" (Playwright)
 redémarre-t-il à chaque appel d'outil ? Réponse : oui, confirmé dans
-`BUGS.md` — spawn éphémère (`docker run -i --rm mcp/playwright:latest` par
+`RESOLVED_BUGS.md` — spawn éphémère (`docker run -i --rm mcp/playwright:latest` par
 appel), sans continuité d'état. Or la quasi-totalité des 11 tâches prévues
 (pagination, tri/filtre, piste multi-pages, session authentifiée,
 navigation inter-articles Wikipédia...) suppose un état navigateur partagé
@@ -1251,7 +1251,7 @@ brief, elle approchait déjà de la saturation).
    anticipé du cœur cognitif sur des tâches longues à contenu volumineux
    (Phase 2, compaction d'historique, est le chantier suivant dans l'ordre
    — ce résultat en confirme la nécessité).
-2. **Bug de harnais latent, découvert ici** (voir BUGS.md) : les 3
+2. **Bug de harnais latent, découvert ici** (voir RESOLVED_BUGS.md) : les 3
    « répétitions » de `_run_campaign()` partagent le MÊME thread_id
    (`_derive_thread_id` ne hache que le texte du prompt, fixe et identique
    d'une répétition à l'autre) — la répétition 1 a laissé le thread bloqué

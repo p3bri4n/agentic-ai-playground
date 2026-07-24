@@ -20,7 +20,7 @@ cp .env.example .env
 
 docker pull mcp/filesystem:latest
 docker pull mcp/git:latest
-docker pull mcp/playwright:latest   # serveur HTTP persistant (service playwright-mcp), voir BUGS.md
+docker pull mcp/playwright:latest   # serveur HTTP persistant (service playwright-mcp), voir RESOLVED_BUGS.md
 docker compose --profile build-only build mcp-terminal-build   # construit l'image locale mcp-terminal:local
 
 docker compose up -d
@@ -57,7 +57,7 @@ services/
                        mcp-client s'y connecte en Streamable HTTP)
   playwright-mcp/      image officielle mcp/playwright, navigateur piloté par
                        l'agent (pas de code applicatif ici : service docker-compose
-                       à part, serveur HTTP natif de l'image — voir BUGS.md pour
+                       à part, serveur HTTP natif de l'image — voir RESOLVED_BUGS.md pour
                        l'historique du passage depuis un spawn éphémère)
   llama-server/        build du fork llama.cpp servant le modèle (voir
                        section Backend d'inférence) — pas de code Python ici,
@@ -290,7 +290,7 @@ tâche par tâche.
 | T11 — sonde de péremption | 3/3 | version consultée en direct à chaque fois |
 
 **Bug de harnais trouvé et corrigé sur cette campagne** (`31aacac`, voir
-BUGS.md) : les répétitions d'une même tâche dans `_run_campaign()`
+RESOLVED_BUGS.md) : les répétitions d'une même tâche dans `_run_campaign()`
 partageaient leur `thread_id` (`_derive_thread_id` hache un prompt fixe,
 identique entre répétitions) — T8 rep1 a fait déborder le contexte
 (170285 tokens > 32768 côté TabbyAPI, une grosse page Wikipedia réelle +
@@ -557,7 +557,7 @@ Résumé des suites, à date de la dernière vérification :
 |---|---|---|
 | `skill-manager` | 5 | chargement des skills, matching mot-clé, endpoints HTTP |
 | `context-manager` | 4 | ingestion/retrieval Qdrant, mémoire par utilisateur, collection vide |
-| `mcp-client` | 20 | registre d'outils, schéma function-calling (description/inputSchema) exposé pour le LLM, appel réel via stdio, erreur 404 sur outil inconnu, appel réel via Streamable HTTP (serveur "desktop"/GhostDesk) avec vérification du bearer token et de l'en-tête `GhostDesk-Model-Space` (présent avec la valeur configurée ET absent quand `GHOSTDESK_MODEL_SPACE=""`), serveur "ocr" (services/ocr-service) enregistré/appelable via Streamable HTTP et bearer invalide rejeté, **persistance de session** (`persistent_session` sur "browser"/Playwright, voir BUGS.md) : session réutilisée entre deux appels consécutifs, comportement éphémère inchangé pour les serveurs sans ce flag, session cassée jetée puis rouverte proprement après une erreur, **`browser_extract`** (Phase 1d-révisée, voir HISTORY.md "correctif extraction") : outil synthétique enregistré quand "browser" est configuré, dispatché en interne vers `browser_evaluate` avec un template JS fixe (la requête est interpolée via `json.dumps`, jamais concaténée brute), et **`POST /reset-session/{server_name}`** (isolation entre tâches) : jette une session persistante en cache, 404 si le serveur visé n'est pas configuré en session persistante |
+| `mcp-client` | 20 | registre d'outils, schéma function-calling (description/inputSchema) exposé pour le LLM, appel réel via stdio, erreur 404 sur outil inconnu, appel réel via Streamable HTTP (serveur "desktop"/GhostDesk) avec vérification du bearer token et de l'en-tête `GhostDesk-Model-Space` (présent avec la valeur configurée ET absent quand `GHOSTDESK_MODEL_SPACE=""`), serveur "ocr" (services/ocr-service) enregistré/appelable via Streamable HTTP et bearer invalide rejeté, **persistance de session** (`persistent_session` sur "browser"/Playwright, voir RESOLVED_BUGS.md) : session réutilisée entre deux appels consécutifs, comportement éphémère inchangé pour les serveurs sans ce flag, session cassée jetée puis rouverte proprement après une erreur, **`browser_extract`** (Phase 1d-révisée, voir HISTORY.md "correctif extraction") : outil synthétique enregistré quand "browser" est configuré, dispatché en interne vers `browser_evaluate` avec un template JS fixe (la requête est interpolée via `json.dumps`, jamais concaténée brute), et **`POST /reset-session/{server_name}`** (isolation entre tâches) : jette une session persistante en cache, 404 si le serveur visé n'est pas configuré en session persistante |
 | `mcp-terminal` | 6 | liste blanche de commandes, lecture de fichier (y compris nom avec espace), blocage du path traversal |
 | `ocr-service` | 14 | matching `find_text` exact/fuzzy/désactivé/sans résultat (insensible à la casse, distance de Levenshtein légère mot par mot en secours), conversion de coordonnées pixels -> repère normalisé 0-1000 sur une image 1280x1024 connue (`OCR_COORD_SPACE`) et désactivation (`coord_space="pixels"`), `find_text`/`read_screen` de bout en bout contre un faux serveur MCP GhostDesk réel (Streamable HTTP, image PNG de taille connue), plafond de `read_screen` à 80 éléments triés par confiance, `OCR_ENGINE=fake` (aucune dépendance à PaddleOCR dans les tests) |
 | `dashboard` | 16 | parser Prometheus minimal maison sur un payload `/metrics` figé réaliste (commentaires `# HELP`/`# TYPE` ignorés, lignes illisibles tolérées), normalisation des slots `/slots` (clé `used_tokens` : premier champ connu présent parmi plusieurs noms possibles selon la version), parsing CSV `nvidia-smi` (lignes malformées ignorées), `GET /api/snapshot` : agrégation des 3 sources quand tout va bien, llama-server injoignable -> section `null` + statut 200 (jamais 500), langgraph-agent injoignable -> `context` à `null`, `thread_id` explicite en query prioritaire sur le plus récent, VRAM activée (`ENABLE_GPU_STATS`, nvidia-smi mocké) vs désactivée par défaut (nvidia-smi jamais appelé, pas d'erreur), `GET /` renvoie 200 en HTML (page non testée en détail, statique) |
@@ -917,7 +917,7 @@ documentée plus haut pour le streaming n'a donc pas été touchée.
   `mcp==1.2.0` vers `mcp==1.9.4` dans `services/mcp-client/requirements.txt`),
   authentifié par bearer token (`GHOSTDESK_AUTH_TOKEN`, voir `.env.example`).
 - **`playwright-mcp` (serveur "browser") est un serveur HTTP persistant
-  depuis le correctif documenté en détail dans `BUGS.md`** — auparavant
+  depuis le correctif documenté en détail dans `RESOLVED_BUGS.md`** — auparavant
   spawné en STDIO éphémère (`docker run -i --rm mcp/playwright:latest` par
   appel), il perdait tout état de navigation entre deux appels d'outils.
   L'image officielle expose nativement un mode serveur HTTP
