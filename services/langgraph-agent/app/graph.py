@@ -52,6 +52,8 @@ import json
 import re
 import shlex
 import uuid
+import zoneinfo
+from datetime import datetime
 from typing import Annotated, Optional, TypedDict
 from urllib.parse import urljoin
 
@@ -529,6 +531,81 @@ DOWNLOAD_DIRECTIVE = (
     "jamais via browser_navigate/browser_evaluate vers un chemin du "
     "navigateur, que tu ne peux pas connaître à l'avance."
 )
+
+# Conscience temporelle (PLAN.md Phase 1, point 7 — amendement dédié,
+# jamais implémenté avant ce correctif malgré T11 déjà présente dans le
+# harnais depuis la Phase 0, voir HISTORY.md : confirmé en grep exhaustif
+# lors du diagnostic T11). Déclenchée par la sonde T11 elle-même :
+# `browser_extract(query="Python 3.13")` — le modèle navigue bien vers
+# python.org (correctif "premier hop") mais interroge la page avec un
+# préfixe de version issu de SA PROPRE connaissance figée, manquant la
+# version réellement affichée (3.14.x).
+#
+# Date de coupure : AUCUNE date officielle publiée dans le model card
+# local (models/qwen3.6-27b-exl3-3.50bpw/README.md, vérifié — pas de
+# mention "knowledge cutoff"). Le model card situe la sortie de Qwen3.6
+# après "the February release of the Qwen3.5 series" et cite des
+# problèmes AIME 2026 dans ses benchmarks — mais l'observation empirique
+# ci-dessus (Python 3.13 avancé comme dernière version alors que 3.14
+# existe déjà) montre que la connaissance réelle du modèle est plus
+# ancienne que sa date de sortie annoncée (cas courant : les données
+# d'entraînement figent des mois avant la sortie). Borne CONSERVATRICE
+# retenue : ne pas se fier à des versions/faits volatils sans vérifier,
+# quelle que soit la date supposée.
+# Biais de formulation de requête (trouvé APRÈS la 1re version de cette
+# directive, voir HISTORY.md — sonde T11 : le modèle décide bien de
+# vérifier, "Ma connaissance pourrait être dépassée", MAIS interroge
+# ensuite browser_extract avec "Python 3.13" — sa propre valeur supposée
+# injectée dans la requête de recherche elle-même — au lieu d'un terme
+# neutre, et récupère donc l'ancienne version toujours présente ailleurs
+# sur la page (historique des releases). Vérifier via le web ne sert à
+# rien si la requête de vérification est déjà biaisée par la réponse
+# supposée.
+PEREMPTION_DIRECTIVE = (
+    "\nTes connaissances ont une date de coupure antérieure à aujourd'hui "
+    "— probablement plus ancienne que tu ne le penses (déjà observé : tu "
+    "as annoncé Python 3.13 comme dernière version alors que 3.14 existe "
+    "déjà). Avant d'affirmer un fait volatil (version d'un logiciel, prix, "
+    "actualité, titulaire d'un rôle/poste, état d'un service en ligne), "
+    "VÉRIFIE-le via le web plutôt que de répondre depuis ta mémoire — "
+    "réserve la réponse de mémoire aux faits stables (histoire, "
+    "mathématiques, définitions, documentation figée). En vérifiant, "
+    "n'injecte JAMAIS dans ta requête de recherche/extraction une valeur "
+    "précise que tu supposes déjà (ex. un numéro de version) — une page "
+    "réelle mentionne souvent aussi d'anciennes valeurs (historique des "
+    "versions), ta requête biaisée les retrouverait et te confirmerait à "
+    "tort ton biais. Cherche plutôt un terme neutre décrivant ce que tu "
+    "cherches (« dernière version stable », « version actuelle »)."
+)
+
+# Timezone de l'agent (PLAN.md Phase 1, point 7a) : depuis l'env hôte
+# (TZ, voir docker-compose.yml), défaut Europe/Paris (fuseau de ce
+# déploiement, vérifié via `timedatectl` sur l'hôte — les conteneurs
+# Docker n'héritent PAS automatiquement du fuseau hôte, ils tournent en
+# UTC par défaut sans ce réglage explicite).
+_AGENT_TIMEZONE = os.environ.get("TZ", "Europe/Paris")
+_WEEKDAYS_FR = ["lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi", "dimanche"]
+_MONTHS_FR = [
+    "janvier", "février", "mars", "avril", "mai", "juin",
+    "juillet", "août", "septembre", "octobre", "novembre", "décembre",
+]
+
+
+def _date_directive() -> str:
+    """
+    Injection de date (PLAN.md Phase 1, point 7a) : granularité JOUR
+    UNIQUEMENT, jamais l'heure — préservation du cache de préfixe
+    ExLlamaV3 (voir HISTORY.md, chasse au cache=0) : une valeur qui ne
+    change qu'une fois par jour, pas à chaque tour ni chaque seconde.
+    Positionnée en dernier dans le bloc système statique (après
+    GROUNDING_DIRECTIVE/DOWNLOAD_DIRECTIVE/PEREMPTION_DIRECTIVE, avant la
+    consigne de vérification par tour de _verification_directive, encore
+    plus volatile) — maximise la longueur du préfixe réellement stable
+    d'un tour à l'autre au sein d'une même journée.
+    """
+    now = datetime.now(zoneinfo.ZoneInfo(_AGENT_TIMEZONE))
+    return f"\nDate actuelle : {_WEEKDAYS_FR[now.weekday()]} {now.day} {_MONTHS_FR[now.month - 1]} {now.year} ({_AGENT_TIMEZONE})."
+
 
 # Filet de sécurité (bug réel observé en usage réel avec llama-server —
 # fork turboquant-webp — sur la tâche "va sur wikipedia.org et cherche
@@ -1546,7 +1623,7 @@ def describe_context(messages: list, pending_text: Optional[str] = None) -> list
             for label, kind in _CONTEXT_BLOCK_SKELETON
         ]
 
-    system_parts = [GROUNDING_DIRECTIVE, DOWNLOAD_DIRECTIVE]
+    system_parts = [GROUNDING_DIRECTIVE, DOWNLOAD_DIRECTIVE, PEREMPTION_DIRECTIVE]
     skills_parts = []
     history_parts = []
     image_count = 0
@@ -1730,7 +1807,12 @@ def _verification_directive(state: AgentState) -> str:
 async def call_llm(state: AgentState, config: dict) -> dict:
     bound_llm = await _get_bound_llm()
     messages_for_llm = [
-        SystemMessage(content=f"{GROUNDING_DIRECTIVE}\n{DOWNLOAD_DIRECTIVE}{_verification_directive(state)}")
+        SystemMessage(
+            content=(
+                f"{GROUNDING_DIRECTIVE}\n{DOWNLOAD_DIRECTIVE}{PEREMPTION_DIRECTIVE}"
+                f"{_date_directive()}{_verification_directive(state)}"
+            )
+        )
     ] + state["messages"]
     messages_for_llm = _apply_image_retention(messages_for_llm)
     messages_for_llm = _apply_adaptive_thinking(messages_for_llm, state.get("session_grants") or [])

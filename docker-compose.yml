@@ -29,6 +29,12 @@ services:
     container_name: langgraph-agent
     restart: unless-stopped
     environment:
+      # Conscience temporelle (PLAN.md Phase 1, point 7a, voir HISTORY.md) :
+      # un conteneur Docker tourne en UTC par défaut, jamais le fuseau de
+      # l'hôte automatiquement — défaut Europe/Paris (fuseau de ce
+      # déploiement, vérifié via `timedatectl` sur l'hôte), surchargeable
+      # via .env si l'hôte change.
+      - TZ=${TZ:-Europe/Paris}
       - LLM_BASE_URL=${LLM_BASE_URL:-http://tabbyapi:5000/v1}
       - SKILL_MANAGER_URL=http://skill-manager:8001
       - CONTEXT_MANAGER_URL=http://context-manager:8002

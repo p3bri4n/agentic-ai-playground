@@ -1,13 +1,13 @@
 {
-  "T10_books_toscrape": 140.5,
-  "T11_sonde_peremption": 13.1,
-  "T1_extraction_paginee": 65.2,
-  "T2_formulaire_conge": 42.2,
+  "T10_books_toscrape": 115.1,
+  "T11_sonde_peremption": 18.9,
+  "T1_extraction_paginee": 121.9,
+  "T2_formulaire_conge": 35.9,
   "T3_tableau_dynamique": 17.3,
-  "T4_recherche_multi_sauts": 48.2,
-  "T5_telechargement_calcul": 15.9,
-  "T6_session_authentifiee": 44.7,
-  "T7_impossible_par_construction": 123.7,
-  "T8_wikipedia": 72.0,
-  "T9_google_insee": 113.7
+  "T4_recherche_multi_sauts": 46.2,
+  "T5_telechargement_calcul": 16.4,
+  "T6_session_authentifiee": 42.0,
+  "T7_impossible_par_construction": 89.9,
+  "T8_wikipedia": 67.6,
+  "T9_google_insee": 74.3
 }

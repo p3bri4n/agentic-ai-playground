@@ -1976,3 +1976,140 @@ valident le chantier latence dans son ensemble ; le score/couverture
 restent un chantier séparé (T1/T7/T11), pas un effet de ce correctif.
 
 Aucun nouveau correctif engagé — rapporté à l'utilisateur pour arbitrage.
+
+## Conscience temporelle (PLAN.md Phase 1, point 7 — implémentée)
+
+Jamais construite depuis la Phase 0 malgré T11 déjà présente dans le
+harnais (confirmé en grep exhaustif lors du diagnostic T11 précédent) —
+implémentée pour cibler directement la cause trouvée : `browser_extract`
+ancré sur un préfixe de version issu de la connaissance figée du modèle
+(« Python 3.13 »), malgré une navigation désormais réussie (correctif
+"premier hop").
+
+**Implémenté** (`app/graph.py`) :
+- `PEREMPTION_DIRECTIVE` : date de coupure du modèle non publiée
+  (vérifié — aucune mention dans le model card local,
+  `models/qwen3.6-27b-exl3-3.50bpw/README.md`) ; documente l'observation
+  empirique (Python 3.13 avancé alors que 3.14 existe) comme preuve que la
+  connaissance réelle est plus ancienne que la date de sortie annoncée du
+  modèle (2026) ; consigne de vérifier via le web tout fait volatil
+  (versions, prix, actualité, rôles, état de services), réponse de mémoire
+  réservée aux faits stables.
+- `_date_directive()` : injection de date, granularité JOUR uniquement
+  (jamais l'heure, pour préserver le cache de préfixe ExLlamaV3 — voir
+  chasse au cache=0), positionnée en fin de bloc système statique, avant
+  la consigne de vérification par tour (la plus volatile).
+- `TZ` (`docker-compose.yml`, défaut `Europe/Paris`, vérifié via
+  `timedatectl` sur l'hôte — un conteneur Docker tourne en UTC par défaut
+  sans ce réglage explicite).
+
+**Tests** (`tests/test_temporal_awareness.py`, nouveau) : format et
+stabilité intra-journée de `_date_directive`, présence des deux directives
+dans le message système réellement envoyé (câblage bout en bout, pas
+juste unitaire). Un test existant (`test_context_endpoint.py`) mis à jour
+(compte de blocs système 2->3). 276/276 tests passent.
+
+**Smoke T11 ×3** (après reconstruction) : **2/3** — net progrès (0/3 sur
+les 3 dernières campagnes). Confirmé dans l'audit : le modèle raisonne
+désormais explicitement « Ma connaissance pourrait être dépassée, donc je
+dois vérifier via le web » dans LES TROIS répétitions — la directive
+fonctionne sur la décision de vérifier. La répétition #2 échoue quand même
+: `browser_extract(query="Python 3.13")` reste ancré sur l'ancienne
+version dans SA PROPRE requête de recherche, ratant 3.14.6 — la directive
+résout la décision de vérifier, pas totalement le biais dans la
+FORMULATION de la requête de vérification. Amélioration réelle et
+mesurée, pas une résolution complète.
+
+Aucune campagne complète relancée dans ce tour (smoke suffisant pour
+valider le principe) — rapporté à l'utilisateur pour décider de la suite
+(campagne complète de re-mesure, ou itérer d'abord sur le biais de
+formulation de requête).
+
+## Correctif du biais de formulation de requête (PEREMPTION_DIRECTIVE étendue)
+
+Root cause précisée depuis le tour précédent : le modèle décidait déjà de
+vérifier via le web (« Ma connaissance pourrait être dépassée »), mais
+interrogeait ensuite `browser_extract` avec sa propre valeur SUPPOSÉE
+("Python 3.13") plutôt qu'un terme neutre — une page réelle mentionne
+souvent aussi d'anciennes valeurs (historique des releases), la requête
+biaisée les retrouvait donc et confirmait le biais au lieu de le corriger.
+
+**Correctif** : `PEREMPTION_DIRECTIVE` étendue d'une règle explicite —
+n'injecte jamais une valeur supposée dans la requête de vérification
+elle-même, cherche un terme neutre (« dernière version stable » plutôt
+qu'un numéro précis). Généralisable au-delà de T11 (tout fait volatil où
+le modèle pourrait ancrer sa recherche sur sa propre réponse supposée).
+Test dédié ajouté (`test_peremption_directive_warns_against_biased_search_query`).
+277/277 tests passent.
+
+**Smoke T11 ×3** (après reconstruction) : **3/3**. Confirmé dans l'audit :
+les 3 threads démarrent désormais par `browser_extract(query="latest
+stable")` — le terme neutre demandé — puis affinent avec la valeur
+RÉELLEMENT trouvée (3.14), jamais une valeur supposée a priori. Mécanisme
+validé de bout en bout : décision de vérifier (1er correctif) + requête
+non biaisée (2e correctif) résolvent ensemble la cause complète du
+biais T11.
+
+Aucune campagne complète relancée dans ce tour — en attente de
+l'utilisateur pour la re-mesure complète des 4 juges du chantier latence
+avec l'ensemble des correctifs (premier hop + conscience temporelle +
+biais de requête).
+
+## Checkpoint final (33 runs, ~36,5 min) : meilleur score du chantier
+
+| Juge | Cible | Résultat |
+|---|---|---|
+| Score | ≥ 29/33 | ❌ **26/33** (meilleur score du chantier — 22, 24, puis 26) |
+| Latence médiane | ≤ 60s | ✅ **46,2s** |
+| Couverture des constats | ≥ 95% | ❌ 93,8% (212/226, plateau persistant sous le seuil) |
+| Prefill total | en baisse vs 1323,5s référence | ✅ **889,8s** (-32,8%) |
+| Échecs classés infra | 0 | ❌ 1 (T9 rep1, blocage externe déjà documenté `t9_blocked`, pas une régression) |
+
+**T11 : 3/3** — confirmé sur campagne complète, pas seulement en smoke : le
+correctif conscience temporelle (décision de vérifier + requête non
+biaisée) tient. **T1** reste 0/3 (requête numérique, causes déjà connues,
+non traité comme convenu). **T7** 1/3 (fabrication + 1 nouvelle
+hallucination). **T9** 2/3 (1 blocage externe, pré-existant). **T10** 2/3
+(1 échec d'extraction, nouveau sur cette campagne — pas encore
+investigué, à surveiller si récurrent).
+
+**Bilan du chantier latence dans son ensemble** : progression nette et
+régulière sur les campagnes de checkpoint successives (22/33 -> 24/33 ->
+26/33), latence et prefill tenus à chaque fois, T11 définitivement résolu.
+Score et couverture restent sous les seuils fixés en début de chantier,
+mais pour des causes toutes identifiées, distinctes du mécanisme de
+constat/latence lui-même (T1 stratégie de recherche, T7 fabrication
+résiduelle, T9 blocage externe, T10 à investiguer). Aucun nouveau
+correctif engagé — rapporté à l'utilisateur pour arbitrage sur la suite
+(clore ce chantier latence ici, ou poursuivre sur T1/T7/T10).
+
+## Investigation T10 (archives, avant clôture du chantier latence)
+
+Inspection des 3 threads T10 de la campagne de checkpoint final : cause
+DIFFÉRENTE de T1/T7/T9, et pas une régression de ce chantier. Le modèle
+navigue correctement vers books.toscrape.com puis doit rejoindre la
+catégorie « Science » (accessible uniquement par clic sur un lien du menu
+latéral — l'URL de catégorie n'est pas devinable de façon stable,
+`science_18` puis `science_22` selon les essais, bloquée à raison par le
+garde-fou anti-fabrication). Le vrai problème apparaît APRÈS un clic
+réussi : `browser_snapshot` renvoie parfois encore le contenu de
+l'ANCIENNE page alors que l'URL et la capture d'écran confirment déjà le
+changement (« Le snapshot semble être désynchronisé... la capture d'écran
+montre clairement [Science] » observé dans l'audit) — désynchronisation
+snapshot/URL après navigation sur une page à rendu client. Le modèle perd
+alors plusieurs tours à déterminer où il se trouve réellement : 2 threads
+sur 3 s'en sortent via `browser_evaluate`/`browser_run_code_unsafe`
+(contournement direct du DOM) ; le 3e (celui qui échoue) épuise son
+budget d'itérations en pleine confusion, avant même d'avoir vu la liste
+des livres.
+
+**Consigné comme backlog séparé, pas traité ici** : candidat = un délai
+d'attente de stabilisation (`browser_wait_for` ou équivalent) après
+navigation/clic, avant tout `browser_snapshot`, sur les pages à rendu
+client. Fréquence faible (1/3), workaround déjà trouvé spontanément par
+le modèle dans 2 cas sur 3 — pas urgent.
+
+**Chantier latence clos ici**, comme recommandé et validé par
+l'utilisateur : ses propres juges sont atteints (latence, prefill, T11
+résolu) ; ce qui reste (T1, T7, T9, T10) forme un backlog de causes
+distinctes et sans effet de levier partagé, à traiter séparément.
