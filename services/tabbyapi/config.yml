@@ -30,6 +30,18 @@
 # répartit automatiquement) pour disposer d'assez de VRAM cumulée. 32768
 # reprend la valeur qui a fait ses preuves côté llama-server, à affiner
 # encore si besoin selon la marge VRAM réelle constatée.
+#
+# cache_size relevé à 49152 (correctif "chasse au cache=0", voir
+# HISTORY.md) : diagnostiqué en archives (journal TabbyAPI de la campagne
+# 1/2-ter) que cache_size == max_seq_len ne laisse quasiment aucune marge
+# pour qu'une requête planner_llm (courte, jamais liée aux outils,
+# intercalée entre deux tours de la boucle principale) coexiste dans le
+# pool de cache SANS évincer les pages de la boucle principale (contexte
+# ~20k tokens) — 13/16 des gros cache=0 observés suivaient IMMÉDIATEMENT
+# une requête à petit contexte. Marge VRAM vérifiée avant ce changement
+# (~822 Mio de plus sur la Blackwell à cache_size=8192 par tranche de
+# 8192 tokens Q6, extrapolé) ; à revalider par un rechargement réel si le
+# modèle change.
 
 network:
   host: 0.0.0.0
@@ -41,7 +53,7 @@ model:
   model_name: agent-llm
   backend: exllamav3
   max_seq_len: 32768
-  cache_size: 32768
+  cache_size: 49152
   cache_mode: Q6
   vision: true
   tool_format: qwen3_coder

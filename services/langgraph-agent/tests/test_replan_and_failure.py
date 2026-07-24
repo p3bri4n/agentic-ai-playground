@@ -49,19 +49,34 @@ def test_route_after_verification_continue_when_no_failed_subtask():
     assert g.route_after_verification(state) == "end"
 
 
-def test_route_after_verification_replan_under_budget():
+def test_route_after_tool_execution_replan_under_budget():
+    """Correctif latence 1/2-bis (voir HISTORY.md) : le dispatch
+    replan/give_up sur sous-tâche "echoue" a été déplacé de
+    route_after_verification vers route_after_tool_execution (tourne APRÈS
+    exécution des tool_calls, pour que report_and_act ait toujours son
+    ToolMessage de reçu avant qu'on quitte cette branche du graphe)."""
     import app.graph as g
+    from langchain_core.messages import AIMessage
 
-    state = {"plan": [_subtask(status="echoue")], "replan_count": 0}
-    assert g.route_after_verification(state) == "replan"
+    state = {
+        "plan": [_subtask(status="echoue")],
+        "replan_count": 0,
+        "messages": [AIMessage(content="", tool_calls=[{"id": "r1", "name": "report_and_act", "args": {}}])],
+    }
+    assert g.route_after_tool_execution(state) == "replan"
 
 
-def test_route_after_verification_give_up_when_budget_exhausted(monkeypatch):
+def test_route_after_tool_execution_give_up_when_budget_exhausted(monkeypatch):
     import app.graph as g
+    from langchain_core.messages import AIMessage
 
     monkeypatch.setattr(g, "REPLAN_BUDGET", 2)
-    state = {"plan": [_subtask(status="echoue")], "replan_count": 2}
-    assert g.route_after_verification(state) == "give_up"
+    state = {
+        "plan": [_subtask(status="echoue")],
+        "replan_count": 2,
+        "messages": [AIMessage(content="", tool_calls=[{"id": "r1", "name": "report_and_act", "args": {}}])],
+    }
+    assert g.route_after_tool_execution(state) == "give_up"
 
 
 def test_route_after_verification_continue_with_empty_plan():

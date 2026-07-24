@@ -437,7 +437,52 @@ async def test_tool_schema_from_mcp_client_is_bound_to_llm(mock_side_services):
     await g.agent_graph.ainvoke(state, CONFIG)
 
     sent_body = json.loads(llm_route.calls.last.request.content)
+    # VERIFICATION_ENABLED désactivé par défaut (voir _get_bound_llm,
+    # correctif latence 1/2-ter) : le schéma n'est ni augmenté de
+    # constat_precedent ni complété de report_and_act — comportement
+    # inchangé par rapport à avant tout correctif de latence.
     assert sent_body["tools"] == tool_schema
+
+
+@pytest.mark.asyncio
+async def test_tool_schema_augmented_with_constat_when_verification_enabled(mock_side_services, monkeypatch):
+    """Correctif latence 1/2-ter (voir HISTORY.md) : quand VERIFICATION_ENABLED
+    est actif, chaque outil MCP réel reçoit constat_precedent en paramètre
+    requis (_inject_constat_param), et report_and_act est ajouté comme seul
+    outil de repli (tour sans action réelle)."""
+    import app.graph as g
+
+    monkeypatch.setattr(g, "VERIFICATION_ENABLED", True)
+
+    tool_schema = [
+        {
+            "type": "function",
+            "function": {
+                "name": "run_command",
+                "description": "Exécute une commande shell.",
+                "parameters": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]},
+            },
+        }
+    ]
+    mock_side_services.get("http://fake-mcp-client/tools/schema").mock(
+        return_value=httpx.Response(200, json={"tools": tool_schema})
+    )
+    llm_route = mock_side_services.post("http://fake-vllm/v1/chat/completions").mock(
+        return_value=_sse_response(text_response(["OK"]))
+    )
+    g.agent_graph = g.build_graph()
+
+    state = {"messages": [{"role": "user", "content": "Salut"}], "tool_iterations": 0, "approved": None}
+    await g.agent_graph.ainvoke(state, CONFIG)
+
+    sent_body = json.loads(llm_route.calls.last.request.content)
+    sent_tools = sent_body["tools"]
+    assert len(sent_tools) == 2
+    run_command = next(t for t in sent_tools if t["function"]["name"] == "run_command")
+    assert "constat_precedent" in run_command["function"]["parameters"]["properties"]
+    assert "constat_precedent" in run_command["function"]["parameters"]["required"]
+    assert "command" in run_command["function"]["parameters"]["required"]
+    assert any(t["function"]["name"] == "report_and_act" for t in sent_tools)
 
 
 @pytest.mark.asyncio

@@ -184,3 +184,17 @@ politique de tiers web, limites connues et assumées). 🧑 **Checkpoint final.*
 - Authentification de l'agent sur des comptes réels, paiements, captchas.
 - Multi-agent / sous-agents parallèles.
 - Toute tâche nécessitant plus que le périmètre navigateur + GhostDesk actuel.
+
+## Chantier d'architecture différé : dossier Mjolnir (second modèle)
+
+Consigné post-checkpoint « correctif latence 2/2 » (voir HISTORY.md) :
+l'isolation du cache/contexte des appels auxiliaires (`planner_llm` —
+plan_task/revise_plan/replan_task/_judge_plan) vis-à-vis de la boucle
+principale a été diagnostiquée comme cause probable d'une partie du
+cache=0 résiduel côté TabbyAPI (alternance de forme de requête évinçant
+le cache de préfixe partagé) — non résolue par une simple augmentation de
+`cache_size` (voir HISTORY.md, chasse au cache=0). Rejoint le dossier
+Mjolnir, où un second modèle a déjà un rôle prévu (critique/compaction) :
+**trois usages candidats pour une décision d'architecture unique**
+(critique, compaction, isolation planner/cache), à instruire avec les
+chiffres du checkpoint plutôt que traité isolément ici.

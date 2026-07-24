@@ -323,6 +323,56 @@ suppression) pour exercer le pipeline de validation en conditions réelles.
 Nouveau point zéro assumé, comparaisons v1/v2 interdites. Détail dans
 `docs/briefs/phase-1-coeur-cognitif.md`.
 
+### Constat post-action : historique et mécanisme actuel
+
+Trois versions successives (voir HISTORY.md, « correctif latence 1/2 »
+puis « 1/2-bis » puis « 1/2-ter ») avant la version actuelle : un appel
+LLM séparé (`verify_action`, coûteux) -> un marqueur texte
+`[CONSTAT: ...]` dans la réponse du tour suivant (trop fragile, souvent
+omis) -> un tool call dédié obligatoire `report_and_act` (fiabilité réelle
+mesurée ~9%, le modèle ne coordonnait pas deux tool_calls dans le même
+tour) -> **mécanisme actuel, fusionné** : `constat_precedent`
+(`atteint`/`non_atteint`/`sans_objet`) est un paramètre REQUIS du schéma de
+CHAQUE outil réel (`_inject_constat_param`, `app/graph.py`, gated sur
+`VERIFICATION_ENABLED`) — un seul tool call porte à la fois l'action et
+son constat. `report_and_act` reste l'outil de repli pour le seul cas
+sans action réelle (réponse en texte pur). Dégradation INVERSÉE
+(constat absent/mal formé -> `sans_objet`, budget de tentatives inchangé,
+compté dans `constats_inexploitables` plutôt que facturé comme un échec)
+et juge de COUVERTURE permanent (`verification_opportunities`/
+`verification_exploitable`, journal d'audit `role="verification"`) —
+compromis latence observé : ce schéma augmenté sur ~64 outils à chaque
+tour a un coût de prompt mesurable (voir HISTORY.md pour le détail
+chiffré), chantier encore ouvert.
+
+### Outillage de campagne (`scripts/run-campaign.sh`)
+
+Lance le harnais de bout en bout, zéro intervention entre le lancement et
+le rapport : estimation de durée (médiane courante par tâche x tâches x
+répétitions, voir `CAMPAIGN_DURATION_STATS.json`) -> préambule
+(`campaign_preflight.run_preflight` : readiness LLM réelle — un appel de
+complétion, pas un simple `/health` — PUIS schéma d'outils agent/mcp-client
+synchronisés) -> campagne -> rapport écrit -> notification de fin (fichier
+`.DONE` toujours ; `ntfy`/mail en plus si `NTFY_TOPIC`/`MAIL_TO` sont
+définis).
+
+```
+scripts/run-campaign.sh                      # campagne complète (11 tâches x 3)
+scripts/run-campaign.sh --tasks T1,T7,T11    # smoke ciblé, itération rapide
+scripts/run-campaign.sh --tasks T7 --reps 1  # smoke minimal
+```
+
+**Protocole** : le mode smoke (`--tasks`) sert à ITÉRER vite sur un
+correctif — n réduit, pas de signification statistique pour arbitrer un
+seuil de passage/régression. Seule la campagne complète (3 répétitions,
+11 tâches) compte comme mesure de référence pour un checkpoint. Trouvé en
+conditions réelles (voir HISTORY.md, « outillage de campagne ») : la
+readiness LLM a mordu une fois — `docker compose up --build` avait recréé
+TabbyAPI en même temps qu'une campagne démarrait, qui a alors tourné
+~20s trop tôt contre un serveur pas encore à l'écoute (30 échecs quasi
+instantanés, aucune assertion pour le signaler) — d'où sa vérification
+systématique en tête de préambule désormais.
+
 ## OCR d'appoint (`services/ocr-service`)
 
 **Pourquoi** : le VLM servi par défaut (Qwen3.6 MoE) raisonne bien mais

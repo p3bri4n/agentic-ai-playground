@@ -31,12 +31,28 @@ référencé dans app/graph.py, via le garde-fou de fabrication d'URL).
 
 import json
 import subprocess
+import time
 from typing import Callable, Iterable, Optional
 
 import app.approval_policy as policy
 
 AGENT_CONTAINER = "langgraph-agent"
 MCP_CLIENT_CONTAINER = "mcp-client"
+TABBYAPI_CONTAINER = "tabbyapi"
+TABBYAPI_IMAGE_TAG = "agentic-ai-playground-tabbyapi"
+
+# Readiness LLM (outillage de campagne, voir HISTORY.md) : trouvé en
+# conditions réelles — un `docker compose up --build langgraph-agent` a
+# aussi recréé tabbyapi (dérive de config détectée) ; la campagne a démarré
+# ~20s après "Model successfully loaded" mais AVANT que le serveur HTTP
+# n'écoute réellement, produisant 30 échecs quasi instantanés
+# (openai.APIConnectionError, capturé comme notice d'erreur interne) avant
+# qu'aucune assertion n'ait pu révéler le problème. Le préambule
+# précédent (check_tools_schema) ne vérifiait QUE le schéma d'outils via
+# mcp-client, jamais que le backend LLM répond réellement à une
+# complétion — angle mort désormais couvert par wait_for_llm_ready.
+LLM_READY_TIMEOUT_SECONDS = 180
+LLM_READY_POLL_INTERVAL_SECONDS = 5
 
 EXPECTED_TOOLS = policy.TIER_READ_TOOLS | policy.TIER_REVERSIBLE_TOOLS | policy.NEVER_GRANTABLE_TOOLS | {
     "browser_navigate"
@@ -102,12 +118,111 @@ print(json.dumps(sorted({t["function"]["name"] for t in body.get("tools", [])}))
     return json.loads(_docker_exec_python(MCP_CLIENT_CONTAINER, script))
 
 
+def _fetch_llm_ready() -> bool:
+    """
+    Appel de complétion RÉEL (pas un /health) contre LLM_BASE_URL tel que vu
+    par langgraph-agent lui-même (portable au backend alternatif
+    llama-server, voir README « Backend d'inférence » — pas seulement
+    TabbyAPI) : c'est la seule vérification qui aurait détecté le cas
+    trouvé en conditions réelles (serveur pas encore à l'écoute malgré un
+    modèle déjà chargé). enable_thinking=False + max_tokens=1 : le plus
+    rapide possible, on ne veut qu'un finish_reason, pas une vraie réponse.
+    """
+    script = """
+import json, os, urllib.request, urllib.error
+base = os.environ.get('LLM_BASE_URL', 'http://tabbyapi:5000/v1').rstrip('/')
+req = urllib.request.Request(
+    base + '/chat/completions',
+    data=json.dumps({
+        'model': 'agent-llm',
+        'messages': [{'role': 'user', 'content': 'ping'}],
+        'max_tokens': 1,
+        'enable_thinking': False,
+    }).encode(),
+    headers={'Content-Type': 'application/json'},
+)
+try:
+    with urllib.request.urlopen(req, timeout=10) as r:
+        print(r.status)
+except Exception as e:
+    print('ERROR', repr(e))
+"""
+    out = _docker_exec_python(AGENT_CONTAINER, script, timeout=15)
+    return out.strip() == "200"
+
+
+def _run_docker(args: list, timeout: int = 15) -> str:
+    result = subprocess.run(["docker", *args], capture_output=True, text=True, timeout=timeout)
+    if result.returncode != 0:
+        raise PreflightError(f"`docker {' '.join(args)}` a échoué (préambule) : {result.stderr.strip()}")
+    return result.stdout.strip()
+
+
+def _fetch_tabbyapi_image_ids() -> tuple:
+    """(id de l'image RÉELLEMENT utilisée par le conteneur tabbyapi qui
+    tourne, id de la dernière image construite localement pour ce tag) —
+    voir check_tabbyapi_image_fresh."""
+    running = _run_docker(["inspect", "--format", "{{.Image}}", TABBYAPI_CONTAINER])
+    built = _run_docker(["image", "inspect", "--format", "{{.Id}}", TABBYAPI_IMAGE_TAG])
+    return running, built
+
+
+def check_tabbyapi_image_fresh(fetch_image_ids: Callable[[], tuple] = _fetch_tabbyapi_image_ids) -> Optional[str]:
+    """
+    Vérification du digest d'image (arbitrage post-1/2-ter, voir
+    HISTORY.md, action 1) : détecte un conteneur tabbyapi qui tournerait
+    sur une image DIFFÉRENTE de la dernière construite localement pour ce
+    tag — ex. `docker compose build` exécuté sans le `up -d` qui applique
+    le changement, ou un rollback d'image manuel oublié. Un tel écart
+    laisserait tourner une campagne entière contre un modèle/une version
+    différente de celle attendue, silencieusement (aucune erreur, juste un
+    comportement différent) — même classe de risque que la désynchronisation
+    de schéma d'outils que check_tools_schema détecte déjà côté
+    langgraph-agent/mcp-client. Pure une fois fetch_image_ids injecté (voir
+    tests/test_campaign_preflight.py) : aucun docker réel dans les tests.
+    """
+    running_id, built_id = fetch_image_ids()
+    if running_id != built_id:
+        return (
+            f"le conteneur {TABBYAPI_CONTAINER} tourne sur une image différente de la dernière "
+            f"construite pour {TABBYAPI_IMAGE_TAG} (running={running_id}, built={built_id}) — "
+            "commande à taper : docker compose up -d --build tabbyapi"
+        )
+    return None
+
+
+def wait_for_llm_ready(
+    fetch_llm_ready: Callable[[], bool] = _fetch_llm_ready,
+    *,
+    timeout_seconds: int = LLM_READY_TIMEOUT_SECONDS,
+    interval_seconds: int = LLM_READY_POLL_INTERVAL_SECONDS,
+    sleep: Callable[[float], None] = time.sleep,
+    now: Callable[[], float] = time.monotonic,
+) -> None:
+    """
+    Interroge fetch_llm_ready jusqu'à succès ou expiration — voir
+    LLM_READY_TIMEOUT_SECONDS plus haut pour la raison d'être. `sleep`/`now`
+    injectables pour un test unitaire rapide (voir
+    tests/test_campaign_preflight.py), sans vrai délai ni docker.
+    """
+    deadline = now() + timeout_seconds
+    while not fetch_llm_ready():
+        if now() >= deadline:
+            raise PreflightError(
+                f"LLM_BASE_URL ne répond pas à une complétion réelle après {timeout_seconds}s "
+                "— vérifier `docker logs tabbyapi` (serveur pas encore démarré, ou crash au chargement)"
+            )
+        sleep(interval_seconds)
+
+
 def run_preflight(
     *,
     purge_downloads: Callable[[], None],
     reset_browser_session: Callable[[], None],
     fetch_agent_tools: Callable[[], Iterable[str]] = _fetch_agent_tools,
     fetch_mcp_tools: Callable[[], Iterable[str]] = _fetch_mcp_tools,
+    fetch_llm_ready: Callable[[], bool] = _fetch_llm_ready,
+    fetch_tabbyapi_image_ids: Callable[[], tuple] = _fetch_tabbyapi_image_ids,
 ) -> None:
     """
     Appelé UNE fois par campagne (pas par répétition, contrairement à
@@ -119,7 +234,16 @@ def run_preflight(
     plutôt que des défauts internes pour ne jamais dupliquer leur
     implémentation (déjà dans test_web_tasks.py, avec leurs propres raisons
     d'être documentées).
+
+    Ordre : readiness LLM D'ABORD (le moins cher à constater EN ERREUR —
+    inutile de comparer des schémas d'outils si le backend ne répond même
+    pas), puis fraîcheur d'image tabbyapi (arbitrage post-1/2-ter, voir
+    HISTORY.md), puis schéma d'outils, puis purge/reset.
     """
+    wait_for_llm_ready(fetch_llm_ready)
+    error = check_tabbyapi_image_fresh(fetch_tabbyapi_image_ids)
+    if error:
+        raise PreflightError(error)
     error = check_tools_schema(fetch_agent_tools(), fetch_mcp_tools())
     if error:
         raise PreflightError(error)

@@ -324,6 +324,7 @@ async def _resolve_run(request: ChatCompletionRequest):
         "plan_grant_session": False,
         "plan_grant": False,
         "pending_verification": False,
+        "constats_inexploitables": 0,
     }
     return config, run_input
 

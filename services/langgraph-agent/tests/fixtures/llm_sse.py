@@ -72,6 +72,33 @@ def content_and_tool_call_response(content_text, tool_name, tool_call_id, argume
     )
 
 
+def content_and_multi_tool_call_response(content_text, tool_calls):
+    """
+    Généralisation de content_and_tool_call_response à PLUSIEURS tool_calls
+    dans le même tour (correctif latence 1/2-bis, voir HISTORY.md) : le
+    constat vit désormais dans un tool call dédié obligatoire
+    (report_and_act) plutôt qu'un marqueur texte, ce qui oblige à simuler au
+    moins deux tool_calls (report_and_act + l'action réelle) dans la même
+    réponse streamée. tool_calls : liste de (tool_name, tool_call_id,
+    arguments_json).
+    """
+    header = {
+        "tool_calls": [
+            {"index": i, "id": tc_id, "type": "function", "function": {"name": name, "arguments": ""}}
+            for i, (name, tc_id, _args) in enumerate(tool_calls)
+        ],
+    }
+    arg_deltas = [
+        ({"tool_calls": [{"index": i, "function": {"arguments": args}}]}, None)
+        for i, (_name, _tc_id, args) in enumerate(tool_calls)
+    ]
+    return sse_body(
+        [({"role": "assistant", "content": content_text}, None), (header, None)]
+        + arg_deltas
+        + [({}, "tool_calls")]
+    )
+
+
 def multi_tool_call_response(tool_calls):
     """
     Simule un tour où le modèle demande PLUSIEURS outils d'un coup.

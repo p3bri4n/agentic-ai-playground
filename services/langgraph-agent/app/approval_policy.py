@@ -147,10 +147,26 @@ TIER_REVERSIBLE_TOOLS = _load_tier_override("TIER_REVERSIBLE_TOOLS", _DEFAULT_TI
 AUTO_APPROVED_TOOLS = set(filter(None, os.environ.get("AUTO_APPROVED_TOOLS", "").split(",")))
 
 
+
+# Meta-outil local (correctif latence 1/2-bis, app/graph.py :
+# _REPORT_AND_ACT_TOOL) : jamais servi par mcp-client, donc volontairement
+# PAS ajouté à _DEFAULT_TIER_READ/TIER_READ_TOOLS — ces ensembles alimentent
+# aussi EXPECTED_TOOLS (tests_integration/campaign_preflight.py), comparé
+# terme à terme au schéma RÉEL de mcp-client ; l'y ajouter ferait échouer le
+# préambule de campagne (outil "attendu" qui n'apparaîtra jamais dans ce
+# schéma). Classé directement ici à la place, en lecture pure (aucun effet
+# de bord, jamais TIER_SENSITIVE) sans quoi has_tool_calls() (app/graph.py)
+# soumettrait à tort CHAQUE tour vérifié à une approbation humaine (défaut
+# TIER_SENSITIVE de tool_tier() pour tout nom inconnu).
+REPORT_AND_ACT_TOOL_NAME = "report_and_act"
+
+
 def tool_tier(tool_name: str) -> str:
     """Tier statique d'un outil, sans tenir compte des grants de session
     (Phase 3) ni des règles sur arguments (Phase 4) — voir effective_tier()
     pour la résolution complète. Défaut = TIER_SENSITIVE."""
+    if tool_name == REPORT_AND_ACT_TOOL_NAME:
+        return TIER_READ
     if tool_name in TIER_READ_TOOLS:
         return TIER_READ
     if tool_name in TIER_REVERSIBLE_TOOLS or tool_name in AUTO_APPROVED_TOOLS:

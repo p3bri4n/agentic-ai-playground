@@ -11,6 +11,17 @@ exécutées + liens vus dans un résultat d'outil browser_* précédent) avant
 d'appeler mcp-client — une URL jamais observée est refusée SANS exécution,
 avec un feedback d'outil explicite, et comptée dans
 `fabricated_navigation_attempts`.
+
+Correctif "premier hop" (chantier fiabilité session navigateur, voir
+HISTORY.md) : la toute PREMIÈRE navigation d'une tâche (aucune URL encore
+observée, `has_prior_navigation` faux dans `app/graph.py`) est désormais
+TOUJOURS autorisée, même sans URL dans le prompt — root cause trouvée sur
+des tâches réelles sans URL donnée (T8 "sur Wikipédia...", T11 "quelle est
+la dernière version de Python ?") dont la première navigation, pourtant
+légitime, était bloquée comme fabrication. La fabrication réellement
+observée (T1/T7) survient toujours APRÈS une exploration déjà entamée,
+jamais comme premier geste : le garde-fou reste pleinement actif à partir
+de la DEUXIÈME navigation, qu'une URL ait été donnée ou non.
 """
 
 import httpx
@@ -43,9 +54,45 @@ def mock_side_services():
 
 
 @pytest.mark.asyncio
-async def test_fabricated_url_blocked_without_calling_mcp(mock_side_services):
-    """Aucune URL mentionnée dans la tâche : browser_navigate vers une URL
-    jamais observée doit être refusé, même après approbation humaine."""
+async def test_first_navigate_without_task_url_is_allowed(mock_side_services):
+    """Correctif "premier hop" (voir HISTORY.md) : une tâche réelle sans URL
+    dans le prompt (ex. T8/T11) ne doit plus voir sa PREMIÈRE navigation
+    bloquée comme fabrication — rien n'a encore été observé, il n'y a pas
+    de fabrication possible sur un tout premier choix de départ."""
+    import app.graph as g
+
+    route = mock_side_services.post("http://fake-vllm/v1/chat/completions")
+    route.side_effect = [
+        _sse_response(tool_call_response("browser_navigate", "call_1", '{"url": "https://www.python.org/downloads/"}')),
+        _sse_response(text_response(["Réponse", " finale."])),
+    ]
+    mcp_route = mock_side_services.post("http://fake-mcp-client/call").mock(
+        return_value=httpx.Response(
+            200, json={"content": [{"type": "text", "text": "Page URL: https://www.python.org/downloads/"}]}
+        )
+    )
+    g.agent_graph = g.build_graph()
+
+    state = {
+        "messages": [{"role": "user", "content": "Quelle est la dernière version stable de Python ?"}],
+        "tool_iterations": 0,
+        "approved": None,
+    }
+    await g.agent_graph.ainvoke(state, CONFIG)
+    await g.agent_graph.aupdate_state(CONFIG, {"approved": True})
+    result = await g.agent_graph.ainvoke(None, CONFIG)
+
+    assert mcp_route.call_count == 1
+    assert result["fabricated_navigation_attempts"] == 0
+
+
+@pytest.mark.asyncio
+async def test_second_fabricated_url_still_blocked_without_calling_mcp(mock_side_services):
+    """Une fois qu'AU MOINS une navigation a déjà eu lieu (observed_urls non
+    vide au départ, simulée ici), une URL suivante jamais observée reste
+    refusée SANS exécution — la protection principale (fabrication en
+    cours d'exploration, T1/T7) reste pleinement intacte après le correctif
+    "premier hop"."""
     import app.graph as g
 
     route = mock_side_services.post("http://fake-vllm/v1/chat/completions")
@@ -58,7 +105,12 @@ async def test_fabricated_url_blocked_without_calling_mcp(mock_side_services):
     )
     g.agent_graph = g.build_graph()
 
-    state = {"messages": [{"role": "user", "content": "Fais une recherche."}], "tool_iterations": 0, "approved": None}
+    state = {
+        "messages": [{"role": "user", "content": "Fais une recherche."}],
+        "tool_iterations": 0,
+        "approved": None,
+        "observed_urls": ["http://exemple.com/deja-observee.html"],
+    }
     await g.agent_graph.ainvoke(state, CONFIG)
     await g.agent_graph.aupdate_state(CONFIG, {"approved": True})
     result = await g.agent_graph.ainvoke(None, CONFIG)
@@ -275,8 +327,12 @@ def test_fabrication_feedback_at_limit_always_concludes_absence():
 @pytest.mark.asyncio
 async def test_fabrication_attempt_number_wired_from_state_counter(mock_side_services):
     """Vérifie le câblage bout en bout (pas juste _fabrication_feedback en
-    isolation) : le 1er rejet de la tâche doit recevoir le message tier 1
-    (minimal), cohérent avec fabricated_navigation_attempts=0 au départ."""
+    isolation) : le 1er REJET de la tâche doit recevoir le message tier 1
+    (minimal), cohérent avec fabricated_navigation_attempts=0 au départ.
+    Simule une navigation déjà effectuée (observed_urls non vide, voir
+    correctif "premier hop") pour que CETTE navigation-ci soit bien la
+    première à être évaluée par le garde-fou, pas la toute première de la
+    tâche (désormais toujours autorisée)."""
     import app.graph as g
 
     route = mock_side_services.post("http://fake-vllm/v1/chat/completions")
@@ -289,7 +345,12 @@ async def test_fabrication_attempt_number_wired_from_state_counter(mock_side_ser
     )
     g.agent_graph = g.build_graph()
 
-    state = {"messages": [{"role": "user", "content": "Trouve un prix."}], "tool_iterations": 0, "approved": None}
+    state = {
+        "messages": [{"role": "user", "content": "Trouve un prix."}],
+        "tool_iterations": 0,
+        "approved": None,
+        "observed_urls": ["http://exemple.com/deja-observee.html"],
+    }
     await g.agent_graph.ainvoke(state, CONFIG)
     await g.agent_graph.aupdate_state(CONFIG, {"approved": True})
     result = await g.agent_graph.ainvoke(None, CONFIG)

@@ -643,25 +643,137 @@ def has_visible_answer(content: str) -> bool:
 # vérification post-action ne vient plus d'un appel LLM séparé
 # (planner_llm.ainvoke, ~coût d'un tour entier) mais du raisonnement du
 # TOUR SUIVANT lui-même (call_llm) — voir _verification_directive et
-# verify_action plus bas. Marqueur structuré simple, cherché hors balise
-# <think> (même pipeline que has_visible_answer).
-_VERIFICATION_MARKER_RE = re.compile(r"\[CONSTAT:\s*(ATTEINT|ECHEC)\]", re.IGNORECASE)
+# verify_action plus bas.
+#
+# Correctif latence 1/2-bis (voir HISTORY.md) : le marqueur texte
+# [CONSTAT: ATTEINT|ECHEC] (recherché par regex hors balise <think>) s'est
+# révélé trop fragile en campagne réelle — le modèle l'omettait parfois,
+# et la dégradation conservative de l'ancien mécanisme (marqueur absent ->
+# traité comme un échec) consommait alors à tort le budget de tentatives
+# d'une action peut-être réussie, cassant le score (18/33). Remplacé par un
+# tool call OBLIGATOIRE dédié (report_and_act, en plus de l'action normale
+# du tour). Vérifié EN DIRECT contre TabbyAPI/ExLlamaV3 avant ce choix
+# (voir HISTORY.md) : la génération contrainte par schéma JSON
+# (response_format) existe bien côté serveur mais est implémentée avec
+# eos_after_completed=True (backends/exllamav3/grammar.py de l'image
+# installée) — elle termine la génération dès que le JSON clôture,
+# empêchant tout tool_calls/texte supplémentaire dans le MÊME tour.
+# Confirmé par un appel réel : réponse strictement `{"constat": "atteint"}`,
+# `tool_calls: null`. Incompatible avec le besoin -> repli sur le tool call.
+#
+# Correctif latence 1/2-ter (voir HISTORY.md) : mesuré sur la campagne
+# post-1/2-bis (26/33, sous le seuil), le taux de couverture réel de
+# report_and_act n'était qu'~9% des tours d'outil (349 constats
+# inexploitables sur 422 tours assistant) — le modèle traitait le "en plus
+# de ton action normale" comme optionnel, PAS comme un second appel
+# obligatoire à coordonner dans le même tour. Le budget d'échec
+# (SUBTASK_ATTEMPT_BUDGET) était donc de facto désactivé sur la quasi
+# totalité des tours (dégradation inversée -> sans_objet -> jamais décompté
+# du budget), expliquant la réapparition des boucles de fabrication d'URL
+# (T1/T7, 0/3) : la protection existait sur le papier, jamais en pratique.
+# FUSION au lieu de coordination (ne plus dépendre du modèle pour émettre
+# DEUX tool_calls dans le même tour) : constat_precedent devient un
+# paramètre REQUIS du schéma de CHAQUE outil réel (_inject_constat_param,
+# appliqué dans _get_bound_llm) — un seul appel d'outil porte à la fois
+# l'action ET son constat sur l'action précédente, pattern natif à un seul
+# tool call. report_and_act reste l'outil de repli pour le seul cas où
+# aucune action réelle n'est décidée ce tour-ci (réponse finale en texte
+# pur, rien sur quoi accrocher constat_precedent) — sa description explique
+# ce cas précis, plus "en plus de ton action normale".
+#
+# À noter : ce backend n'applique par ailleurs AUCUNE contrainte de
+# grammaire sur les tool_calls eux-mêmes (aucun filtre ajouté pour
+# `tools`/`tool_choice`, y compris tool_choice="required", lu dans
+# endpoints/OAI/utils/chat_completion.py de l'image installée) — "requis"
+# dans le schéma JSON n'est donc PAS grammaticalement imposé ; la fiabilité
+# gagnée vient de la fusion en un seul appel (plus rien à coordonner), pas
+# d'une garantie de grammaire côté serveur. D'où le nouveau juge permanent
+# de couverture (voir verify_action) : à mesurer, pas à supposer acquis.
+_CONSTAT_PARAM_NAME = "constat_precedent"
+_CONSTAT_VERDICTS = ("atteint", "non_atteint", "sans_objet")
+# Dégraissé (correctif "arbitrage post-1/2-ter", voir HISTORY.md) : enum
+# nu, sans description — mesuré à +6 931 tokens/tour (+65%) avec la
+# description répétée sur les 64 outils réels vs +2 569 tokens (+24%)
+# sans elle (tokenizer réel de TabbyAPI, /v1/token/encode). La sémantique
+# n'a besoin d'être expliquée qu'UNE fois : elle vit dans
+# _verification_directive (injectée dans le system prompt à chaque tour,
+# une seule copie), pas dans le schéma de CHAQUE outil. Protégé par le
+# juge de couverture (verify_action/constats_inexploitables) : si ce
+# dégraissage fait chuter la couverture réelle sous 95%, la description
+# revient.
+_CONSTAT_PARAM_SCHEMA = {
+    "type": "string",
+    "enum": list(_CONSTAT_VERDICTS),
+}
 
 
-def _parse_verification_marker(content: str) -> Optional[bool]:
+def _inject_constat_param(tool: dict) -> dict:
     """
-    None si le marqueur est absent/mal formé (le modèle n'a pas respecté la
-    consigne) — traité comme "non atteint" par l'appelant (verify_action),
-    même philosophie de dégradation conservative que l'ancien mécanisme LLM
-    (ne jamais bloquer, mais ne jamais accorder un succès implicite).
+    Augmente le schéma OpenAI function-calling d'un outil MCP réel avec le
+    paramètre requis constat_precedent (voir plus haut) — copie, ne mute
+    jamais le schéma d'origine (partagé via _tools_schema_cache). Retiré
+    des arguments AVANT tout dispatch réel (voir _execute_tool_calls) : les
+    serveurs MCP eux-mêmes ne le connaissent pas.
     """
-    if not content:
-        return None
-    text = _THINK_BLOCK_RE.sub("", content)
-    match = _VERIFICATION_MARKER_RE.search(text)
-    if not match:
-        return None
-    return match.group(1).upper() == "ATTEINT"
+    fn = tool.get("function", {})
+    params = dict(fn.get("parameters") or {"type": "object", "properties": {}})
+    properties = dict(params.get("properties") or {})
+    properties[_CONSTAT_PARAM_NAME] = _CONSTAT_PARAM_SCHEMA
+    required = list(params.get("required") or [])
+    if _CONSTAT_PARAM_NAME not in required:
+        required.append(_CONSTAT_PARAM_NAME)
+    return {**tool, "function": {**fn, "parameters": {**params, "properties": properties, "required": required}}}
+
+
+# Nom partagé avec approval_policy.REPORT_AND_ACT_TOOL_NAME (source de
+# vérité pour le tiering, voir tool_tier()) — dupliqué ici en constante
+# locale plutôt que réimporté à chaque usage, uniquement pour la lisibilité
+# des nombreuses références ci-dessous ; DOIT rester identique.
+_REPORT_AND_ACT_TOOL_NAME = approval_policy.REPORT_AND_ACT_TOOL_NAME
+_REPORT_AND_ACT_TOOL = {
+    "type": "function",
+    "function": {
+        "name": _REPORT_AND_ACT_TOOL_NAME,
+        "description": (
+            "Outil de repli, à appeler UNIQUEMENT quand tu réponds en texte "
+            "pur ce tour-ci, sans appeler aucun autre outil (ex. réponse "
+            "finale) : constate si l'action PRÉCÉDENTE a atteint son "
+            "critère. Si tu appelles un AUTRE outil ce tour-ci, mets plutôt "
+            "constat_precedent directement dans SES arguments — n'appelle "
+            "jamais les deux à la fois."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {_CONSTAT_PARAM_NAME: _CONSTAT_PARAM_SCHEMA},
+            "required": [_CONSTAT_PARAM_NAME],
+        },
+    },
+}
+
+
+def _parse_constat(tool_calls: Optional[list]) -> tuple[Optional[str], bool]:
+    """
+    Cherche constat_precedent parmi les tool_calls du tour — soit sur
+    report_and_act (priorité, cas "texte pur, aucune action"), soit sur le
+    premier tool_call réel qui le porte (cas normal, fusionné). Retourne
+    (verdict, exploitable) :
+    - (None, False) si absent de tous les tool_calls, ou trouvé mais hors
+      énumération (mal formé) ;
+    - (verdict, True) sinon, verdict ∈ _CONSTAT_VERDICTS.
+    "exploitable=False" pilote le compteur constats_inexploitables et le
+    juge de couverture (verify_action) — distinct d'un "sans_objet"
+    légitimement déclaré par le modèle (exploitable=True dans ce cas).
+    """
+    report_call = next((tc for tc in tool_calls or [] if tc.get("name") == _REPORT_AND_ACT_TOOL_NAME), None)
+    if report_call is not None:
+        verdict = (report_call.get("args") or {}).get(_CONSTAT_PARAM_NAME)
+        return (verdict, True) if verdict in _CONSTAT_VERDICTS else (None, False)
+    for tc in tool_calls or []:
+        args = tc.get("args") or {}
+        if _CONSTAT_PARAM_NAME in args:
+            verdict = args.get(_CONSTAT_PARAM_NAME)
+            return (verdict, True) if verdict in _CONSTAT_VERDICTS else (None, False)
+    return None, False
 
 
 # Nœud planificateur (Itération 1, voir plan_task plus bas) : reconnaît un
@@ -1012,6 +1124,19 @@ class AgentState(TypedDict):
     # texte seul) — le marqueur explicite évite de constater une SOUS-TÂCHE
     # FRAÎCHE contre un résultat d'outil PÉRIMÉ.
     pending_verification: bool
+    # Correctif latence 1/2-bis (voir HISTORY.md, remplace le marqueur texte
+    # [CONSTAT: ...] par le tool call obligatoire report_and_act) : compteur
+    # cumulatif sur toute la tâche, incrémenté chaque fois que
+    # pending_verification était vrai mais qu'aucun report_and_act
+    # exploitable n'a pu être extrait du tour (absent, mal formé, ou
+    # arguments non conformes à l'énumération attendue). Dégradation
+    # inversée voulue : ce cas se MESURE (métrique dédiée) plutôt que de se
+    # FACTURER comme un échec de sous-tâche (voir verify_action) — l'ancien
+    # mécanisme punissait l'ambiguïté du marqueur en la comptant comme un
+    # échec, ce qui a cassé le score de la campagne précédente (18/33).
+    # Remis à 0 à chaque nouveau message utilisateur top-level (voir
+    # run_input, app/main.py), comme les autres compteurs cumulatifs.
+    constats_inexploitables: int
 
 
 # Plafond de tokens par TOUR (un seul appel LLM), pas pour la conversation
@@ -1048,25 +1173,28 @@ llm = ChatOpenAI(
 # petite valeur reste un filet de sécurité voulu contre les dérives de
 # répétition, voir LLM_MAX_TOKENS).
 PLANNER_MAX_TOKENS = int(os.environ.get("PLANNER_MAX_TOKENS", "8192"))
-# Terrain préparé pour le correctif latence 2/2 (thinking bridé sur les
-# appels auxiliaires restants — plan_task/revise_plan/replan_task/
-# _judge_plan — PAS ACTIVÉ ICI) : contrairement à `/no_think` en préfixe de
-# prompt (ADAPTIVE_THINKING, déjà confirmé sans effet sur ce backend, voir
-# commentaire ci-dessus), TabbyAPI expose un vrai paramètre PAR REQUÊTE côté
-# serveur (`GET /openapi.json`, schéma ChatCompletionRequest) :
-# `enable_thinking: bool` et `reasoning_effort: str`, transmis au template de
-# chat comme variables `enable_thinking`/`reasoning_effort`. Accessible
-# depuis ce code via `ChatOpenAI(..., extra_body={...})` ou
-# `planner_llm.bind(extra_body={"enable_thinking": False})` par appel —
-# `extra_body` est un paramètre natif de langchain-openai (vérifié :
-# `"extra_body" in inspect.signature(ChatOpenAI).parameters`). Vérifié
-# accessible, non activé — décision et mesure d'impact au correctif 2/2.
+# Correctif latence 2/2 (voir HISTORY.md) : thinking bridé sur les appels
+# auxiliaires (plan_task/revise_plan/replan_task/_judge_plan, tous via
+# planner_llm) — contrairement à `/no_think` en préfixe de prompt
+# (ADAPTIVE_THINKING, confirmé sans effet sur ce backend, voir commentaire
+# plus haut), TabbyAPI expose un vrai paramètre PAR REQUÊTE côté serveur
+# (`GET /openapi.json`, schéma ChatCompletionRequest : `enable_thinking:
+# bool`), vérifié EN DIRECT avant d'écrire ce correctif (appel réel avec un
+# prompt de planification JSON, voir HISTORY.md) : `reasoning_content:
+# null`, JSON valide immédiat, aucun raisonnement. `extra_body` est un
+# paramètre natif de langchain-openai (vérifié :
+# `"extra_body" in inspect.signature(ChatOpenAI).parameters`).
+# PLANNER_THINKING_ENABLED (défaut false = thinking bridé) plutôt qu'une
+# désactivation en dur : permet un rollback sans redéploiement de code si
+# la qualité des plans/jugements s'en trouvait dégradée en pratique.
+PLANNER_THINKING_ENABLED = os.environ.get("PLANNER_THINKING_ENABLED", "false").lower() == "true"
 planner_llm = ChatOpenAI(
     base_url=LLM_BASE_URL,
     api_key="not-needed",
     model="agent-llm",
     temperature=0.2,
     max_tokens=PLANNER_MAX_TOKENS,
+    extra_body={"enable_thinking": PLANNER_THINKING_ENABLED},
 )
 
 # Schéma des outils MCP (terminal/filesystem/git/browser/desktop-GhostDesk),
@@ -1097,7 +1225,18 @@ async def _get_tools_schema() -> list:
 
 async def _get_bound_llm() -> ChatOpenAI:
     schema = await _get_tools_schema()
-    return llm.bind_tools(schema) if schema else llm
+    if not schema:
+        return llm
+    if not VERIFICATION_ENABLED:
+        return llm.bind_tools(schema)
+    # Correctif latence 1/2-ter (voir plus haut) : constat_precedent injecté
+    # comme paramètre requis de CHAQUE outil MCP réel, plus report_and_act
+    # comme seul repli (tour en texte pur, aucune action). Gated sur
+    # VERIFICATION_ENABLED : sans lui, ce champ n'a aucun lecteur
+    # (_verification_directive ne l'instruit pas) et ne ferait qu'ajouter
+    # du bruit au schéma envoyé au modèle.
+    wrapped = [_inject_constat_param(t) for t in schema]
+    return llm.bind_tools(wrapped + [_REPORT_AND_ACT_TOOL])
 
 
 async def retrieve_context(state: AgentState) -> dict:
@@ -1549,29 +1688,42 @@ def _verification_directive(state: AgentState) -> str:
     LLM séparé verify_action par une consigne injectée dans CE tour-ci —
     le constat sur l'action précédente vit dans le même raisonnement que la
     décision de la suite, coût marginal ~zéro (aucun aller-retour
-    supplémentaire). Chaîne vide (rien injecté) si VERIFICATION_ENABLED est
-    désactivé, si aucune sous-tâche n'est "en_cours", ou si
-    `pending_verification` (AgentState) est faux — pas de nouvelle action
-    exécutée depuis le dernier constat (ex. tour de replanification, qui
-    n'exécute aucun outil) : mêmes conditions que verify_action, DOIT rester
-    synchronisé avec lui, voir plus bas.
+    supplémentaire).
+
+    Correctif latence 1/2-ter (voir HISTORY.md) : le rappel de base
+    (constat_precedent requis sur CHAQUE tool_call, cf. _inject_constat_param
+    dans _get_bound_llm) est désormais TOUJOURS injecté dès que
+    VERIFICATION_ENABLED est actif — plus seulement quand
+    `pending_verification` est vrai, puisque le champ est maintenant requis
+    par le SCHÉMA lui-même dès le tout premier outil appelé de la tâche
+    (rien à constater alors -> "sans_objet", cas normal). Le hint
+    SPÉCIFIQUE (critère de la sous-tâche active à juger) reste conditionné
+    à `pending_verification` + sous-tâche "en_cours" (mêmes conditions
+    qu'avant, DOIT rester synchronisé avec verify_action) : rien de neuf à
+    constater sinon (ex. tour de replanification, qui n'exécute aucun
+    outil).
     """
     if not VERIFICATION_ENABLED:
         return ""
+    base = (
+        "\nchaque appel d'outil doit inclure constat_precedent (atteint / "
+        "non_atteint / sans_objet) sur l'action PRÉCÉDENTE — sans_objet "
+        "s'il n'y a rien à constater (ex. toute première action de la "
+        "tâche). Si tu réponds en texte pur ce tour-ci sans appeler "
+        "d'autre outil, appelle report_and_act à la place, jamais les deux."
+    )
     if not state.get("pending_verification"):
-        return ""
+        return base
     plan = state.get("plan") or []
     active_index = _active_subtask_index(plan)
     if active_index is None:
-        return ""
+        return base
     critere = plan[active_index]["success_criterion"]
-    return (
-        "\nAvant de décider la suite : l'action précédente a-t-elle atteint "
-        f'son critère "{critere}" ? Constate sur le résultat d\'outil '
-        "ci-dessus (pas sur le critère seul — s'il suppose une approche qui "
-        "n'existe pas réellement sur cette page, juge la progression "
-        "réelle). Commence ta réponse par exactement [CONSTAT: ATTEINT] ou "
-        "[CONSTAT: ECHEC], puis continue normalement (agis ou réponds)."
+    return base + (
+        f' Ce tour-ci : l\'action précédente a-t-elle atteint son critère "{critere}" '
+        "? Juge sur le résultat d'outil ci-dessus (pas sur le critère seul "
+        "— s'il suppose une approche qui n'existe pas réellement sur cette "
+        "page, juge la progression réelle)."
     )
 
 
@@ -1811,6 +1963,20 @@ async def _execute_tool_calls(state: AgentState, config: dict, *, audit: bool) -
     # CE tour-ci/tours précédents de la tâche + racines du périmètre (1er
     # message humain). Recalculé/étendu au fil des tool_calls DE CE TOUR
     # (plusieurs browser_* peuvent apparaître dans le même tour_calls).
+    #
+    # Correctif "premier hop" (voir HISTORY.md, chantier fiabilité session
+    # navigateur) : `has_prior_navigation` distingue le brut persisté
+    # (navigations RÉELLEMENT déjà effectuées) de l'union avec
+    # `_task_scope_urls` ci-dessous — sert à exempter la toute PREMIÈRE
+    # navigation de la tâche du garde-fou (voir plus bas), pas seulement
+    # celles vers une URL déjà mentionnée dans le prompt. Root cause : des
+    # tâches réelles sans URL dans le prompt (T8 "sur Wikipédia...", T11
+    # "quelle est la dernière version de Python ?") voyaient LEUR PREMIÈRE
+    # navigation, pourtant légitime, bloquée comme fabrication — confondu
+    # au diagnostic avec une panne d'infra playwright-mcp avant de
+    # remonter au vrai résultat d'outil (le message de refus du
+    # garde-fou lui-même).
+    has_prior_navigation = bool(state.get("observed_urls"))
     observed_urls = set(state.get("observed_urls") or []) | _task_scope_urls(state["messages"])
     current_page_url = state.get("current_page_url")
     current_page_links = state.get("current_page_links") or []
@@ -1840,6 +2006,40 @@ async def _execute_tool_calls(state: AgentState, config: dict, *, audit: bool) -
 
     async with httpx.AsyncClient(timeout=60) as client:
         for tool_call in last.tool_calls:
+            if tool_call["name"] == _REPORT_AND_ACT_TOOL_NAME:
+                # Meta-outil de repli (correctif latence 1/2-ter, voir
+                # _parse_constat) : déjà consommé par verify_action (tourne
+                # AVANT ce nœud, sur le même AIMessage) pour muter le plan —
+                # jamais dispatché à mcp-client (ça n'est pas un outil MCP
+                # réel), jamais audité (TIER_READ, voir
+                # approval_policy._DEFAULT_TIER_READ). Un ToolMessage de
+                # reçu reste néanmoins obligatoire : chaque tool_call de
+                # l'AIMessage précédente doit avoir sa réponse, sans quoi le
+                # prochain appel LLM romprait le format OpenAI.
+                new_messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tool_call["id"],
+                        "content": json.dumps({"ok": True}, ensure_ascii=False),
+                    }
+                )
+                continue
+
+            # Correctif latence 1/2-ter : constat_precedent voyage dans les
+            # arguments de l'outil réel lui-même (schéma augmenté, voir
+            # _inject_constat_param) — retiré ICI, avant tout usage de
+            # tool_call["args"] plus bas (dispatch mcp-client, garde-fou
+            # anti-fabrication, comparaison anti-répétition, audit). Sans ce
+            # retrait, la comparaison stricte nom+args du garde-fou
+            # anti-répétition (plus bas) ne matcherait plus JAMAIS deux
+            # tentatives par ailleurs identiques (constat différent à chaque
+            # fois) — désactivant ce garde-fou silencieusement.
+            if _CONSTAT_PARAM_NAME in (tool_call.get("args") or {}):
+                tool_call = {
+                    **tool_call,
+                    "args": {k: v for k, v in tool_call["args"].items() if k != _CONSTAT_PARAM_NAME},
+                }
+
             audit_tier = None
             if audit:
                 tier = approval_policy.effective_tier(tool_call["name"], tool_call.get("args"), grants)
@@ -1849,6 +2049,7 @@ async def _execute_tool_calls(state: AgentState, config: dict, *, audit: bool) -
             blocked = False
             if (
                 BROWSER_NAVIGATE_GUARDRAIL
+                and has_prior_navigation
                 and tool_call["name"] == "browser_navigate"
                 and tool_call.get("args", {}).get("url")
                 and tool_call["args"]["url"] not in observed_urls
@@ -1977,30 +2178,50 @@ def _active_subtask_index(plan: list) -> Optional[int]:
     return next((i for i, st in enumerate(plan) if st.get("status") == "en_cours"), None)
 
 
-async def verify_action(state: AgentState) -> dict:
+async def verify_action(state: AgentState, config: dict) -> dict:
     """
     Analyse du constat de vérification post-action (Itération 2, révisé
-    Itération 4 — correctif latence, voir HISTORY.md et
-    _verification_directive plus haut). NE FAIT PLUS D'APPEL LLM : le
-    verdict est parsé depuis la réponse que call_llm vient de produire (CE
-    même appel a aussi constaté le résultat de l'action précédente ET
-    décidé la suite — voir _verification_directive). Ce nœud ne fait que
-    lire ce marqueur et mettre à jour le plan en conséquence.
+    Itération 4 « correctif latence 1/2 », révisé Itération 4 « correctif
+    latence 1/2-bis » — voir HISTORY.md et _verification_directive plus
+    haut). NE FAIT PLUS D'APPEL LLM : le verdict est parsé depuis les
+    tool_calls que call_llm vient de produire (CE même appel a aussi
+    constaté le résultat de l'action précédente ET décidé la suite — voir
+    _verification_directive). Ce nœud ne fait que lire ce tool call
+    (report_and_act) et mettre à jour le plan en conséquence.
 
     No-op (`{"messages": []}`) si VERIFICATION_ENABLED est désactivé
     (défaut), s'il n'y a pas de sous-tâche "en_cours", ou si
     `pending_verification` (AgentState) est faux — mêmes conditions que
     _verification_directive, à garder synchronisées : si la consigne n'a
     pas été injectée, il n'y a rien à parser ici non plus. Consomme
-    toujours le marqueur (`pending_verification: False` en retour) : une
-    fois constatée, une action ne doit pas être reconstatée au prochain
-    tour si aucune NOUVELLE action n'a encore été exécutée entre-temps (ex.
-    tour de replanification, qui n'exécute aucun outil).
+    toujours le flag (`pending_verification: False` en retour) : une fois
+    constatée, une action ne doit pas être reconstatée au prochain tour si
+    aucune NOUVELLE action n'a encore été exécutée entre-temps (ex. tour de
+    replanification, qui n'exécute aucun outil).
 
     Critère vérifié = success_criterion de la sous-tâche ACTIVE du plan
-    (Itération 1). Marqueur absent/mal formé -> traité comme "non atteint"
-    (même dégradation conservative que l'ancien mécanisme LLM : ne jamais
-    bloquer, mais ne jamais accorder un succès implicite).
+    (Itération 1). Dégradation INVERSÉE (correctif 1/2-bis, remplace la
+    dégradation conservative "absent -> non atteint" de la version
+    précédente — c'est elle qui avait cassé le score, 18/33, en consommant
+    à tort le budget de tentatives d'actions peut-être réussies) : constat
+    absent/mal formé -> traité comme "sans_objet" (NI succès NI échec,
+    budget de tentatives inchangé), et compté dans le compteur cumulatif
+    constats_inexploitables plutôt que facturé à la sous-tâche. Un
+    "sans_objet" légitimement déclaré PAR LE MODÈLE a le même effet sur le
+    plan (aucune mutation) mais n'incrémente PAS ce compteur — seule
+    l'ambiguïté (constat manquant/mal formé) se mesure.
+
+    Correctif latence 1/2-ter (voir HISTORY.md) : chaque évaluation ici
+    (exploitable ou non) journalise désormais une entrée d'audit
+    `role="verification"` avec son verdict d'exploitabilité — nouveau juge
+    permanent de COUVERTURE (constats exploitables / opportunités), le
+    compagnon de constats_inexploitables qui ne mesurait que la moitié du
+    contrat (l'ambiguïté, pas l'absence pure et simple de tentative). Sans
+    ce comptage systématique, une campagne peut afficher
+    constats_inexploitables ≈ 0 alors que le taux de couverture réel est
+    catastrophique (~9% mesuré sur la campagne qui a motivé ce correctif) :
+    verify_action ne compte comme "inexploitable" QUE les tentatives
+    reconnues comme telles, jamais un constat qui n'a même pas été tenté.
     """
     if not VERIFICATION_ENABLED:
         return {"messages": []}
@@ -2012,38 +2233,47 @@ async def verify_action(state: AgentState) -> dict:
         return {"messages": [], "pending_verification": False}
 
     last = state["messages"][-1]
-    content = last.content if isinstance(last.content, str) else ""
-    atteint = _parse_verification_marker(content)
-    if atteint is None:
-        raison = "marqueur de constat absent ou mal formé dans la réponse"
-    elif atteint:
-        raison = "critère atteint (constat intégré au tour)"
-    else:
-        raison = "critère non atteint (constat intégré au tour)"
+    verdict, exploitable = _parse_constat(getattr(last, "tool_calls", None))
+    thread_id = config.get("configurable", {}).get("thread_id", "")
+    audit_log.log_message(thread_id, "verification", {"exploitable": exploitable, "verdict": verdict})
+
+    if not exploitable:
+        logger.warning(
+            "Sous-tâche %d : constat_precedent absent ou mal formé, constat inexploitable "
+            "(sans_objet, budget de tentatives inchangé)",
+            active_index,
+        )
+        return {
+            "pending_verification": False,
+            "constats_inexploitables": state.get("constats_inexploitables", 0) + 1,
+        }
+
+    if verdict == "sans_objet":
+        logger.info("Sous-tâche %d : constat sans_objet (rien à mettre à jour)", active_index)
+        return {"pending_verification": False}
 
     new_plan = [dict(st) for st in plan]
-    if atteint:
+    if verdict == "atteint":
         new_plan[active_index]["status"] = "fait"
-        new_plan[active_index]["result"] = raison
+        new_plan[active_index]["result"] = "critère atteint (constat intégré au tour)"
         if active_index + 1 < len(new_plan):
             new_plan[active_index + 1]["status"] = "en_cours"
-        logger.info("Sous-tâche %d atteinte : %s", active_index, raison)
+        logger.info("Sous-tâche %d atteinte", active_index)
         return {"plan": new_plan, "pending_verification": False}
 
+    # verdict == "non_atteint"
     attempts = new_plan[active_index]["attempts"] + 1
     new_plan[active_index]["attempts"] = attempts
     if attempts < SUBTASK_ATTEMPT_BUDGET:
         logger.info(
-            "Sous-tâche %d non atteinte (tentative %d/%d) : %s",
-            active_index, attempts, SUBTASK_ATTEMPT_BUDGET, raison,
+            "Sous-tâche %d non atteinte (tentative %d/%d)",
+            active_index, attempts, SUBTASK_ATTEMPT_BUDGET,
         )
         return {"plan": new_plan, "pending_verification": False}
 
     new_plan[active_index]["status"] = "echoue"
-    new_plan[active_index]["result"] = raison
-    logger.warning(
-        "Sous-tâche %d échouée après %d tentatives : %s", active_index, attempts, raison
-    )
+    new_plan[active_index]["result"] = "critère non atteint (constat intégré au tour)"
+    logger.warning("Sous-tâche %d échouée après %d tentatives", active_index, attempts)
     return {"plan": new_plan, "pending_verification": False}
 
 
@@ -2131,20 +2361,23 @@ async def report_failure(state: AgentState) -> dict:
 def route_after_verification(state: AgentState) -> str:
     """
     Routage après verify_action (Itération 2, câblage révisé Itération 4 —
-    correctif latence, voir HISTORY.md). verify_action tourne maintenant
-    APRÈS call_llm (plus AVANT, voir build_graph) : ce routage fusionne donc
-    l'ancien "continue" avec le dispatch qu'assurait has_tool_calls
-    directement depuis call_llm — sous-tâche "echoue" -> "replan"/"give_up"
-    comme avant ; sinon, délègue à has_tool_calls (mêmes 4 issues :
+    correctif latence 1/2, puis 1/2-bis, voir HISTORY.md). verify_action
+    tourne maintenant APRÈS call_llm (plus AVANT, voir build_graph) : ce
+    routage délègue directement à has_tool_calls (mêmes 4 issues :
     auto_call_tools/call_tools/retry_empty_answer/end), état["messages"][-1]
     restant le même AIMessage tout du long (verify_action ne touche jamais
     "messages").
+
+    Correctif 1/2-bis : le dispatch "sous-tâche echoue -> replan/give_up"
+    a été DÉPLACÉ vers route_after_tool_execution (après exécution des
+    tool_calls, plus ici avant). Raison : le constat vit désormais dans un
+    tool call obligatoire (report_and_act), qui a TOUJOURS besoin d'un
+    ToolMessage de reçu pour rester valide au format OpenAI — sauter tout
+    droit vers replan_task/report_failure sans exécuter ce tool_calls
+    (comme avant, quand le constat vivait dans du texte libre sans jamais
+    aucun tool_calls à résoudre) laisserait un tool_call non résolu dans
+    l'historique, cassant le prochain appel LLM qui rejoue cet historique.
     """
-    plan = state.get("plan") or []
-    if any(st.get("status") == "echoue" for st in plan):
-        if state.get("replan_count", 0) < REPLAN_BUDGET:
-            return "replan"
-        return "give_up"
     return has_tool_calls(state)
 
 
@@ -2331,6 +2564,62 @@ async def _route_entry(state: AgentState) -> str:
     return "slash_command" if tool_name in known_names else "normal"
 
 
+def route_after_tool_execution(state: AgentState) -> str:
+    """
+    Routage après call_tools/auto_call_tools (correctif latence 1/2-bis,
+    voir route_after_verification pour la raison du déplacement) :
+
+    1. Sous-tâche "echoue" (verify_action vient de la marquer, budget de
+       tentatives épuisé, voir plus haut) -> replan_task/report_failure —
+       le tool_calls du tour (report_and_act au minimum) vient d'être
+       exécuté juste avant, donc déjà résolu par un ToolMessage, quel que
+       soit le chemin choisi ensuite.
+    2. Court-circuit sinon : si le SEUL tool_calls du tour était
+       report_and_act (aucune action réelle décidée) ET que ce même tour
+       portait déjà une réponse visible (cas fréquent : dernière sous-tâche
+       atteinte, réponse finale donnée dans le même tour que son constat),
+       reboucler sur call_llm coûterait un appel LLM entier pour ne faire
+       répéter au modèle qu'une réponse déjà produite — exactement le coût
+       que ce chantier cherche à éliminer. Route vers finalize_after_report
+       plutôt que directement END (voir ce nœud : sans lui, le dernier
+       message du thread serait le ToolMessage de reçu de report_and_act,
+       pas la réponse visible — cassant _current_answer/app/main.py, qui
+       suppose partout que messages[-1] est l'AIMessage de réponse).
+    3. Cas normal (une vraie action a aussi été exécutée, ou aucune réponse
+       visible) : comportement inchangé, retour à call_llm.
+    """
+    plan = state.get("plan") or []
+    if any(st.get("status") == "echoue" for st in plan):
+        if state.get("replan_count", 0) < REPLAN_BUDGET:
+            return "replan"
+        return "give_up"
+
+    last_ai = next((m for m in reversed(state["messages"]) if getattr(m, "type", None) == "ai"), None)
+    if last_ai is None:
+        return "call_llm"
+    tool_calls = getattr(last_ai, "tool_calls", None) or []
+    only_report = bool(tool_calls) and all(tc["name"] == _REPORT_AND_ACT_TOOL_NAME for tc in tool_calls)
+    if only_report and has_visible_answer(last_ai.content):
+        return "finalize"
+    return "call_llm"
+
+
+async def finalize_after_report_and_act(state: AgentState) -> dict:
+    """
+    Voir route_after_tool_execution ("finalize") : ré-émet le texte de la
+    réponse déjà produite (et déjà streamée au client par call_llm) comme un
+    NOUVEL AIMessage propre, SANS tool_calls — pour que messages[-1] reste
+    l'AIMessage de réponse visible, pas le ToolMessage de reçu de
+    report_and_act qui vient d'être exécuté. Même précédent que
+    run_slash_command_direct (voir sa docstring) : aucun appel LLM, un
+    simple message de forme standard pour rester compatible avec
+    app/main.py.
+    """
+    last_ai = next((m for m in reversed(state["messages"]) if getattr(m, "type", None) == "ai"), None)
+    content = last_ai.content if last_ai is not None else ""
+    return {"messages": [{"role": "assistant", "content": content}]}
+
+
 def build_graph(checkpointer=None):
     graph = StateGraph(AgentState)
     graph.add_node("retrieve_context", retrieve_context)
@@ -2345,6 +2634,7 @@ def build_graph(checkpointer=None):
     graph.add_node("call_tools", call_tools)
     graph.add_node("auto_call_tools", auto_call_tools)
     graph.add_node("verify_action", verify_action)
+    graph.add_node("finalize_after_report_and_act", finalize_after_report_and_act)
     graph.add_node("replan_task", replan_task)
     graph.add_node("report_failure", report_failure)
     graph.add_node("reject_tools", reject_tools)
@@ -2377,11 +2667,13 @@ def build_graph(checkpointer=None):
     )
     graph.add_edge("reject_plan", END)
     # Correctif latence 1/2 (Itération 4, voir HISTORY.md) : verify_action
-    # tourne maintenant APRÈS call_llm (analyse du marqueur [CONSTAT: ...]
-    # que ce même appel vient de produire), plus AVANT comme appel LLM
-    # séparé — route_after_verification fusionne donc l'ancien dispatch de
-    # has_tool_calls (call_tools/auto_call_tools/retry_empty_answer/end) et
-    # le routage replan/give_up sur sous-tâche "echoue".
+    # tourne maintenant APRÈS call_llm (analyse du constat que ce même appel
+    # vient de produire), plus AVANT comme appel LLM séparé —
+    # route_after_verification délègue à has_tool_calls
+    # (call_tools/auto_call_tools/retry_empty_answer/end). Correctif 1/2-bis
+    # (voir route_after_verification/route_after_tool_execution) : le
+    # dispatch replan/give_up sur sous-tâche "echoue" a été déplacé APRÈS
+    # l'exécution des tool_calls (route_after_tool_execution), pas ici.
     graph.add_edge("call_llm", "verify_action")
     graph.add_conditional_edges(
         "verify_action",
@@ -2391,18 +2683,36 @@ def build_graph(checkpointer=None):
             "auto_call_tools": "auto_call_tools",
             "retry_empty_answer": "retry_empty_answer",
             "end": END,
-            "replan": "replan_task",
-            "give_up": "report_failure",
         },
     )
     graph.add_conditional_edges(
         "require_approval", route_after_approval, {"call_tools": "call_tools", "reject_tools": "reject_tools"}
     )
-    graph.add_edge("call_tools", "call_llm")
-    graph.add_edge("auto_call_tools", "call_llm")
+    graph.add_conditional_edges(
+        "call_tools",
+        route_after_tool_execution,
+        {"call_llm": "call_llm", "finalize": "finalize_after_report_and_act", "replan": "replan_task", "give_up": "report_failure"},
+    )
+    graph.add_conditional_edges(
+        "auto_call_tools",
+        route_after_tool_execution,
+        {"call_llm": "call_llm", "finalize": "finalize_after_report_and_act", "replan": "replan_task", "give_up": "report_failure"},
+    )
     graph.add_edge("replan_task", "validate_plan")
     graph.add_edge("report_failure", END)
-    graph.add_edge("reject_tools", "call_llm")
+    graph.add_edge("finalize_after_report_and_act", END)
+    # reject_tools résout aussi TOUS les tool_calls du tour (dont
+    # report_and_act, voir reject_tools) — même routage post-exécution que
+    # call_tools/auto_call_tools, pour ne jamais sauter par-dessus un
+    # échoue/give_up potentiellement posé par verify_action juste avant
+    # (correctif latence 1/2-bis : ce cas n'était pas exercé par les tests
+    # avant que report_and_act rende un tool_calls quasi systématique sur
+    # les tours vérifiés).
+    graph.add_conditional_edges(
+        "reject_tools",
+        route_after_tool_execution,
+        {"call_llm": "call_llm", "finalize": "finalize_after_report_and_act", "replan": "replan_task", "give_up": "report_failure"},
+    )
     graph.add_edge("retry_empty_answer", "call_llm")
 
     return graph.compile(checkpointer=checkpointer or MemorySaver())

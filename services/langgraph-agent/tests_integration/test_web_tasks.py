@@ -97,6 +97,20 @@ MCP_CLIENT_CONTAINER = os.environ.get("MCP_CLIENT_CONTAINER", "mcp-client")
 N_REPETITIONS = int(os.environ.get("WEB_TASKS_REPETITIONS", "3"))
 MAX_APPROVAL_ROUNDS = int(os.environ.get("WEB_TASKS_MAX_APPROVAL_ROUNDS", "40"))
 CHAT_TIMEOUT_SECONDS = int(os.environ.get("WEB_TASKS_CHAT_TIMEOUT", "240"))
+# Mode smoke (outillage de campagne, voir HISTORY.md et run-campaign.sh) :
+# sous-ensemble de tâches (préfixes séparés par virgule, ex. "T1,T7,T11" —
+# matché en début de task_id, pas de nom exact requis) pour ITÉRER
+# rapidement sur un correctif, avec le MÊME préambule/juges/génération de
+# rapport que la campagne complète (_run_campaign/_write_report
+# inchangés) — jamais une suite parallèle à maintenir séparément.
+# Protocole : smoke pour développer/vérifier vite, campagne complète
+# (WEB_TASKS_SMOKE_TASKS non défini, 3 répétitions) réservée aux
+# checkpoints qui comptent pour un score de référence — un smoke n'a pas
+# la significativité statistique (n réduit) pour arbitrer un seuil de
+# passage/régression.
+SMOKE_TASK_PREFIXES = [
+    p.strip() for p in os.environ.get("WEB_TASKS_SMOKE_TASKS", "").split(",") if p.strip()
+]
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 for _sub in ("catalog", "docs", "hr-app"):
@@ -116,6 +130,14 @@ HR_APP_DATA_FILE = WORKSPACE_HOST_PATH / "hr-app-data" / "leave_submissions.json
 
 REPORT_PATH = Path(os.environ.get("WEB_TASKS_REPORT_PATH", Path(__file__).parent / "TASKS-BASELINE.md"))
 CAMPAIGN_LABEL = os.environ.get("WEB_TASKS_CAMPAIGN_LABEL", "Campagne A (budget par défaut)")
+# Outillage de campagne (run-campaign.sh) : durée médiane courante par
+# tâche, mise à jour à la fin de CHAQUE campagne (complète ou smoke) —
+# permet d'estimer la durée d'un prochain lancement (tâches × répétitions ×
+# médiane connue) AVANT de le lancer, pour choisir smoke ou complète en
+# connaissance de cause. Un seul fichier partagé, volontairement : la
+# dernière mesure connue par tâche est la meilleure estimation disponible,
+# qu'elle vienne d'un smoke ou d'une campagne complète.
+DURATION_STATS_PATH = Path(__file__).parent / "CAMPAIGN_DURATION_STATS.json"
 
 # Textes exacts émis côté serveur (voir app/main.py) — même convention que
 # test_tool_calling_baseline.py.
@@ -299,11 +321,74 @@ class TaskResult:
         # d'audit pour ce thread. Ne prétend pas égaler le compteur interne
         # exact de MAX_TOOL_ITERATIONS (non exposé par l'API).
         self.tool_calls_observed = 0
+        # Juge permanent de couverture des constats (correctif latence
+        # 1/2-ter, voir HISTORY.md) : verify_action journalise désormais une
+        # entrée role="verification" à CHAQUE évaluation (exploitable ou
+        # non, voir app/audit_log.py). Distinct de tool_calls_observed
+        # ci-dessus : ces entrées ont kind="message", filtrées à part pour
+        # ne pas gonfler ce dernier ni être confondues avec les tool_calls
+        # réels (kind absent, voir audit_log.log_tool_call).
+        self.verification_opportunities = 0
+        self.verification_exploitable = 0
+        # Juge de checkpoint "prefill total par tâche" (correctif latence
+        # 2/2, voir HISTORY.md) : remplace le taux de cache=0 approximatif
+        # par sa vraie grandeur — le TEMPS effectivement dépensé à traiter
+        # des tokens de prompt (cache manqué ou non), lu directement dans
+        # les métriques TabbyAPI (`Process: N cached tokens and M new
+        # tokens at S T/s` -> M / S secondes de prefill par requête, sommé
+        # sur toute la fenêtre real-time de CETTE tâche). cache_zero_ratio
+        # reste consigné à titre informatif (l'ancien taux approximatif).
+        self.prefill_seconds = 0.0
+        self.cache_zero_requests = 0
+        self.tabbyapi_requests = 0
+
+
+TABBYAPI_CONTAINER = os.environ.get("TABBYAPI_CONTAINER", "tabbyapi")
+_TABBY_METRICS_RE = re.compile(
+    r"(\d+) tokens generated in ([\d.]+) seconds \(Queue: ([\d.]+) s, Process: (\d+) cached tokens "
+    r"and (\d+) new tokens at ([\d.]+) T/s"
+)
+
+
+def _fetch_tabbyapi_prefill_stats(since_dt, until_dt) -> dict:
+    """
+    Somme le temps de prefill RÉEL (nouveaux tokens / débit de traitement,
+    tel que journalisé par TabbyAPI/ExLlamaV3) sur la fenêtre temporelle
+    d'UNE tâche — voir TaskResult.prefill_seconds. La campagne tourne tâche
+    par tâche, répétition par répétition (jamais en parallèle, voir
+    _run_campaign) : la fenêtre temps réel de cette répétition attribue
+    donc sans ambiguïté chaque requête TabbyAPI journalisée à cette tâche.
+    Best-effort : ne fait jamais échouer une répétition si `docker logs`
+    échoue (conteneur redémarré entre-temps, etc.) — retourne des zéros.
+    """
+    since_iso = since_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+    until_iso = until_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+    try:
+        result = subprocess.run(
+            ["docker", "logs", "--since", since_iso, "--until", until_iso, TABBYAPI_CONTAINER],
+            capture_output=True, text=True, timeout=30,
+        )
+    except subprocess.TimeoutExpired:
+        return {"prefill_seconds": 0.0, "cache_zero_requests": 0, "tabbyapi_requests": 0}
+    text = (result.stdout or "") + (result.stderr or "")
+    normalized = re.sub(r"\s+", " ", text)
+    prefill_seconds = 0.0
+    cache_zero = 0
+    n = 0
+    for m in _TABBY_METRICS_RE.finditer(normalized):
+        cached, new, proc_speed = int(m.group(4)), int(m.group(5)), float(m.group(6))
+        n += 1
+        if cached == 0:
+            cache_zero += 1
+        if proc_speed > 0:
+            prefill_seconds += new / proc_speed
+    return {"prefill_seconds": round(prefill_seconds, 2), "cache_zero_requests": cache_zero, "tabbyapi_requests": n}
 
 
 def run_task(prompt: str) -> TaskResult:
     result = TaskResult()
     start = time.monotonic()
+    wall_start = datetime.now(timezone.utc)
     try:
         content = _chat(prompt)
         while _is_approval_pending(content):
@@ -337,12 +422,26 @@ def run_task(prompt: str) -> TaskResult:
         entries = _audit_entries(prompt)
     except (RuntimeError, subprocess.TimeoutExpired):
         entries = []
-    result.tool_calls_observed = result.approvals + len(entries)
-    for e in entries:
+    # kind absent = tool_call réel (log_tool_call) ; kind="message" =
+    # raisonnement assistant ou entrée de couverture des constats
+    # (log_message, voir app/audit_log.py) — à ne pas mélanger.
+    tool_call_entries = [e for e in entries if e.get("kind") is None]
+    verification_entries = [e for e in entries if e.get("kind") == "message" and e.get("role") == "verification"]
+    result.tool_calls_observed = result.approvals + len(tool_call_entries)
+    result.verification_opportunities = len(verification_entries)
+    result.verification_exploitable = sum(
+        1 for e in verification_entries if (e.get("content") or {}).get("exploitable")
+    )
+    for e in tool_call_entries:
         if e.get("tool") == "browser_navigate":
             url = e.get("arguments", {}).get("url")
             if url:
                 result.observed_navigate_urls.append(url)
+
+    prefill_stats = _fetch_tabbyapi_prefill_stats(wall_start, datetime.now(timezone.utc))
+    result.prefill_seconds = prefill_stats["prefill_seconds"]
+    result.cache_zero_requests = prefill_stats["cache_zero_requests"]
+    result.tabbyapi_requests = prefill_stats["tabbyapi_requests"]
     return result
 
 
@@ -667,6 +766,20 @@ def _run_campaign():
 
     tasks = list(TASKS)
     tasks.append(_t11_task())
+    if SMOKE_TASK_PREFIXES:
+        # Bug trouvé en conditions réelles (voir HISTORY.md) : un simple
+        # startswith(p) fait matcher "T1" contre "T10_..."/"T11_..." aussi
+        # (préfixe numérique partagé) — exige la frontière "_" (ou une
+        # correspondance exacte) pour ne matcher QUE la tâche voulue.
+        tasks = [
+            t for t in tasks
+            if any(t[0] == p or t[0].startswith(p + "_") for p in SMOKE_TASK_PREFIXES)
+        ]
+        if not tasks:
+            raise RuntimeError(
+                f"WEB_TASKS_SMOKE_TASKS={SMOKE_TASK_PREFIXES!r} ne matche aucune tâche connue "
+                f"(voir TASKS/_t11_task dans ce module)"
+            )
 
     rows = []
     for task_id, base_prompt, assert_fn in tasks:
@@ -701,13 +814,47 @@ def _run_campaign():
                     "detail": detail,
                     "approvals": result.approvals,
                     "tool_calls_observed": result.tool_calls_observed,
+                    "verification_opportunities": result.verification_opportunities,
+                    "verification_exploitable": result.verification_exploitable,
+                    "prefill_seconds": result.prefill_seconds,
+                    "cache_zero_requests": result.cache_zero_requests,
+                    "tabbyapi_requests": result.tabbyapi_requests,
                     "fabricated_urls": fabricated_urls,
                     "duration_seconds": round(result.duration_seconds, 1),
                     "failure_cause": cause,
                     "final_text": result.final_text,
                 }
             )
+    _update_duration_stats(rows)
     return rows
+
+
+def _update_duration_stats(rows: list) -> None:
+    """
+    Voir DURATION_STATS_PATH plus haut. Fusionne avec les stats déjà
+    persistées (une tâche absente de CE run, ex. smoke ciblé, garde sa
+    dernière médiane connue plutôt que d'être effacée) — best-effort,
+    n'échoue jamais la campagne pour un problème d'écriture de ce fichier
+    annexe (permissions, disque plein...).
+    """
+    import statistics
+
+    try:
+        existing = json.loads(DURATION_STATS_PATH.read_text(encoding="utf-8")) if DURATION_STATS_PATH.exists() else {}
+    except (OSError, ValueError):
+        existing = {}
+
+    by_task = {}
+    for r in rows:
+        by_task.setdefault(r["task_id"], []).append(r["duration_seconds"])
+
+    for task_id, durations in by_task.items():
+        existing[task_id] = round(statistics.median(durations), 1)
+
+    try:
+        DURATION_STATS_PATH.write_text(json.dumps(existing, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    except OSError:
+        pass
 
 
 def _write_report(rows: list) -> None:
@@ -724,11 +871,16 @@ def _write_report(rows: list) -> None:
         "de test_web_tasks.py pour la méthode de sous-classification "
         "boucle_fabrication/boucle_budget.",
         "",
-        "| Tâche | Succès | Approbations (moy.) | Tool calls observés (moy.) | Durée (moy., s) | Causes d'échec |",
-        "|---|---|---|---|---|---|",
+        "| Tâche | Succès | Approbations (moy.) | Tool calls observés (moy.) | Couverture constats | Prefill total (s) | Cache=0 | Durée (moy., s) | Causes d'échec |",
+        "|---|---|---|---|---|---|---|---|---|",
     ]
     total_ok = 0
     total_n = 0
+    total_opportunities = 0
+    total_exploitable = 0
+    total_prefill_seconds = 0.0
+    total_cache_zero = 0
+    total_tabbyapi_requests = 0
     for task_id, task_rows in by_task.items():
         n_ok = sum(1 for r in task_rows if r["success"])
         n = len(task_rows)
@@ -737,14 +889,57 @@ def _write_report(rows: list) -> None:
         avg_approvals = sum(r["approvals"] for r in task_rows) / n
         avg_tool_calls = sum(r["tool_calls_observed"] for r in task_rows) / n
         avg_duration = sum(r["duration_seconds"] for r in task_rows) / n
+        task_opportunities = sum(r["verification_opportunities"] for r in task_rows)
+        task_exploitable = sum(r["verification_exploitable"] for r in task_rows)
+        total_opportunities += task_opportunities
+        total_exploitable += task_exploitable
+        task_prefill = sum(r["prefill_seconds"] for r in task_rows)
+        task_cache_zero = sum(r["cache_zero_requests"] for r in task_rows)
+        task_tabbyapi_requests = sum(r["tabbyapi_requests"] for r in task_rows)
+        total_prefill_seconds += task_prefill
+        total_cache_zero += task_cache_zero
+        total_tabbyapi_requests += task_tabbyapi_requests
+        coverage_str = (
+            f"{100 * task_exploitable / task_opportunities:.0f}% ({task_exploitable}/{task_opportunities})"
+            if task_opportunities
+            else "—"
+        )
+        cache_zero_str = (
+            f"{100 * task_cache_zero / task_tabbyapi_requests:.0f}% ({task_cache_zero}/{task_tabbyapi_requests})"
+            if task_tabbyapi_requests
+            else "—"
+        )
         causes = Counter(r["failure_cause"] for r in task_rows if r["failure_cause"])
         causes_str = ", ".join(f"{c}×{n}" for c, n in causes.items()) or "—"
         lines.append(
             f"| {task_id} | {n_ok}/{n} | {avg_approvals:.1f} | {avg_tool_calls:.1f} | "
-            f"{avg_duration:.1f} | {causes_str} |"
+            f"{coverage_str} | {task_prefill:.1f} | {cache_zero_str} | {avg_duration:.1f} | {causes_str} |"
         )
 
     lines.insert(3, f"**Score de campagne : {total_ok}/{total_n} passages réussis.**")
+    # Juge de checkpoint "prefill total par tâche" (correctif latence 2/2,
+    # voir HISTORY.md) : remplace le taux de cache=0 comme juge PRINCIPAL —
+    # celui-ci reste consigné à titre informatif seulement (voir la colonne
+    # "Cache=0" ci-dessus et cette ligne agrégée).
+    lines.insert(
+        4,
+        f"**Prefill total (toutes tâches) : {total_prefill_seconds:.1f}s** "
+        f"({total_cache_zero}/{total_tabbyapi_requests} requêtes à cache=0, "
+        f"{100*total_cache_zero/total_tabbyapi_requests:.1f}% — métrique informative)."
+        if total_tabbyapi_requests else "",
+    )
+    # Juge permanent de couverture des constats (correctif latence 1/2-ter,
+    # voir HISTORY.md, seuil de passage >= 95%) : constats exploitables /
+    # opportunités totales, tous accumulés sur la campagne — compagnon de
+    # constats_inexploitables, qui ne mesurait que l'ambiguïté (pas
+    # l'absence pure et simple de tentative).
+    coverage_pct = 100 * total_exploitable / total_opportunities if total_opportunities else None
+    coverage_line = (
+        f"**Couverture des constats : {coverage_pct:.1f}% ({total_exploitable}/{total_opportunities}).**"
+        if coverage_pct is not None
+        else "**Couverture des constats : aucune opportunité observée (VERIFICATION_ENABLED désactivé ?).**"
+    )
+    lines.insert(4, coverage_line)
     lines.append("")
     lines.append("## Détail par run")
     lines.append("")
@@ -753,11 +948,18 @@ def _write_report(rows: list) -> None:
         fabricated_note = (
             f", URL fabriquées={r['fabricated_urls']}" if r["fabricated_urls"] else ""
         )
+        coverage_note = (
+            f", constats={r['verification_exploitable']}/{r['verification_opportunities']}"
+            if r["verification_opportunities"]
+            else ""
+        )
+        prefill_note = f", prefill={r['prefill_seconds']:.1f}s" if r["tabbyapi_requests"] else ""
         lines.append(
             f"- {status} `{r['task_id']}` #{r['repetition']} — {r['detail']} "
             f"(approbations={r['approvals']}, tool_calls_observés={r['tool_calls_observed']}, "
             f"durée={r['duration_seconds']}s"
-            f"{', cause=' + r['failure_cause'] if r['failure_cause'] else ''}{fabricated_note})"
+            f"{', cause=' + r['failure_cause'] if r['failure_cause'] else ''}{fabricated_note}"
+            f"{coverage_note}{prefill_note})"
         )
 
     REPORT_PATH.parent.mkdir(parents=True, exist_ok=True)

@@ -87,6 +87,13 @@ services:
       # consommait à lui seul tout LLM_MAX_TOKENS (2048), tronquant la
       # réponse JSON systématiquement.
       - PLANNER_MAX_TOKENS=${PLANNER_MAX_TOKENS:-8192}
+      # Correctif latence 2/2 (voir HISTORY.md) : thinking bridé sur les
+      # appels auxiliaires (plan_task/revise_plan/replan_task/_judge_plan,
+      # tous via planner_llm) — TabbyAPI expose enable_thinking en
+      # paramètre par requête, vérifié en direct sans effet sur la validité
+      # du JSON produit. Défaut false (thinking bridé) ; override à true
+      # pour revenir au comportement précédent sans redéploiement de code.
+      - PLANNER_THINKING_ENABLED=${PLANNER_THINKING_ENABLED:-false}
       # Filet de sécurité (voir README, tableau des bugs) : certains modèles
       # écrivent parfois leur appel d'outil en prose au lieu d'un tool_calls
       # structuré, piégé dans le raisonnement. Nombre de relances
