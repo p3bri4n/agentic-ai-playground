@@ -491,3 +491,111 @@ def test_reset_session_non_persistent_server_is_404():
     une faute de frappe côté appelant."""
     resp = _client().post("/reset-session/echo")
     assert resp.status_code == 404
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Stabilisation post-navigation (voir HISTORY.md, investigation T10 :
+# "désynchronisation snapshot/URL") : browser_wait_for appelé automatiquement
+# après CHAQUE browser_navigate/browser_click réussi, transparent pour
+# l'agent, avant que le prochain outil (browser_snapshot ou autre) ne voie
+# le résultat.
+# ─────────────────────────────────────────────────────────────────────────
+
+
+class _RecordingSession:
+    """Session factice : enregistre chaque appel (nom, arguments) et renvoie
+    un résultat minimal, sans dépendre d'un vrai serveur MCP/navigateur."""
+
+    def __init__(self, calls):
+        self.calls = calls
+
+    async def call_tool(self, name, arguments):
+        from mcp.types import TextContent
+
+        self.calls.append((name, arguments))
+
+        class _Result:
+            content = [TextContent(type="text", text=f"ok:{name}")]
+
+        return _Result()
+
+
+def _patch_run_on_server_recording(main_mod, monkeypatch):
+    """Court-circuite _run_on_server (déjà testé séparément, voir plus haut)
+    pour isoler la logique ajoutée dans call_tool() elle-même : une seule
+    session factice enregistrant tous les appels, quel que soit le serveur
+    visé."""
+    calls = []
+    session = _RecordingSession(calls)
+
+    async def fake_run_on_server(server_name, action):
+        return await action(session)
+
+    monkeypatch.setattr(main_mod, "_run_on_server", fake_run_on_server)
+    return calls
+
+
+def _register_fake_browser_tool(main_mod, name, required=None):
+    main_mod._tool_registry[name] = {
+        "server": "browser",
+        "description": "",
+        "inputSchema": {"type": "object", "properties": {}, "required": required or []},
+    }
+
+
+def test_browser_navigate_triggers_stabilization_wait(monkeypatch):
+    import app.main as main_mod
+
+    main_mod._tool_registry.clear()
+    _register_fake_browser_tool(main_mod, "browser_navigate", ["url"])
+    calls = _patch_run_on_server_recording(main_mod, monkeypatch)
+
+    resp = _client().post("/call", json={"tool": "browser_navigate", "arguments": {"url": "https://exemple.com"}})
+
+    assert resp.status_code == 200
+    assert calls == [
+        ("browser_navigate", {"url": "https://exemple.com"}),
+        ("browser_wait_for", {"time": main_mod.BROWSER_STABILIZE_WAIT_SECONDS}),
+    ]
+
+
+def test_browser_click_triggers_stabilization_wait(monkeypatch):
+    import app.main as main_mod
+
+    main_mod._tool_registry.clear()
+    _register_fake_browser_tool(main_mod, "browser_click", ["target"])
+    calls = _patch_run_on_server_recording(main_mod, monkeypatch)
+
+    resp = _client().post("/call", json={"tool": "browser_click", "arguments": {"target": "e1"}})
+
+    assert resp.status_code == 200
+    assert calls[-1] == ("browser_wait_for", {"time": main_mod.BROWSER_STABILIZE_WAIT_SECONDS})
+
+
+def test_browser_snapshot_does_not_trigger_stabilization_wait(monkeypatch):
+    """Seuls navigate/click déclenchent le délai — un simple snapshot ne
+    change pas la page, rien à stabiliser derrière lui."""
+    import app.main as main_mod
+
+    main_mod._tool_registry.clear()
+    _register_fake_browser_tool(main_mod, "browser_snapshot")
+    calls = _patch_run_on_server_recording(main_mod, monkeypatch)
+
+    resp = _client().post("/call", json={"tool": "browser_snapshot", "arguments": {}})
+
+    assert resp.status_code == 200
+    assert calls == [("browser_snapshot", {})]
+
+
+def test_stabilization_wait_disabled_via_zero_seconds(monkeypatch):
+    import app.main as main_mod
+
+    main_mod._tool_registry.clear()
+    _register_fake_browser_tool(main_mod, "browser_navigate", ["url"])
+    monkeypatch.setattr(main_mod, "BROWSER_STABILIZE_WAIT_SECONDS", 0.0)
+    calls = _patch_run_on_server_recording(main_mod, monkeypatch)
+
+    resp = _client().post("/call", json={"tool": "browser_navigate", "arguments": {"url": "https://exemple.com"}})
+
+    assert resp.status_code == 200
+    assert calls == [("browser_navigate", {"url": "https://exemple.com"})]

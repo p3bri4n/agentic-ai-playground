@@ -2113,3 +2113,37 @@ le modèle dans 2 cas sur 3 — pas urgent.
 l'utilisateur : ses propres juges sont atteints (latence, prefill, T11
 résolu) ; ce qui reste (T1, T7, T9, T10) forme un backlog de causes
 distinctes et sans effet de levier partagé, à traiter séparément.
+
+## Correctif T10 : stabilisation post-navigation, avant Phase 2
+
+Décidé avec l'utilisateur : ne pas traiter tout le backlog (T1/T7/T9 sont
+des échecs isolés à faible effet de levier), mais corriger T10 en premier
+— la désynchronisation snapshot/URL touche potentiellement N'IMPORTE
+QUELLE tâche sur une page à rendu client, pas seulement books.toscrape :
+la laisser ouverte risquait de polluer silencieusement les futures
+mesures de Phase 2 (compaction) sans qu'on sache distinguer un échec de
+compaction d'un échec de ce bug.
+
+**Correctif** (`services/mcp-client/app/main.py`) : `browser_wait_for`
+(outil réel de mcp/playwright, confirmé via `GET /tools/schema` —
+`time`/`text`/`textGone`, aucun mode "networkidle" mais un délai fixe
+suffit) appelé automatiquement après CHAQUE `browser_navigate`/
+`browser_click` réussi, transparent pour l'agent — délai fixe
+(`BROWSER_STABILIZE_WAIT_SECONDS`, défaut 0,5s, `0` désactive). Correctif
+serveur plutôt qu'une consigne de prompt : ne dépend d'aucun comportement
+du modèle pour s'appliquer. Vérifié en direct (durée réelle d'un
+`browser_navigate` cohérente avec navigate+0,5s ; `browser_snapshot` seul
+inchangé, ~0,08s, confirmant qu'aucun délai n'est ajouté là où il n'a pas
+lieu d'être). Tests dédiés (`tests/test_main.py`, session factice
+enregistrant la séquence d'appels) : 24/24 tests mcp-client passent.
+
+**Smoke T10 ×3** (après reconstruction de `mcp-client`) : **3/3** — durée
+moyenne 113,0s (vs 177,0s dans le checkpoint précédent), tool_calls
+observés 10,0 (vs 12,3) : cohérent avec la disparition des tours perdus à
+se repérer. Confirmé dans l'audit : plus aucune mention de « snapshot
+désynchronisé » sur 2 threads sur 3 ; le 3e montre un échec de clic
+ordinaire (cible manquée, contournement JS immédiat) — cause différente,
+sans rapport avec la désynchronisation, et sans conséquence sur le
+résultat final.
+
+Backlog restant inchangé (T1, T7, T9) — non traité, comme convenu.

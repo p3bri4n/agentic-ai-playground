@@ -369,6 +369,24 @@ async def list_tools_schema():
     }
 
 
+# Stabilisation post-navigation (trouvé en investiguant T10, voir
+# HISTORY.md « désynchronisation snapshot/URL ») : sur une page à rendu
+# client (ex. books.toscrape.com, catégorie chargée après le clic),
+# `browser_snapshot` peut renvoyer le contenu de l'ANCIENNE page alors que
+# l'URL/la capture d'écran confirment déjà le changement — l'agent perd
+# alors plusieurs tours à se convaincre d'où il se trouve, jusqu'à parfois
+# épuiser son budget d'itérations avant même d'avoir vu le contenu utile.
+# `browser_wait_for` (outil réel de mcp/playwright, confirmé via
+# GET /tools/schema : time/text/textGone) est appelé automatiquement après
+# CHAQUE browser_navigate/browser_click réussi, transparent pour l'agent —
+# aucun texte attendu à l'avance, un délai fixe court suffit à laisser le
+# rendu client se stabiliser. Correctif serveur plutôt qu'une consigne de
+# prompt : un délai fixe ne dépend d'aucun comportement du modèle pour
+# être appliqué.
+_STABILIZE_AFTER_TOOLS = {"browser_navigate", "browser_click"}
+BROWSER_STABILIZE_WAIT_SECONDS = float(os.environ.get("BROWSER_STABILIZE_WAIT_SECONDS", "0.5"))
+
+
 @app.post("/call")
 async def call_tool(request: CallRequest):
     if request.tool not in _tool_registry:
@@ -390,4 +408,8 @@ async def call_tool(request: CallRequest):
     result = await _run_on_server(
         tool_info["server"], lambda s: s.call_tool(request.tool, request.arguments)
     )
+    if request.tool in _STABILIZE_AFTER_TOOLS and BROWSER_STABILIZE_WAIT_SECONDS > 0:
+        await _run_on_server(
+            "browser", lambda s: s.call_tool("browser_wait_for", {"time": BROWSER_STABILIZE_WAIT_SECONDS})
+        )
     return {"content": [block.model_dump() for block in result.content]}

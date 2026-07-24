@@ -262,6 +262,13 @@ services:
       # ses coordonnées vers 0-1000 lui-même avant de répondre.
       - MCP_OCR_URL=http://ocr-service:8004/mcp
       - OCR_AUTH_TOKEN=${OCR_AUTH_TOKEN}
+      # Stabilisation post-navigation (trouvé en investiguant T10, voir
+      # HISTORY.md « désynchronisation snapshot/URL ») : sur une page à
+      # rendu client, browser_snapshot peut renvoyer le contenu de
+      # l'ANCIENNE page juste après un browser_navigate/browser_click —
+      # browser_wait_for est appelé automatiquement après ces deux outils
+      # pour laisser le rendu se stabiliser. 0 désactive ce délai.
+      - BROWSER_STABILIZE_WAIT_SECONDS=${BROWSER_STABILIZE_WAIT_SECONDS:-0.5}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock   # ⚠️ équivaut à un accès root sur l'hôte,
                                                        # voir avertissement de sécurité dans le README
