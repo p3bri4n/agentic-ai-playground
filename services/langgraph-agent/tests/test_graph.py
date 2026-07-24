@@ -444,6 +444,36 @@ async def test_tool_schema_from_mcp_client_is_bound_to_llm(mock_side_services):
     assert sent_body["tools"] == tool_schema
 
 
+def test_bulk_check_directive_mentions_browser_evaluate_and_loop():
+    """Investigation T1 (voir HISTORY.md) : le vrai blocage était un budget
+    d'itérations insuffisant face à une info visible uniquement sur les
+    pages de détail, jamais le listing — la consigne pousse vers une
+    vérification en masse (browser_evaluate + boucle fetch) plutôt qu'une
+    navigation page par page."""
+    import app.graph as g
+
+    assert "browser_evaluate" in g.BULK_CHECK_DIRECTIVE
+    assert "fetch()" in g.BULK_CHECK_DIRECTIVE
+    assert "un seul appel" in g.BULK_CHECK_DIRECTIVE.lower()
+
+
+@pytest.mark.asyncio
+async def test_call_llm_system_message_includes_bulk_check_directive(mock_side_services):
+    import app.graph as g
+
+    route = mock_side_services.post("http://fake-vllm/v1/chat/completions").mock(
+        return_value=_sse_response(text_response(["OK"]))
+    )
+    g.agent_graph = g.build_graph()
+
+    state = {"messages": [{"role": "user", "content": "Salut"}], "tool_iterations": 0, "approved": None}
+    await g.agent_graph.ainvoke(state, CONFIG)
+
+    sent_body = json.loads(route.calls.last.request.content)
+    system_content = sent_body["messages"][0]["content"]
+    assert g.BULK_CHECK_DIRECTIVE in system_content
+
+
 @pytest.mark.asyncio
 async def test_tool_schema_augmented_with_constat_when_verification_enabled(mock_side_services, monkeypatch):
     """Correctif latence 1/2-ter (voir HISTORY.md) : quand VERIFICATION_ENABLED

@@ -2147,3 +2147,51 @@ sans rapport avec la désynchronisation, et sans conséquence sur le
 résultat final.
 
 Backlog restant inchangé (T1, T7, T9) — non traité, comme convenu.
+
+## Correctif T1 : consigne de vérification en masse (BULK_CHECK_DIRECTIVE)
+
+**Diagnostic initial erroné, corrigé avant tout code** : l'hypothèse
+« requête numérique traitée comme un nombre » (rapportée au tour
+précédent) reposait sur l'auto-justification du modèle, jamais vérifiée
+contre le générateur du fixture réel — même erreur de méthode que pour
+T8 (« about:blank ») avant. Vérification faite : le générateur
+(`generate_catalog.py`) confirme explicitement que les pages de listing
+ne montrent JAMAIS la référence ni le prix (uniquement nom + lien),
+délibérément, « pour forcer une navigation ciblée ». `browser_extract`
+échoue donc sur les pages de listing quel que soit le format de la
+requête — ce n'est pas le bug.
+
+**Vraie séquence observée dans l'audit** : après plusieurs échecs
+d'extraction sur les 3 pages de listing, le modèle devine
+`product-4471.html` (confond le numéro de référence avec l'index de
+fichier) — **le garde-fou anti-fabrication le bloque correctement**
+(« URL non observée... ne devine pas un chemin »). Le modèle se corrige
+mais n'a alors plus assez de budget (`MAX_TOOL_ITERATIONS=20`) pour
+ouvrir individuellement les fiches produit candidates (jusqu'à 20).
+Root cause réelle : budget d'itérations face à une vérification
+exhaustive fiche par fiche, pas un bug de recherche.
+
+**Trois options évaluées avec l'utilisateur** : (a) consigne de
+vérification en masse via `browser_evaluate`, (b) relever
+`MAX_TOOL_ITERATIONS`, (c) statu quo (limite de capacité assumée).
+Option (a) retenue en premier — ne change pas le calibrage du benchmark,
+généralisable à toute tâche du même type (info visible seulement en
+détail, plusieurs candidats à vérifier).
+
+**Correctif** : `BULK_CHECK_DIRECTIVE` (`app/graph.py`) — quand
+l'information cherchée n'apparaît pas sur le listing mais uniquement sur
+les pages de détail, consigne d'utiliser `browser_evaluate` avec une
+boucle `fetch()` en UN seul appel plutôt que `browser_navigate` page par
+page. Tests dédiés (présence de la consigne, câblage bout en bout dans
+le message système). 279 tests passent.
+
+**Smoke T1 ×3** (après reconstruction) : **3/3** — confirmé dans l'audit :
+les 3 threads basculent directement sur `browser_evaluate` après 2
+tentatives d'extraction infructueuses sur le listing (plus de tentative
+de deviner une URL), un thread navigue même directement vers le bon
+fichier (`product-14.html`) trouvé via le bulk-fetch. 5-6 tool calls par
+run contre 20-30+ avant — gain d'efficacité net, largement dans le
+budget.
+
+Backlog restant : T7, T9 — non traités, comme convenu (rendement
+incertain ou nul, voir estimation précédente).

@@ -532,6 +532,23 @@ DOWNLOAD_DIRECTIVE = (
     "navigateur, que tu ne peux pas connaître à l'avance."
 )
 
+# Vérification en masse (trouvé en investiguant T1, voir HISTORY.md) : le
+# vrai blocage n'était ni un format de requête ni une panne, mais un budget
+# d'itérations insuffisant face à une information visible UNIQUEMENT sur
+# les pages de détail (jamais le listing), forçant potentiellement autant
+# de navigations que d'éléments candidats — le modèle finissait par deviner
+# une URL (à raison bloquée par le garde-fou anti-fabrication), preuve
+# qu'il avait identifié le bon problème sans la bonne solution.
+BULK_CHECK_DIRECTIVE = (
+    "Si l'information cherchée (référence, prix...) n'apparaît PAS sur la "
+    "page de listing/index mais seulement sur la page de détail de chaque "
+    "élément, et qu'il faudrait en vérifier PLUSIEURS pour la trouver : "
+    "n'ouvre pas ces pages une par une avec browser_navigate (budget "
+    "d'itérations limité) — utilise browser_evaluate avec une boucle "
+    "fetch() qui récupère et vérifie TOUTES les pages candidates en UN "
+    "seul appel."
+)
+
 # Conscience temporelle (PLAN.md Phase 1, point 7 — amendement dédié,
 # jamais implémenté avant ce correctif malgré T11 déjà présente dans le
 # harnais depuis la Phase 0, voir HISTORY.md : confirmé en grep exhaustif
@@ -1623,7 +1640,7 @@ def describe_context(messages: list, pending_text: Optional[str] = None) -> list
             for label, kind in _CONTEXT_BLOCK_SKELETON
         ]
 
-    system_parts = [GROUNDING_DIRECTIVE, DOWNLOAD_DIRECTIVE, PEREMPTION_DIRECTIVE]
+    system_parts = [GROUNDING_DIRECTIVE, DOWNLOAD_DIRECTIVE, BULK_CHECK_DIRECTIVE, PEREMPTION_DIRECTIVE]
     skills_parts = []
     history_parts = []
     image_count = 0
@@ -1809,7 +1826,7 @@ async def call_llm(state: AgentState, config: dict) -> dict:
     messages_for_llm = [
         SystemMessage(
             content=(
-                f"{GROUNDING_DIRECTIVE}\n{DOWNLOAD_DIRECTIVE}{PEREMPTION_DIRECTIVE}"
+                f"{GROUNDING_DIRECTIVE}\n{DOWNLOAD_DIRECTIVE}{BULK_CHECK_DIRECTIVE}{PEREMPTION_DIRECTIVE}"
                 f"{_date_directive()}{_verification_directive(state)}"
             )
         )
