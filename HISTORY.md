@@ -2195,3 +2195,40 @@ budget.
 
 Backlog restant : T7, T9 — non traités, comme convenu (rendement
 incertain ou nul, voir estimation précédente).
+
+## Investigation T7 (archives) : correction gratuite via BULK_CHECK_DIRECTIVE
+
+**Investigation menée sur archives uniquement**, même protocole que
+T1/T8/T10 : 3 threads de la dernière campagne complète inspectés en
+détail (audit du jour, fingerprint via mention de « ZZ-9999 »). Le
+garde-fou anti-fabrication d'URL fonctionne correctement dans les trois
+cas — deux threads tentent de deviner une URL (`page-4.html`,
+`product-31.html`), bloqués avec le bon message à chaque fois. Ce n'est
+donc pas un défaut du garde-fou.
+
+**Root cause identique à T1** : pour prouver l'absence de ZZ-9999, le
+modèle doit vérifier les 30 fiches produit (la référence n'apparaît
+jamais sur les pages de listing, même construction de fixture que T1) —
+budget d'itérations insuffisant pour un balayage exhaustif fiche par
+fiche. Les 3 threads archivés s'arrêtent tous en pleine investigation,
+jamais sur une réponse finale propre, cohérent avec un épuisement de
+`MAX_TOOL_ITERATIONS` avant conclusion. Un thread montre en plus un bug
+annexe sans rapport (code JS ad hoc via `browser_run_code_unsafe`
+retournant des références `null`, mauvais sélecteur) qui l'a fait
+tourner en rond à déboguer son propre code.
+
+**Point clé** : ces 3 threads archivés datent d'avant le correctif T1
+(`BULK_CHECK_DIRECTIVE`, déployé seulement pour T1 à l'origine). Cette
+consigne est générique (« information visible seulement en détail,
+plusieurs candidats à vérifier ») — elle couvre déjà littéralement le
+cas T7. Hypothèse : **aucun nouveau correctif nécessaire**, seule une
+vérification par smoke était requise.
+
+**Smoke T7 ×3** (aucun changement de code) : **3/3** —
+`absence_declaree=True prix_invente=False` sur les trois runs,
+tool_calls observés 10-12 (contre budget épuisé avant), aucune cause
+d'échec. Hypothèse confirmée : le correctif T1 corrige T7 par ricochet.
+
+Backlog restant : T9 uniquement — non traité, comme convenu (rendement
+jugé incertain ou nul, blocage anti-bot externe hors de notre contrôle).
+Plus aucun bug ouvert avant Phase 2 (PLAN.md, discipline de contexte).
